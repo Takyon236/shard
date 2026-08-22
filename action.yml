@@ -1,0 +1,369 @@
+# Shard — the GitHub Action. The contract here IS the product surface.
+#
+# THIS FILE SHIPS VERBATIM IN THE PUBLIC FREE DISTRIBUTION, which is why it names no internal design
+# document and no path outside the published repository. `build_free_tree._verify_distribution` refuses
+# a distribution that references a file the distribution does not carry, so a breadcrumb added here for
+# a colleague becomes a dead reference for a customer and the build says so. Measured facts belong here;
+# pointers to where they were measured do not.
+#
+# Every input below maps to a `python -m shard <subcommand>` flag that exists and is tested. This file
+# was an "interface sketch, not yet implemented" until 2026-08-07; where something is still not built,
+# it says so by name rather than being accepted and quietly ignored.
+#
+# THIS FILE LIVES AT THE REPOSITORY ROOT AND MAY NOT BE MOVED INTO A SUBDIRECTORY. It sat in `action/`
+# until 2026-08-11, and that layout could not run anywhere: GitHub resolves `runs.image` — and the
+# Docker BUILD CONTEXT — relative to the directory holding this file, so `image: "Dockerfile"` named
+# `action/Dockerfile`, which did not exist. Moving the Dockerfile there would not have fixed it either:
+# the context would then have been `action/`, which holds no `shard/` for the Dockerfile to COPY. Both
+# halves are why colocation at the root is the requirement rather than a preference, and a test asserts
+# that the image resolves and that its build context carries the source — nothing did until it was the
+# only thing standing between the product and its first real runner. The rule had been written down and
+# the failure predicted; colocation resolves it, rather than publishing from a hand-copied repository.
+name: "Shard"
+description: "Security analysis with a reproducing input attached. Runs in your CI, on your model endpoint."
+author: "Reyse"
+
+# INPUT NAMES USE UNDERSCORES, NOT HYPHENS, and that is load-bearing: GitHub builds the container's
+# environment as `INPUT_<name>` upper-cased with SPACES replaced — hyphens pass through UNCHANGED
+# (actions/toolkit `core.getInput`; github/docs#32671; actions/runner#2283). A hyphenated declaration
+# arrives as `INPUT_WITNESS-ENTRY`, which the underscore-spelled lookup this action shipped with never
+# read — eleven of fourteen inputs were inert on a real runner, including the spend ceiling and the
+# witness entry point. Renaming was FREE on 2026-08-11 because the action was not yet published, and
+# would be a breaking change forever after. `shard/action.py::_input` still accepts the hyphenated
+# spelling from a hand-written `with:` block, preferring it over a declared default.
+inputs:
+  mode:
+    description: >
+      survey  — what this codebase is and what we might look for. No inference. Free tier.
+      diff    — review a pull request. The free tier and the v1 artefact.
+              doing something unexpected.
+              toolchain and real CPU that hosted runners do not have. It does NOT need a Docker
+              produced with one.
+    required: false
+    default: "diff"
+
+  model_endpoint:
+    description: >
+      An OpenAI-compatible base URL for self-hosted vLLM or Ollama. `bedrock` and `vertex` are
+      REFUSED by name until W3 lands their adapters, rather than failing obscurely inside an HTTP
+      client. Self-hosted vLLM is the guaranteed EU-residency path.
+    required: false
+  model:
+    description: "Model identifier. See the supported configuration matrix in the docs."
+    required: false
+    default: "glm-5.2"
+  api_key_env:
+    description: >
+      Environment variable holding the endpoint's key. The customer supplies inference on EVERY tier,
+      including free — we operate no endpoint.
+
+      THIS NAMES THE VARIABLE; IT IS NOT THE KEY. Shard never receives the secret as an input, so it
+      cannot reach an argv, a log line or this manifest. Store the secret once (Settings → Secrets and
+      variables → Actions), then map it onto the step's `env:` with a `secrets.OPENROUTER_API_KEY`
+      expression — README.md carries the block to copy, because a workflow expression cannot be written
+      literally in this file (see the note at the top of `runs:`).
+
+      GitHub injects a step's `env:` into the container, and `shard/cli.py::_backend` looks the name up
+      with `os.environ.get`. Set this only when your secret is called something else.
+
+      ON A FORK'S PULL REQUEST THERE IS NO SECRET, and that is GitHub's rule rather than ours: secrets
+      are withheld from `pull_request` runs originating in a fork. So on a public repository taking
+      outside contributions, Shard gets no key on exactly the pull requests a security tool most wants
+      to read, and the run stops with the configuration error below rather than pretending. The honest
+      answers are a non-fork trigger, or `pull_request_target` — which runs with secrets against the
+      BASE repository and is a documented footgun, because a fork controls the code under review. We do
+      not recommend it without a `permissions:` block and a human approval gate.
+    required: false
+    default: "OPENROUTER_API_KEY"
+
+  # --- what the run is allowed to cost -------------------------------------------------------------
+  # The measured 16x spread across tasks makes a per-run ceiling mandatory rather than advisory:
+  max_spend_usd:
+    description: >
+      Hard ceiling on inference spend for this run, debited from the price the endpoint reports on
+      every response. 0 means unmetered. An endpoint that prices nothing — self-hosted vLLM — cannot
+      be metered in dollars however this is set, and the run says so rather than reporting $0.00.
+
+      The run stops BEFORE a model call it cannot afford at the highest price it has already paid
+      during that run, so this is a ceiling and not an estimate. Two cases still cross it by at most
+      one call, and both are stated here rather than rounded away: the FIRST call of a run has no
+      observed price behind it, and any call can be priced above every call before it. No endpoint
+      this action supports accepts a spend cap as a request parameter, so a call's true cost is
+      knowable only once its response arrives.
+    required: false
+    default: "10"
+  max_minutes:
+    description: "Hard wall-clock ceiling. 0 means unmetered."
+    required: false
+    default: "60"
+  max_tokens:
+    description: >
+      8,000,000-token configuration, and diff mode to no token ceiling, because no measurement of a
+      diff-scoped run supports one. Set a number to override either.
+
+      The measured configuration is 8,000,000 — raised from 2,000,000 because 200 steps were not
+      at an answer, having spent everything you gave it. The run is refused rather than quietly raised,
+      because silently lifting a ceiling spends more of your inference budget than you agreed to. For
+      400,000-token profile — rather than a low number here. Diff mode has no floor: its runs finish
+      in the hundreds of thousands and a 4,000,000 floor would sit above the ceiling.
+    required: false
+    default: "0"
+
+  scan:
+    description: >
+      Which kind of scan this is, and therefore what unset ceilings mean. THIS SETS A BUDGET, NOT A
+      SCOPE — in diff mode the run reviews exactly the diff whichever you pick. `initial` is a
+      first look at a target, sized for COVERAGE, because a first scan that stops early reports a
+      floor rather than a result; it also raises the step ceiling, which a first scan of a large
+      tree needs and which had to be passed by hand until 2026-08-21. `followup` is
+      every run after that: the baseline exists, so the run pays for the change rather than for the
+      tree. An explicit `max_tokens` always wins over both.
+
+      `--max-findings`, which is not an input here): `initial` sweeps until coverage runs out,
+      mode applies no profile at all, keeping its unset `max_tokens` unmetered.
+    required: false
+
+  max_steps:
+    description: >
+      log rather than acting on a knob with nothing behind it.
+
+      UNLIKE THE THREE CEILINGS ABOVE, 0 IS REFUSED. The hunt runs `for step in 1..max_steps`, so zero
+      steps is not "unmetered", it is no review at all — a run that completes, reports nothing and
+      exits 0, which is the green-check-that-reviewed-nothing this product exists to refuse. To let a
+      run go long, raise `max_spend_usd`.
+
+      Left unset it is the measured default in `shard/simple.py` (40) — UNLESS `scan` names a profile
+      that sets a higher floor, which `initial` does since 2026-08-21. That number is worth knowing
+      before you rely on it: the first real pull request Shard reviewed — 3 files, 71 added lines —
+      used all 40 steps, spent $0.28 of a $0.30 allowance and stopped at `maxsteps` with no findings.
+      Dollars, minutes and tokens were all configurable and none of them was the constraint. Read the
+      `status` output: `maxsteps` means the review did not finish, and no findings is not a clean
+      result. Found by the first run this product ever made against a real pull request.
+    required: false
+
+  hunk_radius:
+    description: >
+      Lines of context either side of a changed line to name as the change's neighbourhood.
+
+      Left unset it is the measured default in `shard/diffscope.py` (40), and these are the numbers
+      that earned it: on one line changed in a 6,895-line xmlparse.c it
+      cut 795,519 tokens to 476,601 and $0.0977 to $0.0564 at an identical step count, and the
+      defect planted 69 lines OUTSIDE the window was still found and gated 3 times out of 3 — the
+      window narrows attention, not capability. `0` scopes to whole files, which is what every run
+      before 2026-08-08 did.
+    required: false
+
+  # --- what the customer declares ------------------------------------------------------------------
+  witness_entry:
+    description: >
+      Repo-relative path to a RUNNABLE entry point you declare, e.g. `.shard/entry.sh`. Simple mode
+      supplies it data and observes what happens; it is read-only to the agent.
+      WITHOUT ONE, nothing diff mode reports can gate the build — every finding stays informational.
+      That is a real limit and it is the honest one: a gate that fired on the agent's own say-so
+      would make the anti-slop guarantee false.
+
+      IT MUST BE SELF-CONTAINED. It runs INSIDE this action's container, which carries python and bash
+      and NOTHING ELSE — no gcc, no clang, no make. An entry point that compiles your project will fail
+      to build there, and the failure is QUIET: the run completes, every finding stays a hypothesis,
+      gate-eligible is 0, and nothing says why. Measured 2026-08-10 on a C target: the same commit
+      produced 2 reproductions when the entry point had a prebuilt binary and 0 when it had to compile.
+
+      So BUILD IN AN EARLIER STEP and have the entry point only RUN what is already in the workspace.
+      For a sanitiser build, link the runtime statically (`-static-libasan`) — the container has no
+      libasan — and set `ASAN_OPTIONS=abort_on_error=1` so a detected fault raises a fatal signal
+      rather than ASAN's default exit 1, which is indistinguishable from your program rejecting input.
+
+      DECLARE BENIGN INPUTS BESIDE IT, and this is the single highest-value thing you can add. Put
+      ordinary, non-malicious inputs in a directory named after the entry point plus `.benign` —
+      `.shard/entry.sh.benign/` — one per branch your entry point can take. Every finding is then
+      checked against them, and a "demonstration" that is really just your program printing what it
+      always prints is refused.
+
+      WITHOUT THEM the only control is an EMPTY input, which takes a different branch through almost
+      any program: measured against a five-class Java target, four fixtures containing no attack at
+      all produced gate-eligible findings at exit 0. With four benign inputs declared, all four were
+      refused and every honest finding survived. A run that had no benign control says so in the
+      finding itself, so this is a limit you can see rather than one you have to know about.
+    required: false
+  base_ref:
+    description: >
+      What the pull request is measured against.
+
+      YOUR CHECKOUT MUST BE DEEP ENOUGH TO RESOLVE IT. `actions/checkout` defaults to `fetch-depth: 1`,
+      which fetches ONE commit — so the default `HEAD~1` does not exist, no diff can be read, and the
+      run reports `no changed files in scope` and exits 0. **That is a GREEN CHECK that reviewed
+      nothing.** The reason is printed in the log ("git could not resolve ..."), and a green check is
+      what most people look at. Measured 2026-08-10 on a depth-1 clone.
+
+      So set the depth, in the checkout step rather than here:
+
+        - uses: actions/checkout@v4
+          with: { fetch-depth: 0 }          # or a depth that covers the pull request
+
+      On `pull_request` you can instead point this at the base commit GitHub already gives you — a
+      `github.event.pull_request.base.sha` expression — with a checkout deep enough to contain it.
+
+      BUT `base.sha` IS THE BASE BRANCH TIP AT THE LAST SYNC, NOT THE MERGE BASE, and once the base
+      branch moves it stops being an ancestor of your head. Measured 2026-08-18 on
+      `mistralai/mistral-common` #285: `base.sha` was `693adfb43bcb` and the real merge base was
+      `bc022b91aa1c`. That is the ordinary case for any pull request open longer than the branch is
+      quiet, not a corner.
+
+      A diverged base is NOT fatal — the three-dot diff falls back to the merge base, which is the
+      right causal answer to "what did this change add" — and the run says so in `scope_reasons`. On a
+      `pull_request` event it does not arise at all: the runner checks out a MERGE commit whose first
+      parent IS `base.sha`, so there it and the default `HEAD~1` are the same commit.
+
+      Where it bites is a HEAD-BRANCH checkout — a fork, a `workflow_dispatch`, a local run. Until
+      2026-08-18 that combination also switched `fail-on` off and reported "the diff was not read"
+      about a diff it had read; that is fixed, and the remaining advice is simply: **on a head-branch
+      checkout prefer the merge base** — `git merge-base origin/$GITHUB_BASE_REF HEAD` — over
+      `base.sha`.
+
+      ONE RULE, because two documents disagreed on it and the failure was a green check: a shallow
+      checkout is safe ONLY with the default `HEAD~1`. `fetch-depth: 2` and `HEAD~1` is a valid pair
+      (on `pull_request` the runner checks out a MERGE commit, so `HEAD~1` is the base side of it);
+      `fetch-depth: 2` and a `base.sha` that has moved since the pull request opened is not, because
+      that commit is outside the shallow window — git answers `fatal: bad object`, the scope comes back
+      empty, and the run exits 0. If you pass `base_ref` at all, use `fetch-depth: 0`. Measured
+      2026-08-12.
+    required: false
+    default: "HEAD~1"
+
+  # --- where understanding accumulates -------------------------------------------------------------
+  state_repo:
+    description: >
+      Path to a checked-out DEDICATED repository you create for Shard's state. We never write to the
+      repository under review. Optional: without it nothing accumulates between runs, which keeps
+      install to one step. A state failure NEVER fails the build.
+    required: false
+  slug:
+    description: "<owner>/<name> of the repository under review. Normally a github.repository expression."
+    required: false
+
+  fail_on:
+    description: >
+      none (default, report only) | reproduced | new.
+      The check NEVER fails on a finding without a reproduction or a demonstration, whatever this says.
+
+      `new` additionally requires the defect to sit on a line THIS pull request introduced — the
+      diff's added lines plus the seams its deletions leave — so a pre-existing defect next to an
+      innocent edit reports without failing the build. Derived entirely from the diff in hand:
+      reads no diff and refuses it by name rather than accepting a gate that silently never fires.
+
+      IT NEEDS THE DIFF. If git cannot answer (see base_ref above on checkout depth), `new` cannot be
+      evaluated: the gate does not fire and the run SAYS SO — a gate_reasons entry in the payload
+      echoed to this action's log, beside the scope_reasons naming what git refused. That run is
+      degraded, not clean.
+
+      WHAT EACH VALUE ACTUALLY COVERS, measured end to end on real repositories. Every row below is a
+      finding Shard DEMONSTRATED — it ran your entry point and observed the defect:
+
+        finding                                          none  reproduced  new
+        introduced defect, demonstration named the line    0        1       1
+        introduced defect, the exploit was SILENT          0        1       1
+        defect on a line this PR DELETED                   0        1       1
+        pre-existing defect, untouched by this PR          0        1       0
+
+      (0 = the build passes, 1 = the build fails.)
+
+      HOW `new` ANSWERS ROWS 2 AND 3, because neither is visible in the diff. A successful exploit is
+      often silent — real command injection exits 0 with no stack — so there is no line to look at; and
+      a removed bounds check introduces a defect while adding no line anywhere. Shard therefore asks the
+      question directly: it extracts your repository as it was at `base_ref` and re-runs the same
+      reproducing input against it. Reproduces at base, the defect was already there. Does not, this
+      change introduced it. No line needed, and the answer is about your program rather than about your
+      diff — so a pre-existing defect that merely MOVED onto an added line is correctly not new either.
+
+      WHAT IT COSTS: one `git archive` per run and one extra execution of your entry point per
+      demonstrated finding, and only under `new`. `reproduced` and `none` do neither.
+
+      WHEN IT CANNOT BE ANSWERED, `new` falls back to the diff — the finding's line must be one this
+      pull request added — and the run says so in gate_reasons rather than presenting a plain green
+      check. The common reason is a base checkout that cannot run: `git archive` carries tracked files
+      only, so an entry point that needs a binary an earlier workflow step built will not start there.
+      **An entry point that builds what it needs, or needs no build, is what makes `new` exact.**
+    required: false
+    default: "none"
+
+  out_dir:
+    description: "Where shard.sarif, shard-report.md and bundles/ are written."
+    required: false
+    default: "shard-out"
+
+  github_token:
+    description: >
+      Pass `secrets.GITHUB_TOKEN` to publish this run's findings as code-scanning alerts. WITHOUT IT
+      THE RUN STILL WORKS AND STILL GATES — it simply produces no alerts, and says so in the log
+      rather than skipping quietly.
+
+      Needs `permissions: {security-events: write}` on the job. The upload happens from inside this
+      container, so installing Shard stays one step; if you would rather do it yourself, leave this
+      empty and pass `sarif-path` to `github/codeql-action/upload-sarif`. Both are the same API.
+
+      THE ONLY INPUT HERE THAT IS NOT A COMMAND-LINE FLAG. It is consumed by `shard/action.py` to
+      deliver what the run produced, never forwarded to a subcommand and never written to any
+      artefact. A run reviewing a repository other than the one this token belongs to refuses to
+      upload, because alerts would attribute another repository's findings to this one.
+    required: false
+    default: ""
+
+outputs:
+  status:
+    description: >
+      Whether the run FINISHED. `done` or `audited` mean it did; anything else (`error`, `budget`,
+      `maxsteps`) means it stopped early and the absence of findings below is not a clean result.
+      The check stays green either way — installing Shard does not break your build — so this is
+      where a workflow reads what actually happened. The SARIF carries the same fact in
+      `invocations[].executionSuccessful`.
+  findings:
+    description: "Count of findings emitted"
+  gate-eligible:
+    description: "Count carrying a reproduction or a demonstration — the only ones that may gate"
+  sarif-path:
+    description: "SARIF file for upload to code scanning"
+  report-path:
+    description: "The short markdown report, for a pull-request comment"
+  bundle-path:
+    description: "Reproduction bundles: the crashing input and the command that produced it"
+  telemetry-path:
+    description: >
+      Structured telemetry for this run as JSON — wall clock, model turns, per-tool call counts and
+      bytes returned, the context growth curve, and what each compaction reclaimed. Carries a gaps list
+      naming anything the run could not measure rather than reporting it as zero. Arguments and tool
+      output are described, never quoted, so it holds no source and no model prose and is safe to
+      forward. Empty on a run that wrote none.
+  log-path:
+    description: >
+      The same run, human-readable, in order, with timings and sizes. This is about the RUN;
+      report-path is about the CODE. Empty on a run that wrote none.
+
+# NO `${` + `{{` EXPRESSION MAY APPEAR ANYWHERE IN THIS FILE, INCLUDING INSIDE A DESCRIPTION.
+#
+# GitHub evaluates workflow expressions in action metadata, and the `secrets` and `github` contexts do
+# not exist here. Two of these sat in the `base_ref` and `slug` descriptions as COPY-PASTEABLE ADVICE
+# for months and the whole manifest failed to load on the first real runner:
+#
+#     Failed to load .../action.yml
+#     (Line 190, Col 18): Unrecognized named-value: 'github'. Located at position 1 within expression:
+#     github.repository
+#
+# Not the input being wrong — the FILE being unloadable, so every step using this action died before
+# the container was built and none of the fourteen inputs mattered. Measured 2026-08-11 on the first
+# pull request this repository ever opened, and invisible to every local check because `yaml.safe_load`
+# reads them as ordinary strings and nothing but GitHub's own parser evaluates them.
+#
+# Describe the expression by NAME (`a github.repository expression`) and keep the copy-pasteable block
+# in README.md, which Actions never parses. A guard in the suite fails if one reappears.
+runs:
+  using: "docker"
+  image: "Dockerfile"
+  # `args` is EXPLICIT and it is the whole defect this file carried until 2026-08-08: with no args
+  # block a container action runs the image's CMD, which is `--help`, so the action printed help,
+  # exited 0 — a passing check — and ignored every input above. See `shard/action.py`.
+  #
+  # One argument, because the interface is the environment: GitHub passes each input as INPUT_<NAME>,
+  # and `shard action` maps those to the subcommand and flags. A static args list cannot, since the
+  # three modes take different flags, and it cannot write $GITHUB_OUTPUT either.
+  args:
+    - "action"
