@@ -10,6 +10,29 @@ will not be merged, so you do not spend an evening on something we then decline.
 3. Every change needs a **deterministic test** — no network, no model calls.
 4. Run `python -m pytest -q` and `python -m ruff check shard/` before you push.
 
+## Where your pull request actually goes
+
+**This repository is generated.** It is built from a private development tree by
+a release job, which is why every file here is complete and self-contained and
+why there is no `docs/` directory full of design notes. That has one consequence
+worth knowing before you spend an evening, and it is not obvious from the outside:
+
+**Your pull request is reviewed here and ported upstream — it is not merged
+here.** A maintainer applies it to the development tree, and it reaches you in
+the next release as part of a regenerated tree rather than as your merge commit.
+Your authorship is preserved in the changelog and in the upstream history; what
+you will *not* see is your commit sitting on this repository's `main`.
+
+That is also why the release refuses to publish if it finds a commit here it did
+not generate: work that never reached the development tree would be destroyed by
+the next regeneration, so the job stops instead.
+
+**A fix to a shared module ships in both editions**, and that is what the CLA is
+for — see [The CLA](#the-cla). It is one grant, once, and it is the difference
+between a fix that can be used and one that has to be reimplemented.
+
+None of this changes what makes a good contribution. It changes where it lands.
+
 ## What this project is
 
 Shard is a security agent that runs inside your CI pipeline, on a model endpoint
@@ -64,14 +87,22 @@ python -m pytest -q             # the whole suite. No API key needed, no network
 python -m ruff check shard/     # lint
 ```
 
-To try the action against a repository locally:
+To try it against a repository locally:
 
 ```bash
-python -m shard survey --repo /path/to/repo --out-dir ./out
+shard survey --repo /path/to/repo --out-dir ./out     # or: python -m shard survey ...
+shard preflight --repo /path/to/repo
 ```
 
-`survey` needs no model endpoint. `diff` does — set the environment variable
-named by your `api_key_env` input and see the README for the supported providers.
+`survey` and `preflight` need no model endpoint, no key and no network. `diff`
+needs all three — set the environment variable named by your `api_key_env` input
+and see the README for the supported providers.
+
+The fastest way to see the whole loop is [`examples/`](examples/): three small
+projects with a real defect, a real entry point and real benign controls. They
+run with no key, and `tests/test_examples.py` executes every one of them, so a
+change that breaks a sample turns this repository's CI red rather than being
+discovered by a reader.
 
 ## Reporting a false positive
 

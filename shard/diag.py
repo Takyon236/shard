@@ -14,7 +14,7 @@ lifetimes, different consumers, different failure modes.
 
 **Why configuration lives here rather than at the entry point.** The usual rule is that library code
 configures nothing — and this module still installs no handler unless asked. But the live entry point is
-the predecessor project's `scripts/the benchmark/cloud_sweep.py`, in a *different repo*, and the standing directive is that
+the predecessor project's maintenance tooling, in a *different repo*, and the standing directive is that
 nothing goes there. So an env-var-driven, idempotent, opt-in configure is the only way diagnostics can
 ever be switched on for a real run without a change landing in another repo. With `SHARD_LOG` unset this
 is a no-op and the package behaves exactly as before — verified by test.

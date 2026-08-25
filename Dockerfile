@@ -108,5 +108,23 @@ r = probe_runtimes({'javascript': 1, 'typescript': 1, 'java': 1, 'kotlin': 1, 's
 'ruby': 1, 'php': 1, 'c#': 1, 'c': 1, 'c++': 1}); \
 sys.exit(0 if not r['absent'] else ('MISSING: ' + repr(r['absent'])))"
 
+# ADDRESSSANITIZER, ASSERTED RATHER THAN ASSUMED. The README claims C and C++ are ground-truthed "under
+# AddressSanitizer" and the action manifest tells a customer how to arrange one — and until 2026-08-24
+# nothing in this build checked that `-fsanitize=address` could link here at all. The manifest had in
+# fact been advising `-static-libasan` on the belief that this image carried no ASAN runtime, which is a
+# statement about an image that predates the compiler being added.
+#
+# THE CHECK IS A REPORT AND NOT A COMPILE. A toolchain can accept the flag, link, and produce a binary
+# that detects nothing; that passes a compile-and-run test and would leave every C finding in this image
+# undemonstrable. So this builds a deliberate one-byte heap overflow, requires the program to DIE, and
+# requires ASAN's own report on stderr. `!` because ASAN's default is `abort_on_error=0` — it prints and
+# exits 1 — so a zero exit here means the sanitiser did not fire.
+RUN printf '#include <stdlib.h>\nint main(void){char *p = malloc(1); p[1] = 1; return p[1];}\n' \
+      > /tmp/asan.c \
+ && cc -fsanitize=address -g -o /tmp/asan /tmp/asan.c \
+ && ! /tmp/asan 2> /tmp/asan.err \
+ && grep -q 'AddressSanitizer' /tmp/asan.err \
+ && rm -f /tmp/asan.c /tmp/asan /tmp/asan.err
+
 ENTRYPOINT ["python", "-m", "shard"]
 CMD ["--help"]

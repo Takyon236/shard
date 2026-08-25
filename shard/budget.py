@@ -184,6 +184,10 @@ class BudgetGovernor:
     def __init__(self, budget: Budget, *, now: float | None = None) -> None:
         self.budget = budget
         self._spent: dict[str, float] = {r: 0.0 for r in self._RESOURCES}
+        # Headroom CLAIMED by work in flight and not yet charged. Kept apart from `_spent` on purpose:
+        # `spent()` must go on meaning "what this run really cost", which is what the report prints and
+        # what a customer reconciles against an invoice. See `reserve`.
+        self._reserved: dict[str, float] = {r: 0.0 for r in self._RESOURCES}
         self._start = now if now is not None else time.time()
         # The governor is shared across concurrent sub-loops (orchestrator fan-out), so the
         # read-modify-write in spend() must be serialized — otherwise concurrent spends race and
@@ -267,6 +271,51 @@ class BudgetGovernor:
                 return False
             self._spent[resource] = new
             return True
+
+    def reserve(self, resource: str, amount: float) -> bool:
+        """Atomically CLAIM headroom for a call that is about to be made. True if it fits.
+
+        **`can_afford()` followed by a call is not a check under concurrency, and that is what this
+        replaces.** The dollar ceiling is enforced before a call rather than after it, because the
+        provider bills whatever the ledger would have preferred — but the enforcement was a READ
+        (`remaining("usd")`) with the spend arriving much later, at the far end of a model round-trip.
+        the separate package fans sub-loops out on a thread pool over ONE shared governor, so N loops all
+        read the same headroom, all conclude they can afford a call, and all make one. The cap is then
+        crossed by up to N calls instead of the one the docstrings account for.
+
+        A reservation is not a spend and is never reported as one. It is headroom that is not available
+        to anybody else until the caller `release`s it — which the caller must do on every path,
+        including the one where the call raised, or the run starves itself of budget it never used.
+
+        ``wall_seconds`` cannot be reserved: time is measured, not claimed, and there is nothing to
+        debit. It answers from live headroom so a caller can branch on all resources uniformly.
+        """
+        if resource not in self._RESOURCES:
+            raise ValueError(f"unknown budget resource: {resource}")
+        if resource == "wall_seconds":
+            return self.can_afford(resource, amount)
+        with self._lock:
+            limit = self._limit(resource)
+            if limit is not None and self._spent[resource] + self._reserved[resource] + amount > limit:
+                return False
+            self._reserved[resource] += amount
+            return True
+
+    def release(self, resource: str, amount: float) -> None:
+        """Give back headroom claimed by :meth:`reserve`. Never below zero — a double release is a
+        caller bug that must not manufacture budget out of arithmetic."""
+        if resource not in self._RESOURCES or resource == "wall_seconds":
+            return
+        with self._lock:
+            self._reserved[resource] = max(0.0, self._reserved[resource] - amount)
+
+    def reserved(self, resource: str) -> float:
+        """Headroom currently claimed by work in flight. Reported separately from `spent` because they
+        are different claims: one is money gone, the other is money somebody expects to spend."""
+        if resource == "wall_seconds":
+            return 0.0
+        with self._lock:
+            return self._reserved.get(resource, 0.0)
 
     def check(self) -> None:
         """Raise if any metered resource is already past its cap (e.g. wall clock)."""

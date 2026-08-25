@@ -654,6 +654,16 @@ class RunFacts:
     #: ceiling bound twice, and the second time the agent could not read the backend that would have
     #: cleared a candidate, so the candidate shipped to the customer as a defect. It was not one.
     exec_refused: int | None = None
+    #: How many executions the agent MADE, or `None` when it could not execute at all. See
+    #: `simple.SimpleRun.exec_calls` for the measurement that bought it: five real reviews of French
+    #: public-administration repositories where every run executed, one of them REPRODUCING a defect in
+    #: its own prose, under a header saying nothing could be proven by execution.
+    #:
+    #: The two facts are not in tension once both are printed, and that is the whole of the fix. The
+    #: `witness` row is about ADJUDICATION — whether an observation was re-made after the loop, against
+    #: controls, by something the agent cannot write to. This row is about INVESTIGATION. A reader given
+    #: only the first concludes the review never ran anything.
+    exec_calls: int | None = None
     #: `report_id(env)` — the run's own number, `000000` when it did not come from numbered CI. Carried
     #: rather than read here, because this module takes no environment: the caller owns `os.environ`.
     report_id: str = ""
@@ -733,6 +743,49 @@ def _duration(seconds: float) -> str:
         return f"{minutes}m {secs:02d}s"
     hours, minutes = divmod(minutes, 60)
     return f"{hours}h {minutes:02d}m"
+
+
+def _observed(run: RunFacts) -> tuple[str, str] | None:
+    """The row answering *what did this run actually run*, or None when it could not run anything.
+
+    **A SEAM RATHER THAN A BLOCK, for the reason `_stopped_by` is one.** `_summary_table` sat at 192
+    against a 200-point readability threshold that the maintainers' suite defends, and it got there
+    by having exactly this kind of one-question row lifted out of it. Inlining this one put it at 203 —
+    over the line, and the ratchet's own note calls a boundary shave *"the single highest-return
+    dishonest edit available anywhere in this file"*. So the answer is the honest version of the same
+    move: one row, one question, one function.
+
+    ## What the row is FOR
+
+    **The artefact contradicted itself on one screen.** The header's `witness` row says *"none declared
+    — nothing in this run could be proven by execution"*, which is a statement about ADJUDICATION: was
+    an observation re-made after the loop, against controls, by something the agent cannot write to.
+    Nothing said what the agent ITSELF ran while forming its claims.
+
+    Measured across five reviews of French public-administration repositories, 2026-08-24/25
+    (a measured run): all five executed — 30 shell calls on the first —
+    and on the Etalab review the agent's own finding read *"I reproduced this by executing the exact
+    helper …: it throws"*, two paragraphs below a header saying nothing could be proven by execution.
+    Both sentences are true. Printing only one of them is what made the report wrong.
+
+    ## Why zero is printed here and not one row up
+
+    `exec_refused`'s zero is skipped, because "the ceiling refused nothing" is the ordinary case and a
+    row for it is one a skimmer learns to skip. This zero is the opposite: it says the agent COULD run
+    code and never did, so every claim in the report was reasoned from reading alone — which is the
+    fact a reader weighing an unverified finding needs most, and the signal the maintainers' notes's standing
+    process rule asks for by name. `None` remains not-armed, so the ablation arm in a maintenance script
+    stays distinguishable from a review that declined to look.
+    """
+    if run.exec_calls is None:
+        return None
+    if run.exec_calls:
+        return ("observed",
+                f"the agent ran **{run.exec_calls}** command(s) in this checkout while forming these "
+                f"claims. That is investigation, not adjudication — a finding is only gate-eligible "
+                f"when the row above re-ran it afterwards, against controls")
+    return ("observed", "the agent could run code here and **never did**, so every claim below was "
+                        "reasoned from reading alone")
 
 
 def _stopped_by(status: str, run: RunFacts) -> tuple[str, str] | None:
@@ -838,6 +891,9 @@ def _summary_table(findings, *, status: str, run: RunFacts | None,
         rows.append(("gate", f"{gate}; {reproduced} gate-eligible"))
     rows.append(("witness", f"`{run.witness_entry}`" if run.witness_entry else
                  "**none declared — nothing in this run could be proven by execution**"))
+    observed_row = _observed(run)
+    if observed_row:
+        rows.append(observed_row)
     # THE MACHINE, and only when it took something away. A row on every run saying "all levers
     # available" is a row a skimmer stops reading, and then it is not read on the run where four of
     # them were dead. Same rule `machine_note` follows, and the same one `caveats` above follows.
@@ -849,7 +905,7 @@ def _summary_table(findings, *, status: str, run: RunFacts | None,
     # TARGET, not of the box, and no customer repository has one. Asked directly whether a paid GitHub
     # runner would help, the honest answer is no, and the report was saying otherwise.
     #
-    # And the "less leverage" half was not true either. `deep-proof.yml`'s own header records that the
+    # And the "less leverage" half was not true either. an internal CI workflow's own header records that the
     # `prepared` harness kind "compiles the target with the runner's own gcc and ASAN" and that
     if run.unavailable_levers:
         names = ", ".join(f"`{n}`" for n in run.unavailable_levers)
@@ -1339,7 +1395,7 @@ def _sweep_poc(workdir: pathlib.Path, signature: str, by_signature: dict) -> str
 
     That is a reproduction that does not reproduce what it claims — the one thing this product may
     never do — and it was caught only by replaying every bundle against a freshly compiled target
-    outside the product, which is the discipline `deep-proof.yml` already holds itself to.
+    outside the product, which is the discipline an internal CI workflow already holds itself to.
 
     `None` when the bytes did not survive, and it is deliberate: `report.py` writes no bundle without
     a path, so the finding arrives with no attached input. Honest and visibly incomplete beats a

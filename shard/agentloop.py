@@ -509,6 +509,12 @@ class LoopState:
     #: it as the price a call is assumed to cost before it is made, and 0.0 (the first turn, or any
     #: unpriced route) makes that guard inert by construction.
     max_call_usd: float = 0.0
+    #: Dollars this loop has CLAIMED on the shared governor for a call in flight, and not yet given
+    #: back. `_unaffordable_next_call` takes the claim atomically so concurrent sub-loops cannot each
+    #: read the same headroom and each spend it; `_release_call` returns it once the real charge has
+    #: landed. Zero whenever no call is outstanding, which is every state a reader of this record can
+    #: observe from outside the turn.
+    reserved_usd: float = 0.0
 
 
 class ToolCallingLoop:
@@ -788,14 +794,38 @@ class ToolCallingLoop:
         cost of a call is knowable only after it returns. What IS fixable is the claim, and
         `--max-spend-usd`'s help, `action.yml` and the report now say this rather than promising an
         exactness the wire cannot deliver.
+
+        **A READ IS NOT A CHECK WHEN THE GOVERNOR IS SHARED.** `remaining("usd")` answered from a
+        ledger that would not change until the call it is guarding had already been made and billed,
+        and the separate package fans sub-loops out over ONE governor on a thread pool. Every one of them
+        read the same headroom, every one concluded it could afford a call, and every one made it — so
+        the ceiling was crossed by as many calls as there were loops, not by the single call the
+        residual below accounts for. The reservation is taken atomically instead, and `_release_call`
+        gives it back once the real charge has landed.
         """
         if self.governor is None or st.max_call_usd <= 0.0:
             return 0.0
-        # An unpriced route leaves the limit None and `remaining` inf, so this is inert there too —
-        # which matters, because `--max-spend-usd` on a route that reports no cost must not stop a run
+        # An unpriced route leaves the limit None and `reserve` always fits, so this is inert there too
+        # — which matters, because `--max-spend-usd` on a route that reports no cost must not stop a run
         # on a number nobody measured.
-        short = st.max_call_usd - self.governor.remaining("usd")
-        return short if short > 0.0 else 0.0
+        if self.governor.reserve("usd", st.max_call_usd):
+            st.reserved_usd = st.max_call_usd
+            return 0.0
+        # The reservation failed, so `max_call_usd` is STRICTLY greater than the free headroom and this
+        # subtraction is positive by construction — no epsilon, and no branch that could return 0.0 on
+        # the refusal path and let the call through anyway.
+        return st.max_call_usd - (self.governor.remaining("usd") - self.governor.reserved("usd"))
+
+    def _release_call(self, st: LoopState) -> None:
+        """Give back the headroom `_unaffordable_next_call` claimed, on every path out of a turn.
+
+        Paired with the reservation rather than folded into `_meter`, because a turn can end without
+        being metered at all — a raising backend, a forced-tool rejection, a `continue` on an empty
+        response — and a reservation nothing releases is budget the run permanently denies itself.
+        """
+        if self.governor is not None and st.reserved_usd:
+            self.governor.release("usd", st.reserved_usd)
+            st.reserved_usd = 0.0
 
     def _budget_stop(self, st: LoopState, step: int) -> AgentResult | None:
         """Does the budget end the run before this step? The terminal result if so, else None.
@@ -811,6 +841,10 @@ class ToolCallingLoop:
         """
         if self.governor is None:
             return None
+        # LAST STEP'S CLAIM GOES BACK BEFORE THIS STEP TAKES ONE. The call it was reserved for has
+        # either been billed by `_meter` or never happened, and either way the claim is stale — holding
+        # it while claiming again would make one loop reserve the same money twice per step.
+        self._release_call(st)
         try:
             self.governor.check()
         except BudgetExceeded as e:
@@ -827,6 +861,90 @@ class ToolCallingLoop:
             f"stopping before a call this run cannot afford: the most expensive call so far cost "
             f"${st.max_call_usd:.4f} and ${left:.4f} of the --max-spend-usd ceiling is left",
             limit_hit="usd")
+
+    def _send_and_bill(self, st: LoopState, messages: list, tools: list,
+                       step: int) -> tuple[object, str]:
+        """Make this step's provider call and charge what it cost. `(result, capped-resource-or-"")`.
+
+        **ONE STEP CAN MAKE TWO PROVIDER CALLS, and until 2026-08-24 it metered one.** A forced
+        `tool_choice` a provider rejects answers with an HTTP error or a refusal — `opus-4.8` burned
+        9,003 prompt tokens refusing one, four attempts out of four — and the degrade-safe retry below
+        overwrote the result, dropping that charge on the floor. It is carried in locals rather than
+        folded onto the result object, because `backend` is an injection point and a double's result
+        need not be a dataclass this could rebuild.
+
+        Extracted from `run` for the reason the maintainers' suite exists to reward: "send the turn
+        and account for it" is a whole decision, and leaving it inline grew the largest function in the
+        shipped tree past the ceiling its own ratchet defends.
+        """
+        sent_at = time.monotonic()
+        # Charges this STEP incurred on a call whose result is not the one returned. Zero on every
+        # ordinary step; the forced-tool rejection is the only path that makes two.
+        carried_tokens, carried_usd = 0, 0.0
+        # Per-turn tool_choice forcing (weak-model lever): the hook may force a tool call on early
+        # turns. Only pass tool_choice when forcing is ACTIVE (non-None) — the default path keeps the
+        # exact old chat() signature, so backends/mocks whose chat() predates tool_choice are
+        # unaffected.
+        tc = None
+        if self.force_tool_hook is not None:
+            try:
+                tc = self.force_tool_hook(step)
+            except Exception as e:            # a broken hook degrades to "auto", never traps the loop
+                self._rec("force_tool_hook_error", step=step, error=f"{type(e).__name__}: {e}")
+                tc = None
+        if tc is not None:
+            self._rec("force_tool", step=step, tool_choice=tc)
+            res = self.backend.chat(messages, tools, model=self.model, timeout=self.timeout,
+                                    tool_choice=tc)
+            if not res.ok:
+                # DEGRADE-SAFE FORCING (Fable-review HIGH): a provider that REJECTS the forced
+                # tool_choice (OpenRouter 404 "no endpoint supports this tool_choice", or a named tool
+                # absent from the set) returns a terminal non-ok — which would otherwise kill the task
+                # and, on a forcing run, wipe every task on turn 1. Retry this turn ONCE with forcing
+                # DROPPED (auto) before it goes terminal.
+                self._rec("force_tool_rejected", step=step, error=(res.error or "")[:200])
+                carried_tokens = int(getattr(res, "tokens", 0) or 0)
+                carried_usd = float(getattr(res, "cost_usd", 0.0) or 0.0)
+                res = self.backend.chat(messages, tools, model=self.model, timeout=self.timeout)
+        else:
+            res = self.backend.chat(messages, tools, model=self.model, timeout=self.timeout)
+
+        step_tokens = int(getattr(res, "tokens", 0) or 0) + carried_tokens
+        step_usd = float(getattr(res, "cost_usd", 0.0) or 0.0) + carried_usd
+        # WHERE THE TOKENS AND THE SECONDS WENT. A finished run reported one total in its cost line and
+        # could attribute none of it to a step; `shard/telemetry.py` said so in a `gaps` entry rather
+        # than emitting a zero, and this is the record that closes it.
+        #
+        # ONE RECORD PER TURN, and a forced turn the provider REJECTED makes two provider calls and
+        # still lands one record here — the rejected one is marked by its own `force_tool_rejected`
+        # event above. Stated because a reader counting `llm_request` events against a provider bill
+        # needs to know which they are counting.
+        #
+        # `abandoned` is the count of attempts inside the surviving call whose bill the transport never
+        # saw at all (`llm.chat`). It is zero on every route that does not stream, and a reader
+        # reconciling this journal against an invoice needs it to know the row is a floor, not a total.
+        self._rec("llm_request", step=step, seconds=round(time.monotonic() - sent_at, 3),
+                  total_tokens=step_tokens, cost_usd=step_usd,
+                  abandoned=int(getattr(res, "abandoned_attempts", 0) or 0),
+                  ok=bool(getattr(res, "ok", True)),
+                  finish_reason=getattr(res, "finish_reason", "") or "")
+        # Account the turn's tokens BEFORE metering. ``governor.spend()`` COMMITS the spend and then
+        # raises BudgetExceeded when the cap is crossed, so the tokens of the trip-wire turn are on the
+        # governor's ledger; incrementing first keeps this loop's local total and the governor's ledger
+        # in agreement on BOTH paths — result.tokens == governor.spent("tokens") whether the run ends
+        # normally or on a budget-exceed. (Counting after ``_meter`` would silently drop the final
+        # turn's tokens from result.tokens while the ledger still carried them.)
+        st.spent += step_tokens
+        # THE OBSERVED PRICE OF A CALL, which is what makes the pre-call ceiling self-calibrating.
+        # Recorded whether or not the turn was productive: a call that returned an error was still
+        # charged for, so it is evidence about what the NEXT one will cost.
+        #
+        # It is the price of the STEP, and since `llm.chat` began folding its discarded retries in,
+        # that price includes them. The guard and the ledger read one number, so a run whose provider is
+        # retrying reserves what a retrying call really costs rather than what its last attempt did —
+        # which is the half of the shortfall a fix to the ledger alone would leave.
+        st.max_call_usd = max(st.max_call_usd, step_usd)
+        return res, self._meter(step_tokens, step_usd)
 
     def _rec(self, type: str, **data) -> dict:
         """Journal an event stamped with THIS loop's ``role``.
@@ -1251,6 +1369,23 @@ class ToolCallingLoop:
 
 
     def run(self, goal: str) -> AgentResult:
+        """Drive the loop to a terminal state, and give back any budget it was still holding.
+
+        **The `finally` is the whole of this wrapper and it is not defensive tidiness.** The dollar
+        guard CLAIMS headroom on the governor before each call (`_unaffordable_next_call`), and that
+        governor is SHARED across the sub-loops the separate package fans out. A loop that returns while
+        still holding a claim — every terminal path here is a `return`, and there are eleven of them —
+        subtracts that claim from the ceiling for the rest of the run, for a call that will never be
+        made. Releasing at each of the eleven is the arrangement that goes wrong when a twelfth is
+        added; releasing here cannot be forgotten.
+        """
+        st = LoopState()
+        try:
+            return self._run(goal, st)
+        finally:
+            self._release_call(st)
+
+    def _run(self, goal: str, st: LoopState) -> AgentResult:
         tools = self.registry.openai_tools(self.tool_names)
         full_adv_names = [t["function"]["name"] for t in tools]   # canonical no-resolver advertised set (L4 base)
         messages: list = [{"role": "system", "content": self.system},
@@ -1262,7 +1397,6 @@ class ToolCallingLoop:
                   self_review_interval=self.self_review_interval,
                   enactment_break_after=self._enact_break_after)
         self._rec("goal", text=goal)
-        st = LoopState()
 
         for step in range(1, self.max_steps + 1):
             stopped = self._budget_stop(st, step)
@@ -1325,54 +1459,7 @@ class ToolCallingLoop:
             # cannot see.
             self._rec("context_size", step=step, messages=len(messages), chars=after_chars)
 
-            # Per-turn tool_choice forcing (weak-model lever): the hook may force a tool call on early turns. Only
-            # pass tool_choice when forcing is ACTIVE (non-None) — the default path keeps the exact old chat()
-            # signature, so backends/mocks whose chat() predates tool_choice are unaffected.
-            _sent_at = time.monotonic()
-            _tc = None
-            if self.force_tool_hook is not None:
-                try:
-                    _tc = self.force_tool_hook(step)
-                except Exception as e:                      # a broken hook degrades to "auto", never traps the loop
-                    self._rec("force_tool_hook_error", step=step, error=f"{type(e).__name__}: {e}")
-                    _tc = None
-            if _tc is not None:
-                self._rec("force_tool", step=step, tool_choice=_tc)
-                res = self.backend.chat(messages, tools, model=self.model, timeout=self.timeout, tool_choice=_tc)
-                if not res.ok:
-                    # DEGRADE-SAFE FORCING (Fable-review HIGH): a provider that REJECTS the forced tool_choice
-                    # (OpenRouter 404 "no endpoint supports this tool_choice", or a named tool absent from the set)
-                    # returns a terminal non-ok — which would otherwise kill the task and, on a forcing run, wipe
-                    # every task on turn 1. Retry this turn ONCE with forcing DROPPED (auto) before it goes terminal.
-                    self._rec("force_tool_rejected", step=step, error=(res.error or "")[:200])
-                    res = self.backend.chat(messages, tools, model=self.model, timeout=self.timeout)
-            else:
-                res = self.backend.chat(messages, tools, model=self.model, timeout=self.timeout)
-            # WHERE THE TOKENS AND THE SECONDS WENT. A finished run reported one total in its cost
-            # line and could attribute none of it to a step; `shard/telemetry.py` said so in a `gaps`
-            # entry rather than emitting a zero, and this is the record that closes it.
-            #
-            # ONE RECORD PER TURN, and a forced turn the provider REJECTED makes two provider calls and
-            # still lands one record here — the rejected one is marked by its own `force_tool_rejected`
-            # event above. Stated because a reader counting `llm_request` events against a provider
-            # bill needs to know which they are counting.
-            self._rec("llm_request", step=step, seconds=round(time.monotonic() - _sent_at, 3),
-                      total_tokens=int(getattr(res, "tokens", 0) or 0),
-                      cost_usd=float(getattr(res, "cost_usd", 0.0) or 0.0),
-                      ok=bool(getattr(res, "ok", True)),
-                      finish_reason=getattr(res, "finish_reason", "") or "")
-            # Account the turn's tokens BEFORE metering. ``governor.spend()`` COMMITS the spend and then
-            # raises BudgetExceeded when the cap is crossed, so the tokens of the trip-wire turn are on the
-            # governor's ledger; incrementing first keeps this loop's local total and the governor's ledger
-            # in agreement on BOTH paths — result.tokens == governor.spent("tokens") whether the run ends
-            # normally or on a budget-exceed. (Counting after ``_meter`` would silently drop the final
-            # turn's tokens from result.tokens while the ledger still carried them.)
-            st.spent += res.tokens or 0
-            # THE OBSERVED PRICE OF A CALL, which is what makes the pre-call ceiling self-calibrating.
-            # Recorded whether or not the turn was productive: a call that returned an error was still
-            # charged for, so it is evidence about what the NEXT one will cost.
-            st.max_call_usd = max(st.max_call_usd, float(res.cost_usd or 0.0))
-            hit = self._meter(res.tokens or 0, res.cost_usd or 0.0)
+            res, hit = self._send_and_bill(st, messages, tools, step)
             if hit:
                 return self._result("budget", step, st.n_calls, st.spent, "run budget exhausted",
                                     limit_hit=hit)

@@ -1,7 +1,7 @@
 """The entry point — the single external consumer surface, and what closes C4.
 
 the integration guide flagged the problem this resolves: the GitHub Action was going to become
-a SECOND external consumer alongside the predecessor project's `scripts/the benchmark/cloud_sweep.py`, leaving the package
+a SECOND external consumer alongside the predecessor project's maintenance tooling, leaving the package
 with two entry points and the maintainers' notes's first-listed trap live in both. The benchmark driver and the
 product now run the same path, which is the only arrangement in which a green benchmark is evidence
 about the product rather than about itself.
@@ -1281,6 +1281,10 @@ def _diff_run_facts(args, run, *, spend: dict, scan_facts: dict, changed, tokens
         # AttributeError; a default of `0` would be a claim that nothing was refused, which is the
         # thing we cannot know.
         exec_refused=getattr(run, "exec_refused", None),
+        # WHAT THE AGENT RAN, beside what the ceiling denied. Same `getattr` reason as the line above,
+        # and the same honest-unknown default: `None` omits the row, and a default of `0` would assert
+        # a read-only review of a run we cannot see into.
+        exec_calls=getattr(run, "exec_calls", None),
         witness_entry=args.witness_entry or "", fail_on=args.fail_on,
         usd=spend["usd"], tokens=tokens, seconds=spend["seconds"])
 
@@ -1340,7 +1344,7 @@ def _spend(backend, governor) -> dict:
         #
         # It is not a secondary number for a CI product: wall-clock is what BLOCKS a customer's
         # pipeline, and it is the first thing anybody asks before putting a gate on a pull request.
-        # Both `deep-proof.yml` and every manual run so far computed it OUTSIDE the product with
+        # Both an internal CI workflow and every manual run so far computed it OUTSIDE the product with
         # `date +%s`, which is the tell — an artefact everyone reconstructs by hand is one the product
         # should have written.
         "seconds": round(governor.spent("wall_seconds"), 1),
@@ -1478,6 +1482,12 @@ def _print_preflight(payload: dict, profile) -> None:
           f"${cost['per_month_at_100_runs']['high']:.0f}/month at 100 runs. "
           f"This repository resembles {cost['resembles']}")
     print(f"             band is wide on purpose: {cost['basis']}")
+    # THE TOKENS, BESIDE THE DOLLARS, because the dollars are a floor and the tokens are the half that
+    # has been re-measured since the product could execute. `target.CALIBRATION_TOKENS_ONLY` carries
+    # the runs; the point of printing it is that a customer on an endpoint that reports no price —
+    # a self-hosted vLLM, a subscription — can size a run at all, which they could not before.
+    print(f"             {cost['tokens_low']:,}–{cost['tokens_high']:,} tokens a run. "
+          f"{cost['tokens_basis']}")
     print(f"             what drives it: {cost['driver']}")
     free = payload["free_tier"]
     print(f"free tier    {free['verdict']} — {free['why']}")

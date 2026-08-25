@@ -54,7 +54,7 @@ from shard.sandbox import ExecState, build_exec_tools, exec_budget, scope_digest
 from shard.tools import Tool, ToolContext, ToolRegistry, ToolResult, _grep, _list_dir, _read_file
 from shard.witness import (BENIGN_SUFFIX, INHERITED, INTRODUCED, UNATTRIBUTED, Witness, WitnessSpec,
                            adjudicate, attribute, entry_digest, observed_location,
-                           offered_expectations, self_defeating_marker)
+                           offered_expectations, self_defeating_marker, witness_contract)
 
 DEFAULT_MAX_STEPS = 40
 
@@ -381,9 +381,42 @@ def build_simple_registry(ctx: ToolContext, state: FindingState, *,
     return registry
 
 
+#: How many claims one run will actually EXECUTE a witness for. A backstop, never a target — the
+#: distinction `budget._SWEEP_BACKSTOP` draws, and the same reason for drawing it.
+#:
+#: **Adjudication was the one phase with no ceiling of any kind.** Every other cost in a run is bounded:
+#: tokens and dollars by the governor, the loop by `max_steps`, each execution by `witness.DEFAULT_TIMEOUT`,
+#: the agent's own executions by `sandbox.exec_budget`. The number of claims was bounded by nothing at
+#: all — `report_finding` may be called on every step of a 200-step run — and each surviving claim buys up
+#: to ten executions of the customer's entry point (the attack, the empty baseline, `MAX_BENIGN_CONTROLS`
+#: benign inputs) and, under `--fail-on new`, an `attribute` pass that does the whole of it again at the
+#: base revision. At 60 seconds apiece that is ~21 minutes of runner per claim, after the last ceiling
+#: the run had has already been passed.
+#:
+#: 20 sits five times above the largest claim count in any journal this repository has kept — the
+#: measured maximum of `simple_proposed.count` across `corpora/` is **4** — so a run that reaches it has
+#: a defect in the loop rather than a lot to say, and should be read as one.
+MAX_ADJUDICATED = 20
+
+#: Total wall-clock one run may spend EXECUTING witnesses after the loop has ended, in seconds.
+#:
+#: This is the ceiling that actually binds, and `MAX_ADJUDICATED` is the backstop underneath it: twenty
+#: claims at the per-claim worst case above is seven hours, so a count alone would not bound anything a
+#: customer cares about. 1,200 is chosen to sit ABOVE one whole worst-case claim, so a single expensive
+#: witness is never cut off half-adjudicated, and well below `action.yml`'s own 60-minute default run
+#: ceiling, so the run still has time to write the artefacts that carry the answer.
+#:
+#: A claim refused by either ceiling is still REPORTED. It becomes a hypothesis, which is what a claim
+#: nobody executed is, and `gate_eligible` stays false — the direction every refusal in this module
+#: takes.
+ADJUDICATION_WALL_SECONDS = 1200.0
+
+
 def adjudicate_all(state: FindingState, repo, *, witness_entry: str | None,
                    baseline_digest: str | None, runner=None, workdir=None,
-                   base_repo=None, tampered: str = "") -> list[Finding]:
+                   base_repo=None, tampered: str = "",
+                   max_witnessed: int = MAX_ADJUDICATED,
+                   wall_seconds: float = ADJUDICATION_WALL_SECONDS, clock=None) -> list[Finding]:
     """Turn claims into findings. The ONLY place `gate_eligible` is ever set true.
 
     Runs after the loop has ended, so no proposal can be revised in response to a verdict.
@@ -420,10 +453,21 @@ def adjudicate_all(state: FindingState, repo, *, witness_entry: str | None,
     for — so the control is detection with a consequence, and this is the consequence. The finding is
     still REPORTED and still reaches the customer; it just cannot gate, which is what a demonstration
     nobody can re-verify is worth.
+
+    `max_witnessed` and `wall_seconds` are the two ceilings on THIS phase — see their constants. They
+    are parameters rather than literals for the reason `tampered` is: a test that has to wait twenty
+    minutes to prove a ceiling exists is a test nobody runs, and a ceiling nothing exercises is the
+    class of mechanism the maintainers' notes's standing process rule was written about. `clock` is
+    `time.monotonic` unless injected, and monotonic rather than wall so a clock step cannot hand a run
+    an unbounded phase or cut a bounded one short.
     """
     import subprocess
+    import time as _time
 
     runner = runner or subprocess.run
+    clock = clock or _time.monotonic
+    started = clock()
+    witnessed = 0
 
     proposed = state.proposed
     # (a) Which ordinals a later claim WITHDREW. `_supersedes_target` re-checks the strictly-earlier
@@ -460,6 +504,17 @@ def adjudicate_all(state: FindingState, repo, *, witness_entry: str | None,
                                    entry=witness_entry or "", repo=repo, seq=ordinal, corrects=corrects))
             continue
         if witness_entry and claim.get("witness_expectation"):
+            # THE CEILING IS CHECKED BEFORE THE PAYLOAD IS EVEN DECODED, because the thing being
+            # bounded is the EXECUTION and the decode is what leads to one. A claim past either
+            # ceiling is refused with the reason, in the same shape `tampered` uses.
+            if ceiling := _adjudication_ceiling(witnessed, clock() - started,
+                                                max_witnessed, wall_seconds):
+                out.append(_to_finding(claim, Witness(demonstrated=False,
+                                                      expectation=claim["witness_expectation"],
+                                                      refusal=ceiling),
+                                       entry=witness_entry, repo=repo, seq=ordinal, corrects=corrects))
+                continue
+            witnessed += 1
             # Decoded HERE and not at report time, because a claim reaching this public entry point may
             # never have passed through `_report_finding` — a test, a replay of a stored run, or the PR
             # path reading a state repository all assemble one by hand. A malformed claim is REFUSED
@@ -490,6 +545,25 @@ def adjudicate_all(state: FindingState, repo, *, witness_entry: str | None,
                                attribution=attribution, seq=ordinal, corrects=corrects))
     _separate_anchor_collisions(out)
     return out
+
+
+def _adjudication_ceiling(witnessed: int, elapsed: float, max_witnessed: int,
+                          wall_seconds: float) -> str:
+    """Why this claim will NOT be executed, or "" to adjudicate it.
+
+    Two ceilings, and the sentence names which one bound so the customer can tell "we ran out of clock"
+    apart from "you reported more than this phase will execute". Both read as `<= 0` meaning OFF rather
+    than meaning zero, which is the reading `cli._budget` gives every other ceiling in this product —
+    and a phase permitted zero executions is a gate that never fires, which `action.yml` already argues
+    is worse than a refusal.
+    """
+    if max_witnessed > 0 and witnessed >= max_witnessed:
+        return (f"this run reported more than the {max_witnessed} claims one review will execute a "
+                f"witness for, so this one was not adjudicated and cannot gate")
+    if wall_seconds > 0 and elapsed >= wall_seconds:
+        return (f"the {int(wall_seconds)}s ceiling on post-review adjudication was reached before this "
+                f"claim was executed, so it was not adjudicated and cannot gate")
+    return ""
 
 
 def _supersedes_target(claim: dict, ordinal: int) -> int:
@@ -880,6 +954,23 @@ class SimpleRun:
     #: `None` IS NOT ZERO: not-armed and refused-nothing are different facts about a run, and the arms
     #: in a maintenance script need to tell them apart.
     exec_refused: int | None = None
+    #: How many executions the agent actually MADE, or `None` when it could not execute at all.
+    #:
+    #: **THE RECORD CARRIED WHAT THE CEILING DENIED AND NOT WHAT THE RUN DID**, which is the half a
+    #: reader needs first. Measured on five real reviews of French public-administration repositories,
+    #: 2026-08-24/25 (a measured run): every one executed — 30 shell
+    #: calls on the first — and every report said only *"none declared — nothing in this run could be
+    #: proven by execution"*, which is true of the WITNESS and reads as a claim about the run. On the
+    #: Etalab review the agent's own prose said *"I reproduced this by executing the exact helper …: it
+    #: throws"* two paragraphs under a header stating nothing could be proven by execution. Both
+    #: sentences are correct and the artefact contradicts itself on one screen, which is the defect
+    #: `budget.ScanProfile` records being found the same way and for the same reason.
+    #:
+    #: `0` IS A REAL ANSWER AND IS REPORTED, unlike `exec_refused`'s zero. "The agent could run things
+    #: and chose not to" is the review being read-only, which a customer weighing the finding needs;
+    #: "the ceiling refused nothing" is the ordinary case and would be a row nobody reads. `None`
+    #: stays not-armed — a maintenance script's control arm depends on that distinction.
+    exec_calls: int | None = None
     #: WHY the model calls failed on an `error` status — a key of `report.TRANSPORT_ERROR_ADVICE`, or
     #: `""` when the run did not fail that way or the failure is not one we classify.
     #:
@@ -965,9 +1056,20 @@ def run_simple(*, repo, backend, journal: Journal, scope: tuple[str, ...] = (),
     baseline = entry_digest(repo, witness_entry) if witness_entry else None
     # THE SAME GUARD, WIDENED TO WHAT A SHELL CAN REACH. `entry_digest` protected the entry point back
     # when the loop had no way to touch it; `run` does. The surface that matters is the files a finding
-    # may point at — the changed files — plus the entry point itself, which is already covered above and
-    # is included here as well so a single comparison answers the whole question.
-    scope_before = scope_digest(repo, (*scope, witness_entry) if witness_entry else scope)
+    # may point at — the changed files — plus the WITNESS CONTRACT, which is the entry point and the
+    # benign controls it declares.
+    #
+    # **THE CONTROLS WERE OUTSIDE BOTH DIGESTS UNTIL 2026-08-24, AND THEY ARE THE DIFFERENTIAL.** The
+    # entry point was covered twice over and the files that decide whether its output means anything
+    # were covered by nothing: `witness.benign_controls` returns `()` for a directory that is not
+    # there, and an adjudication with no controls is the configuration an internal audit
+    # measured forging four demonstrations out of four. One `rm -rf .shard/entry.sh.benign` from the
+    # model's own shell bought that, and left this comparison perfectly quiet.
+    #
+    # `witness_contract` is evaluated HERE, before the loop, so the set being protected is the set the
+    # repository declared rather than whatever is left at the end.
+    watched = (*scope, *witness_contract(repo, witness_entry))
+    scope_before = scope_digest(repo, watched)
 
     factory = loop_factory or ToolCallingLoop
     loop = factory(backend=backend, registry=registry, journal=journal,
@@ -1039,10 +1141,10 @@ def run_simple(*, repo, backend, journal: Journal, scope: tuple[str, ...] = (),
     # over whatever it could reach, so an unreadable file digests differently from a readable one and
     # the mismatch arm is the one that fires.
     tampered = ""
-    if scope_digest(repo, (*scope, witness_entry) if witness_entry else scope) != scope_before:
+    if scope_digest(repo, watched) != scope_before:
         tampered = ("the checkout changed during this run, so nothing observed in it can be "
                     "re-verified; the witness was refused rather than adjudicated")
-        journal.record("simple_scope_tampered", scope=len(scope))
+        journal.record("simple_scope_tampered", scope=len(scope), watched=len(watched))
 
     journal.record("simple_proposed", count=len(state.proposed), status=status)
     findings = adjudicate_all(state, repo, witness_entry=witness_entry, baseline_digest=baseline,
@@ -1051,7 +1153,8 @@ def run_simple(*, repo, backend, journal: Journal, scope: tuple[str, ...] = (),
                    gate_eligible=sum(1 for f in findings if f.gate_eligible))
     return SimpleRun(findings=findings, status=status, limit_hit=limit_hit,
                      error_kind=error_kind,
-                     exec_refused=exec_state.refused if exec_state else None)
+                     exec_refused=exec_state.refused if exec_state else None,
+                     exec_calls=exec_state.calls if exec_state else None)
 
 
 def _system(scope: tuple[str, ...], witness_entry: str | None, survey_note: str,

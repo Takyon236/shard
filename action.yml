@@ -93,7 +93,15 @@ inputs:
     required: false
     default: "10"
   max_minutes:
-    description: "Hard wall-clock ceiling. 0 means unmetered."
+    description: >
+      Hard wall-clock ceiling on the review loop. 0 means unmetered.
+
+      Checked BETWEEN steps, so a step in progress finishes rather than being killed part-way — and
+      one step is itself bounded, by a 900-second ceiling that covers a turn including every transport
+      retry inside it. Adjudication runs after the loop has ended and carries its OWN ceiling rather
+      than this one, because it spends runner time and not inference: cutting it short by a budget
+      meant for model calls would throw away the evidence the run was for. Both are stated here rather
+      than left to be discovered, because a ceiling with an exception is not the ceiling it is named.
     required: false
     default: "60"
   max_tokens:
@@ -162,16 +170,27 @@ inputs:
       That is a real limit and it is the honest one: a gate that fired on the agent's own say-so
       would make the anti-slop guarantee false.
 
-      IT MUST BE SELF-CONTAINED. It runs INSIDE this action's container, which carries python and bash
-      and NOTHING ELSE — no gcc, no clang, no make. An entry point that compiles your project will fail
-      to build there, and the failure is QUIET: the run completes, every finding stays a hypothesis,
-      gate-eligible is 0, and nothing says why. Measured 2026-08-10 on a C target: the same commit
-      produced 2 reproductions when the entry point had a prebuilt binary and 0 when it had to compile.
+      IT RUNS INSIDE THIS ACTION'S CONTAINER, so what it may invoke is what the image carries — and
+      the image asserts at build time that every one of these runs, rather than claiming it here:
+      python3, bash, git, node 22, a headless JRE, ruby, php, the .NET 8 runtime, and gcc/g++ with
+      libc6-dev. Absent: any JDK, the .NET SDK, and every other toolchain — Go, Rust, Swift among them.
+      `shard preflight` names whichever runtime YOUR repository needs and does not find, for free,
+      before you spend anything on a review.
 
-      So BUILD IN AN EARLIER STEP and have the entry point only RUN what is already in the workspace.
-      For a sanitiser build, link the runtime statically (`-static-libasan`) — the container has no
-      libasan — and set `ASAN_OPTIONS=abort_on_error=1` so a detected fault raises a fatal signal
-      rather than ASAN's default exit 1, which is indistinguishable from your program rejecting input.
+      WHAT IS NOT HERE IS YOUR BUILD, and that is the part worth planning around. A JRE runs the
+      classes your build already emitted and a .NET runtime runs your assembly; neither compiles.
+      So BUILD IN AN EARLIER STEP and have the entry point RUN what is already in the workspace.
+      C and C++ are the exception — a compiler is present, so an entry point that builds its own small
+      witness works too. Measured 2026-08-10, back when nothing here could compile: the same commit
+      produced 2 reproductions when the entry point had a prebuilt binary and 0 when it had to build
+      one, and the failure was QUIET — the run completed, every finding stayed a hypothesis,
+      gate-eligible was 0, and nothing said why. A build your entry point cannot perform still fails
+      exactly that way, which is why an earlier step is the reliable arrangement even where a compiler
+      would serve.
+
+      FOR A SANITISER BUILD set `ASAN_OPTIONS=abort_on_error=1`, so a detected fault raises a fatal
+      signal rather than ASAN's default exit 1 — which is indistinguishable from your program rejecting
+      the input, and is therefore not something this product will treat as a demonstration.
 
       DECLARE BENIGN INPUTS BESIDE IT, and this is the single highest-value thing you can add. Put
       ordinary, non-malicious inputs in a directory named after the entry point plus `.benign` —

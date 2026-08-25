@@ -94,8 +94,8 @@ NOT_A_FLAG = frozenset({"github_token", "id_token"})
 #: **EMPTY SINCE 2026-08-13, and the mechanism stays.** `scope_file` was the only entry and it is off
 #: the manifest — an internal audit. Being honest about an inert input was the
 #: right call while it was declared, and it was still a security product shipping a security control
-#: that never executes, which is a review liability the honesty does not remove. `shard/scope.py` is
-#: unchanged and `SECURITY.md` still describes it; the input comes back in the commit that WIRES it.
+#: that never executes, which is a review liability the honesty does not remove. The module behind it
+#: is unchanged and `SECURITY.md` still describes it; the input comes back in the commit that WIRES it.
 #:
 #: Kept rather than deleted because the guard is the point: the maintainers' suite asserts the
 #: manifest equals `INPUTS | NOT_WIRED`, so an input added to the product surface and to neither is a
@@ -183,10 +183,10 @@ def argv_for(env) -> list[str]:
     # review — so an artefact carrying it cannot be attributed to anything. Measured 2026-08-13 on a
     # real scan of urllib3 (the maintainers' notes, the SCAN block): the survey payload said
     # `"repo": "/github/workspace"`, and the diff report — which DID have a slug — named
-    # `Takyon236/shard-v2`, because the workflow scanning somebody else's code is not that code.
+    # `the development tree`, because the workflow scanning somebody else's code is not that code.
     #
     # `GITHUB_REPOSITORY` stays the default, and the input still overrides it: that is right for the
-    # arrangement this was written for, a customer scanning their own repository, and `scan-target.yml`
+    # arrangement this was written for, a customer scanning their own repository, and an internal CI workflow
     # is the one that must say otherwise. Both halves are now reachable from every mode.
     _opt(argv, "--slug", _input(env, "slug") or (env.get("GITHUB_REPOSITORY") or ""))
 
@@ -300,7 +300,7 @@ def run(env=None, *, invoke=None, echo=print, opener=None) -> int:
     #
     # **A step's LABEL cannot come from in here, and that is a platform fact rather than a choice.**
     # GitHub resolves `name:` before this container starts, so a `uses:` step without one renders as
-    # `Run ./` — and `runner-proof.yml` showed FOUR steps labelled `Run ./` in one job and THREE
+    # `Run ./` — and an internal CI workflow showed FOUR steps labelled `Run ./` in one job and THREE
     # labelled `Run ./vendor/shard` in another, each asserting something different. Run 32079827043's
     # own step list is the evidence.
     #
@@ -331,7 +331,7 @@ def describe(argv: list[str], env=None) -> str:
 
     The mode comes first because it is what a reader looks for, then only the facts that distinguish two
     invocations of the SAME mode against the SAME target: what the change was measured against, and
-    which ceilings were imposed. `runner-proof.yml`'s metered job runs `diff` three times over one
+    which ceilings were imposed. an internal CI workflow's metered job runs `diff` three times over one
     pinned target and the three differ in nothing else.
 
     A revision is truncated for the same reason `report._short` truncates one: a 40-character SHA in a
@@ -566,7 +566,7 @@ def upload_sarif(env, payload: dict, *, opener=None, echo=print) -> bool:
     shape this product refuses everywhere else.
 
     **IT REFUSES TO UPLOAD SOMEBODY ELSE'S SCAN.** `GITHUB_REPOSITORY` is the repository whose token
-    we hold; `slug` is the repository that was REVIEWED, and `.github/workflows/scan-target.yml` is a
+    we hold; `slug` is the repository that was REVIEWED, and an internal CI workflow is a
     live arrangement where they differ. Publishing a third-party review into our own Security tab
     would attribute a stranger's defects to us against a `commit_sha` that does not exist here — the
     same false-attribution defect the report itself had on run `31675518894`, one layer out.
