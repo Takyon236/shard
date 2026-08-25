@@ -12,6 +12,20 @@ local rule that is stricter than semver and exists because of what this product 
 > gates is not a patch. A customer who pinned `v1` and merged on a Friday is entitled to the same
 > answer on Monday.
 
+## [2.1.1] — 2026-08-25
+
+### Fixed
+
+- **A pull request no longer goes red because a registry had a bad minute.** The image job's
+  `docker build` failed on `main` in 36 seconds with `failed to fetch oauth token: … 500 Internal
+  Server Error` from Docker Hub — both base images, before a single layer was built — while the
+  identical commit had passed on a pull request thirteen seconds earlier. These are anonymous pulls,
+  and they are rate-limited per IP while hosted runners share addresses, so it is a recurring failure
+  mode belonging to the network rather than to the change under test. The build now makes three
+  attempts with widening gaps and **still fails at the end**: a genuinely broken image fails exactly as
+  it did before. Contributions are invited here and this is the check a contributor sees; a red tick
+  they cannot explain and did not cause teaches them to ignore it.
+
 ## [2.1.0] — 2026-08-25
 
 **Nothing here widens what gates.** Three of the four changes are about what the product TELLS you —
