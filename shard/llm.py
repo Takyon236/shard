@@ -23,7 +23,7 @@ import re
 import subprocess
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Protocol
 
 from shard.diag import get_logger
@@ -176,6 +176,13 @@ class ChatResult:
                              # is what `--max-spend-usd` was on every run before 2026-08-08. 0.0 from a
                              # backend that does not price its responses; see `_accumulate_usage` on why
                              # "priced 0.0" and "not priced" must not be reported as the same number.
+                             #
+                             # SINCE 2026-08-24 THIS IS THE COST OF THE TURN, not of the last attempt
+                             # in it — see `chat`, which folds the attempts it threw away back in.
+    abandoned_attempts: int = 0  # attempts inside THIS turn whose bill we could not see at all: the
+                             # stream was aborted before any `usage` arrived. The provider still
+                             # generated tokens and still charges for them, so this is the part of the
+                             # turn's real cost that `cost_usd` above is KNOWN not to include.
 
 
 class ToolCallingBackend(Protocol):
@@ -494,7 +501,17 @@ class OpenRouterBackend:
                        # alone cannot tell "this run really cost $0.00" from "no response priced
                        # anything", and the two must not print as the same sentence to a customer
                        # reconciling a bill against the ceiling they set.
-                       "priced_requests": 0}
+                       "priced_requests": 0,
+                       # REQUESTS THE PROVIDER SERVED AND WE NEVER SAW THE END OF. A stream aborted by
+                       # the idle guard, the throughput floor or the absolute ceiling produced tokens
+                       # the provider generated and bills for, and returns `(None, 598, …)` — no body,
+                       # no `usage`, nothing to accumulate. Counted here rather than left out, because
+                       # a ledger that silently omits them reports a run as cheaper than the invoice
+                       # will say it was, and the omission grows with exactly the provider trouble a
+                       # customer would want to see.
+                       "abandoned_requests": 0}
+        # The absolute deadline of the turn in flight ON THIS THREAD. See `_turn_ceiling`.
+        self._turn = threading.local()
         # A single backend instance serves the solver loop AND concurrent sub-agent panels (verifier/oracle/
         # specialist fan out on a ThreadPoolExecutor and reuse this instance), so the accumulate is a shared
         # read-modify-write across threads — guard it, or concurrent `+=` drops updates and under-counts cost.
@@ -620,6 +637,41 @@ class OpenRouterBackend:
             if usage.get("cost") is not None:
                 self._usage["priced_requests"] += 1
 
+    def _turn_ceiling(self):
+        """A context manager stamping ONE absolute deadline for a whole retry ladder.
+
+        **`absolute_timeout` was a ceiling on an ATTEMPT, and `chat`/`complete` make up to five.** With
+        the backoff ladder that is over an hour for a single step, while the run's wall ceiling is only
+        ever consulted BETWEEN steps (`agentloop._budget_stop`) — so `--max-minutes 60` bounded a run
+        that one turn could overrun by itself, and `max_minutes` is a ceiling this product sells.
+
+        **THREAD-LOCAL, not an attribute, and not a parameter.** One backend instance serves the solver
+        loop AND the sub-agent panels that fan out on a thread pool (`_accumulate_usage` carries the
+        same note about its lock), so a plain attribute would have concurrent turns overwriting each
+        other's deadline — the shorter one silently truncating the longer turn. A parameter would have
+        been the other honest answer and was tried; it puts a fifth argument through `_post`, `_once`
+        and `_chat_once`, which are the seams the deterministic transport tests stub, for a value none
+        of those functions has any decision to make about.
+        """
+        import contextlib
+
+        @contextlib.contextmanager
+        def _stamped():
+            previous = getattr(self._turn, "deadline", None)
+            self._turn.deadline = self._monotonic() + self.absolute_timeout
+            try:
+                yield self._turn.deadline
+            finally:
+                self._turn.deadline = previous
+
+        return _stamped()
+
+    def _turn_deadline(self) -> float:
+        """When the turn in flight on THIS thread must be over. A fresh per-attempt ceiling when there
+        is no turn — a direct `_post` caller keeps the behaviour this class always had."""
+        deadline = getattr(self._turn, "deadline", None)
+        return self._monotonic() + self.absolute_timeout if deadline is None else deadline
+
     def usage_summary(self) -> dict:
         """Per-task token/request totals accumulated across every request this backend served (the solver
         loop plus any sub-agents that reuse this instance). Read by cloud_sweep after the solve."""
@@ -670,8 +722,12 @@ class OpenRouterBackend:
             with urllib.request.urlopen(req, timeout=idle) as resp:
                 # ABSOLUTE ceiling: a final backstop measured across the whole stream so a byte-every-89s
                 # slow-drip can't run forever (still ≪ the task wall); hitting it aborts as a retryable stall.
-                deadline = self._monotonic() + self.absolute_timeout
-                return self._read_sse(resp, deadline), 200, ""
+                #
+                # THE TURN'S CEILING WHERE THERE IS ONE, and this attempt's otherwise. `chat` and
+                # `complete` stamp a deadline for the whole retry ladder — see `_turn_ceiling` — so a
+                # five-rung ladder cannot spend five times the absolute ceiling on one step. Falling
+                # back to a fresh one keeps this method's own contract intact for a direct caller.
+                return self._read_sse(resp, self._turn_deadline()), 200, ""
         except urllib.error.HTTPError as e:
             return None, e.code, f"http {e.code}: {e.read().decode('utf-8', 'replace')[:300]}"
         except (TimeoutError, socket.timeout) as e:
@@ -777,13 +833,27 @@ class OpenRouterBackend:
         if not self.api_key:
             return LLMResult("", 0.0, resolved, False, "no OPENROUTER_API_KEY")
         last = LLMResult("", 0.0, resolved, False, "no attempt")
-        for attempt in range(self.retries + 1):
-            # After the FIRST failure, RELAX provider routing (relax=attempt>0) so a hung/429 provider
-            # reroutes to a healthy one — the first try keeps the exact fp8 pin/preference.
-            last, code = self._once(system, user, resolved, timeout, relax=attempt > 0)
-            if last.ok or code not in self._RETRY_CODES:  # 598 = timeout/hang, 599 = empty completion
-                return last      # success, or a permanent error (4xx other than 429)
-            if attempt < self.retries:
+        # ONE CEILING FOR THE LADDER, not one per rung. `chat` carries the reasoning; this path gets the
+        # same treatment because it makes the same requests against the same provider.
+        with self._turn_ceiling() as deadline:
+            for attempt in range(self.retries + 1):
+                # After the FIRST failure, RELAX provider routing (relax=attempt>0) so a hung/429
+                # provider reroutes to a healthy one — the first try keeps the exact fp8 pin.
+                last, code = self._once(system, user, resolved, timeout, relax=attempt > 0)
+                if last.ok or code not in self._RETRY_CODES:  # 598 = hang, 599 = empty completion
+                    return last      # success, or a permanent error (4xx other than 429)
+                # AN ATTEMPT WITH NO USAGE AT ALL IS ONE THE PROVIDER STILL SERVED. See
+                # `_usage["abandoned_requests"]` — the stream was aborted before any `usage` arrived,
+                # so the tokens it generated are billed and invisible to every ledger we keep.
+                if not last.tokens and not last.cost_usd:
+                    with self._usage_lock:
+                        self._usage["abandoned_requests"] += 1
+                if attempt >= self.retries:
+                    break
+                if self._monotonic() >= deadline:
+                    _log.error("provider %s: turn ceiling %ds reached after %d attempt(s); "
+                               "not retrying", resolved, self.absolute_timeout, attempt + 1)
+                    break
                 # ADAPT-G: the single most useful diagnostic line this package can emit. A sweep that
                 # slows to a crawl is almost always transport — a stalled provider being rerouted (598),
                 # a rate limit (429), or empty completions (599) — and none of that reaches the journal,
@@ -897,20 +967,83 @@ class OpenRouterBackend:
         """Native tool-calling turn: send the message history + tool schemas, get back the assistant
         message (content and/or tool_calls). Same retry/provider-routing policy as `complete`. ``tool_choice``
         (None→"auto", "required", or a {function:{name}} dict) FORCES a tool call when the caller wants to break
-        a prose-answer default."""
+        a prose-answer default.
+
+        ## THE TURN IS BILLED, NOT THE ATTEMPT THAT SURVIVED IT
+
+        This ladder makes up to ``retries + 1`` requests and returned only the last one, so every
+        attempt it threw away entered ``agentloop._meter`` at **$0 and zero tokens** — while the
+        provider charged for all of them. Two of the three discard paths carry a real invoice:
+
+        * a **refusal** (403) and an **empty completion** (599) both arrive with a body and a `usage`
+          block. `opus-4.8` burned 9,003 prompt tokens refusing, which `_chat_once` already reads onto
+          the result — and this loop then dropped the result on the floor.
+        * a **stall or malformed stream** (598/599 with no body) has no `usage` at all: the provider
+          generated tokens and we never saw the end of them. That cost is unknowable from here, so it
+          is COUNTED instead, on the result as `abandoned_attempts` and on the backend's own ledger as
+          `abandoned_requests`.
+
+        The consequence was not confined to the ledger. ``--max-spend-usd`` reserves the price of the
+        most expensive call this run has made (`agentloop._unaffordable_next_call`), and that guard was
+        calibrated on the same understated numbers — so a run whose provider was retrying cheerfully
+        under-reserved by exactly the factor by which it was under-billed. Folding the discarded
+        attempts in fixes the ledger and the guard in one place, because they read the same field.
+
+        ## ONE 900s CEILING PER TURN, NOT PER ATTEMPT
+
+        ``absolute_timeout`` backstops a pathological slow-drip inside one stream. Five attempts of it
+        plus the backoff ladder is **over an hour for a single step**, and the run's wall ceiling is
+        only ever consulted BETWEEN steps (`agentloop._budget_stop`) — so `--max-minutes 60` bounded a
+        run that one turn could overrun on its own. The deadline is therefore stamped once, here, and
+        shared by every attempt: the ceiling means what its name says, and a ladder cannot multiply it.
+        """
         resolved = self._resolve(model)
         if not self.api_key:
             return ChatResult(ok=False, error="no OPENROUTER_API_KEY", model=resolved)
         last = ChatResult(ok=False, error="no attempt", model=resolved)
-        for attempt in range(self.retries + 1):
-            # relax=attempt>0: reroute off a hung/429 provider on retry (first try keeps the fp8 pin).
-            last, code = self._chat_once(messages, tools, resolved, timeout, relax=attempt > 0,
-                                         tool_choice=tool_choice)
-            if last.ok or code not in self._RETRY_CODES:
-                return last
-            if attempt < self.retries:
+        # THE TURN'S RUNNING TOTAL, over EVERY attempt rather than over the discarded ones. Summing
+        # only the discards and adding `last` back at the end double-counts the final attempt on the
+        # paths that fall out of the loop rather than returning from inside it — which is one of the
+        # two ways this arithmetic can be wrong, and the harder one to see.
+        made, spent_usd, spent_tokens, abandoned = 0, 0.0, 0, 0
+        with self._turn_ceiling() as deadline:
+            for attempt in range(self.retries + 1):
+                # relax=attempt>0: reroute off a hung/429 provider on retry (first keeps the fp8 pin).
+                last, code = self._chat_once(messages, tools, resolved, timeout, relax=attempt > 0,
+                                             tool_choice=tool_choice)
+                made += 1
+                spent_usd += float(last.cost_usd or 0.0)
+                spent_tokens += int(last.tokens or 0)
+                # A FAILED attempt carrying neither a price nor a token count never reached a `usage`
+                # block at all — the stream aborted. The provider served it; we cannot price it.
+                if not last.ok and not last.cost_usd and not last.tokens:
+                    abandoned += 1
+                    with self._usage_lock:
+                        self._usage["abandoned_requests"] += 1
+                if last.ok or code not in self._RETRY_CODES or attempt >= self.retries:
+                    break
+                # A ladder that outlives the turn's own ceiling buys nothing: the next attempt shares
+                # the deadline and would be cut off before it could produce anything.
+                if self._monotonic() >= deadline:
+                    last = replace(last, error=f"{last.error} (turn ceiling {self.absolute_timeout}s "
+                                               f"reached after {attempt + 1} attempt(s))")
+                    break
                 self._sleep(self.backoff * (2 ** attempt))
-        return last
+        return self._billed(last, made, spent_usd, spent_tokens, abandoned)
+
+    @staticmethod
+    def _billed(result: ChatResult, made: int, spent_usd: float, spent_tokens: int,
+                abandoned: int) -> ChatResult:
+        """The turn's result carrying the turn's whole bill. See `chat`.
+
+        Returned UNCHANGED when the turn made one attempt, which is every ordinary turn: the totals
+        are then the surviving attempt's own numbers by construction, and rebuilding the object would
+        only create a second way for them to disagree.
+        """
+        if made <= 1:
+            return result
+        return replace(result, cost_usd=spent_usd, tokens=spent_tokens,
+                       abandoned_attempts=result.abandoned_attempts + abandoned)
 
 
 @dataclass

@@ -27,7 +27,7 @@ whole suite runs with an in-memory fake and no engine install.
 
    EXTERNAL-CONTRACT half (advisory-only, net-zero measured):
      ``HybridRetriever`` and ``_record_text`` are consumed by the offline retrieval-memory
-     harnesses (the predecessor project's ``scripts/the benchmark/memory-ab/recall_ab.py``,
+     harnesses (the predecessor project's `maintenance tooling`,
      ``fused_retrieval.py``, ``run_benchmark_memory.py``). The hybrid BM25 × activation
      approach these symbols implement was rigorously measured and found net-zero-to-negative
      (see ``MEMORY.md``); it is kept advisory-only. Their signatures are pinned by

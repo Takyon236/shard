@@ -273,6 +273,116 @@ def entry_env(base=None) -> dict:
     return out
 
 
+#: The shortest secret value worth substring-matching for. Below this a "secret" is a common word —
+#: a job that exports `CI_TOKEN=1` would otherwise turn every `1` in a sanitiser trace into
+#: `[redacted]`, destroying the evidence to protect a value that is not one.
+_REDACT_MIN_LEN = 8
+
+
+def secret_values(base=None) -> tuple[str, ...]:
+    """The literal strings that must never appear in anything we publish.
+
+    Exactly the values `entry_env` refuses to pass on, read back out of the SAME environment by the
+    SAME rule — so a name that becomes a secret there becomes one here in the same commit. Longest
+    first, so a value that contains another is replaced whole rather than left with a redacted hole
+    in the middle of it.
+    """
+    import os
+
+    source = os.environ if base is None else base
+    kept = set(entry_env(source))
+    values = {v for name, v in source.items()
+              if name not in kept and isinstance(v, str) and len(v) >= _REDACT_MIN_LEN}
+    return tuple(sorted(values, key=len, reverse=True))
+
+
+def redact_secrets(text: str, base=None) -> str:
+    """Remove our credentials from output we are about to publish, by VALUE rather than by name.
+
+    **`entry_env` is not enough on its own, and the reason is the container's own privilege.** It
+    strips the credentials from the child's environment, but the child runs as root in the same
+    container as this process, so `/proc/1/environ` and `/proc/<our pid>/environ` still hold the
+    original block — a copy the kernel made at exec time, which no later mutation of `os.environ`
+    rewrites. Four lines of `.shard/entry.sh` recover `OPENROUTER_API_KEY` from there, and the
+    entry point's stdout is published back to whoever opened the pull request through
+    `Witness.evidence`, the markdown report, `bundles/*/output.txt` and the PR comment.
+
+    Egress is not the channel that matters here and closing it would not have helped: the value
+    reaches its author by being PRINTED, not by being sent. So the control is at the last place the
+    text is still ours — every capture of a customer-authored program's output goes through this.
+
+    It is applied BEFORE adjudication and not only before reporting, so the attack output and every
+    control output are redacted alike and the differential is unchanged. A marker built on a
+    credential therefore cannot demonstrate anything either, which is the right answer to a claim
+    whose evidence is our own key.
+
+    **The residual, named rather than implied.** This substitutes values we can see in our own
+    environment. A secret the runner holds that never enters this process — one read from a file, or
+    one this job was never given — is not here to match on, and this cannot redact what it does not
+    know.
+    """
+    if not text:
+        return text
+    for value in secret_values(base):
+        if value in text:
+            text = text.replace(value, "[redacted]")
+    return text
+
+
+# ── network containment, for anything that executes customer-authored content ────────────────────────
+
+#: `--` stops `unshare` parsing further options, the same belt-and-braces applied to `bash` below.
+NETWORK_ISOLATION: tuple[str, ...] = ("unshare", "-n", "--")
+
+#: The probe's answer for the default runner, computed once per process. `None` = not yet asked.
+_ISOLATION_CACHE: tuple[str, ...] | None = None
+
+
+def isolation_prefix(runner=None) -> tuple[str, ...]:
+    """The argv prefix that denies a child process a network, or `()` where the kernel refuses.
+
+    **The customer's entry point is attacker-authored content on a pull request** — `entry_env` says
+    so at length — and until 2026-08-24 it was the ONE customer-authored thing that never got this
+    treatment. `sandbox._run_shell` wrapped the model's shell commands and `adjudicate`, `attribute`,
+    the differential baseline and `run_entry` did not, so the script whose output is published back to
+    its author had unrestricted egress on a runner where the model's own shell did not. That is the
+    weaker half of the perimeter protecting the stronger one.
+
+    `unshare -n` needs `CAP_SYS_ADMIN`, which Docker's default capability set does not grant, so on a
+    stock GitHub-hosted runner this returns `()` and the residual `_run_shell` documents is the live
+    one at both sites. It is PROBED rather than assumed because the answer belongs to the customer's
+    runner configuration: a self-hosted runner with a wider capset gets the stronger arm without
+    being told to ask for it.
+
+    An INJECTED runner is never cached. The cache exists so a run pays for one probe rather than one
+    per execution; a test that scripts the probe must get the answer it scripted.
+    """
+    global _ISOLATION_CACHE
+    if runner is not None:
+        return _probe_isolation(runner)
+    if _ISOLATION_CACHE is None:
+        _ISOLATION_CACHE = _probe_isolation(subprocess.run)
+    return _ISOLATION_CACHE
+
+
+def _probe_isolation(runner) -> tuple[str, ...]:
+    """Ask the kernel once. Anything other than a clean exit means we did NOT get a namespace —
+    `containment.py`'s rule, that confirming containment is the burden of proof and ambiguity is
+    failure, applied to the one control this module can assert about itself."""
+    try:
+        proc = runner([*NETWORK_ISOLATION, "true"], capture_output=True, text=True,
+                      errors="replace", timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return ()
+    return NETWORK_ISOLATION if proc.returncode == 0 else ()
+
+
+def reset_isolation_cache() -> None:
+    """Forget the probe's answer. For tests, which must not inherit a verdict from an earlier one."""
+    global _ISOLATION_CACHE
+    _ISOLATION_CACHE = None
+
+
 #: What the agent may propose today, UNCONDITIONALLY. Both are sound on their own observation:
 #: `fatal_signal` cannot be arranged by choosing a string, and `output_marker` is decided against a
 #: differential baseline. `nonzero_exit` is deliberately ABSENT — it is offered only when its baseline
@@ -539,6 +649,43 @@ def benign_controls(repo, entry: str) -> tuple[tuple[pathlib.Path, ...], int]:
     except OSError:
         return (), 0
     return tuple(found[:MAX_BENIGN_CONTROLS]), max(0, len(found) - MAX_BENIGN_CONTROLS)
+
+
+def witness_contract(repo, entry: str | None) -> tuple[str, ...]:
+    """Every repository path whose CONTENTS decide a verdict, repo-relative and sorted.
+
+    **A digest over the entry point alone protected the weaker half of the adjudicator.** The entry
+    point has been covered since the loop could not touch it and `sandbox.scope_digest` widened that
+    to the changed files when the loop gained a shell — but the benign controls were never in either
+    set, and they are the whole of the differential that makes `output_marker` sound.
+
+    What that left open, in the module's own measured terms: an internal audit closed a
+    4-of-4 false-gate rate by running the customer's declared benign inputs, and `benign_controls`
+    returns `()` for a directory that is not there. One `rm -rf .shard/entry.sh.benign` from the
+    model's shell therefore restored the configuration that was MEASURED to forge four demonstrations
+    out of four, and left `scope_digest` — taken over the diff and the entry point — perfectly quiet.
+    Emptying one control file does the same thing one file at a time.
+
+    So the contract is the entry point plus the controls it declares, and `run_simple` digests the
+    set it saw BEFORE the loop. A control that DISAPPEARS or CHANGES is caught by its own path; a
+    control ADDED during the run is not in the before-set and is not caught, which is the right
+    asymmetry — an extra benign input can only refuse a demonstration, never manufacture one.
+
+    Paths outside the checkout are dropped rather than digested: `scope_digest` resolves against the
+    repository root and would score them `UNREADABLE`, which is a mismatch on every run rather than
+    on a tampered one.
+    """
+    if not entry:
+        return ()
+    root = pathlib.Path(repo).resolve()
+    out = {entry}
+    controls, _dropped = benign_controls(repo, entry)
+    for path in controls:
+        try:
+            out.add(path.resolve().relative_to(root).as_posix())
+        except (OSError, ValueError):
+            continue
+    return tuple(sorted(out))
 
 
 #: `File "<path>", line <n>` — a Python traceback. Kept separate from the generic form below because
@@ -933,7 +1080,13 @@ def adjudicate(spec: WitnessSpec, repo, *, baseline_digest: str | None,
 
     # `--` before the script: bash stops parsing options there, so a path that survived the checks and
     # still begins with `-` cannot become an option. Belt and braces with `resolve_entry`'s own refusal.
-    argv = ["bash", "--", str(resolved), str(input_path)]
+    #
+    # THE ISOLATION PREFIX GOES ON `argv` ITSELF, not on this one call, and that is the point:
+    # `_controlled_verdict` builds every baseline and every benign control as `argv[:-1] + [control]`,
+    # so the attack run and the runs it is scored against cannot end up on different sides of the
+    # perimeter. A control with a network the attack did not have would be a differential over two
+    # different programs. `isolation_prefix` is `()` wherever the kernel refuses — see its docstring.
+    argv = [*isolation_prefix(), "bash", "--", str(resolved), str(input_path)]
     try:
         # errors="replace": this runs the CUSTOMER'S witness entry point, and a witness that
         # demonstrates a memory-safety bug crashes — raw memory, sanitiser output and arbitrary bytes
@@ -972,7 +1125,11 @@ def adjudicate(spec: WitnessSpec, repo, *, baseline_digest: str | None,
     except (OSError, subprocess.SubprocessError) as e:
         return _refuse(spec, f"the entry point could not be executed: {e}", digest=digest)
 
-    output = ((proc.stdout or "") + (proc.stderr or ""))
+    # REDACTED BEFORE IT IS READ, never only before it is reported. Everything downstream — the
+    # marker test, `observed_location`, `Witness.evidence`, the bundle, the PR comment — sees the same
+    # scrubbed text, so a demonstration cannot be built on our own credential and the differential
+    # below stays a comparison of like with like. See `redact_secrets`.
+    output = redact_secrets((proc.stdout or "") + (proc.stderr or ""))
     if refused := _nothing_adjudicated(spec, proc, output, digest=digest, input_path=input_path):
         return refused
     return _controlled_verdict(spec, repo, runner=runner, timeout=timeout, argv=argv,
@@ -1326,7 +1483,8 @@ def _base_control(spec: WitnessSpec, base_repo, *, runner, timeout, workdir) -> 
         probe.write_bytes(controls[0].read_bytes() if controls else b"")
     except OSError:
         return None
-    result = _run(runner, ["bash", "--", str(resolved), str(probe)], base_repo, timeout)
+    result = _run(runner, [*isolation_prefix(), "bash", "--", str(resolved), str(probe)],
+                  base_repo, timeout)
     return None if result is None else result[0]
 
 
@@ -1382,7 +1540,10 @@ def _run(runner, argv: list[str], repo, timeout: int) -> tuple[int | None, str] 
                       timeout=timeout, env=entry_env())
     except (OSError, subprocess.SubprocessError):
         return None
-    return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+    # Redacted on the control side too, for `adjudicate`'s reason on the attack side: the two texts are
+    # compared, so scrubbing one and not the other would make our own key look like a marker the
+    # payload introduced.
+    return proc.returncode, redact_secrets((proc.stdout or "") + (proc.stderr or ""))
 
 
 #: What each expectation's baseline is attributing to the payload, for the refusal sentence.
@@ -1706,11 +1867,13 @@ def _refuse(spec: WitnessSpec, why: str, *, digest: str = "") -> Witness:
 __all__ = [
     "BENIGN_SUFFIX", "DEFAULT_TIMEOUT", "DIFFERENTIAL_NONZERO_EXIT", "EXPECTATIONS",
     "FATAL_SIGNAL_CODES", "INHERITED", "INTRODUCED", "MAX_BENIGN_CONTROLS", "MAX_EVIDENCE_CHARS",
+    "NETWORK_ISOLATION",
     "TIMEOUT_KILL_CODES", "TRACEBACK_TOKENS", "UNATTRIBUTED", "UNHANDLED_EXCEPTION",
     "UNMEASURED_EXPECTATIONS", "Witness", "WitnessSpec", "adjudicate", "attribute", "benign_controls",
-    "entry_digest", "entry_env", "observed_location", "offered_expectations", "payload_readings",
-    "resolve_entry",
-    "self_defeating_marker",
+    "entry_digest", "entry_env", "isolation_prefix", "observed_location", "offered_expectations",
+    "payload_readings", "redact_secrets", "reset_isolation_cache", "resolve_entry",
+    "secret_values",
+    "self_defeating_marker", "witness_contract",
 ]
 
 

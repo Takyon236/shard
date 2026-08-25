@@ -187,7 +187,7 @@ _MARKERS: tuple[tuple[str, frozenset[str] | None, re.Pattern[str]], ...] = (
     ("deserialiser", frozenset({"php"}), re.compile(r"\bunserialize\s*\(")),
 
     # Python's real bug classes, added in W9 P1.2. The per-KLOC figures below are NOISE measurements
-    # over 1,235.9 KLOC of real Python (A=shard-v2 40.3 KLOC, B=the benchmark+attacks 153.3 KLOC, C=Hermes
+    # over 1,235.9 KLOC of real Python (A=the development tree 40.3 KLOC, B=the benchmark+attacks 153.3 KLOC, C=Hermes
     # 1,042.3 KLOC) — how often each pattern fires on ordinary code, NOT precision against ground truth.
     # Precision is still UNMEASURED (it needs the P1.1 canary + a CVE corpus, which is P1.3). Like every
     # row above, these are candidate surfaces and never a finding. Scoped to python because that is the

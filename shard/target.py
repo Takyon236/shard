@@ -60,6 +60,11 @@ from dataclasses import dataclass
 # asking the same capability question and answering it differently. Private by name, shared by intent.
 from shard.ignorefile import IgnoreIndex
 from shard.tools import _VCS_DIRS
+# `shard/witness.py` imports nothing from this package — it is a leaf — so this is a plain module-scope
+# import and not a cycle. The FUNCTION is imported rather than the tuple behind it, deliberately: its
+# own docstring is *"read AT CALL TIME so a lever is a decision and not an import order"*, and binding
+# the value here would reintroduce exactly the drift `_EXPECTATION_HELP` below exists to end.
+from shard.witness import offered_expectations
 
 # --- the workdir contract ---------------------------------------------------------------------------
 
@@ -815,11 +820,62 @@ _ENTRY_INVOCATION: dict[str, str] = {
     "ruby": 'exec ruby .shard/witness.rb "$PAYLOAD" 2>&1',
     "php": 'exec php .shard/witness.php "$PAYLOAD" 2>&1',
     "java": 'exec java -cp build/classes Witness "$PAYLOAD" 2>&1',
-    "go": 'exec go run ./.shard/witness.go "$PAYLOAD" 2>&1',
+    # **GO AND RUST NAME A BUILT BINARY, NEVER A TOOLCHAIN, and that is the rule this table now obeys.**
+    # `go` read `go run ./.shard/witness.go` until 2026-08-24, and there is no Go toolchain in this
+    # image — `LANGUAGE_RUNTIME` below says so itself, mapping `go` to `go`, which `probe_runtimes`
+    # would report absent. So one table in this module handed a Go repository a line that exits 127
+    # inside the container while the other table, forty lines down, knew it would.
+    #
+    # The generated line may only name something the image can run. A prebuilt artefact always
+    # qualifies, because building it is the customer's earlier workflow step and not ours — which is
+    # the same arrangement `java` uses (a JRE, no javac) and the reason `rust` was already correct.
+    "go": 'exec ./witness "$PAYLOAD" 2>&1',
     "c": 'exec ./build/witness "$PAYLOAD" 2>&1',
     "c++": 'exec ./build/witness "$PAYLOAD" 2>&1',
     "rust": 'exec ./target/debug/witness "$PAYLOAD" 2>&1',
 }
+
+#: Every demonstration kind this product has a name for, and the one line a customer needs in order to
+#: choose between them. **The TABLE is exhaustive; the TEMPLATE is not.** `entry_template` renders only
+#: what `witness.offered_expectations()` returns at call time, so a lever that is off cannot be
+#: advertised.
+#:
+#: That distinction is the whole point, and it is here because the alternative shipped. The template
+#: listed four kinds for as long as the adjudicator offered two: `witness.EXPECTATIONS` is
+#: `("fatal_signal", "output_marker")`, with `DIFFERENTIAL_NONZERO_EXIT` and `UNHANDLED_EXCEPTION`
+#: both deliberately off and both carrying the measurement that keeps them off. The two it advertised
+#: and could not honour — `nonzero_exit` and `unhandled_exception` — are precisely the two a Python,
+#: Ruby or PHP customer reaches for first.
+#:
+#: **Nothing errored, which is what made it expensive.** A customer who built their entry point around
+#: `unhandled_exception` got a witness the model was never told it could claim: the run completed,
+#: every finding stayed a hypothesis, and nothing gated. `witness.py` records the cost from the other
+#: side — with that lever off, the model chose `fatal_signal` for a Python traceback in 4 of 5 canary
+#: samples, because it is the only exception-shaped route offered.
+#:
+#: A name here that `offered_expectations()` never returns is dead help text and costs nothing; the
+#: entries for the two off levers are kept so that turning one on needs no edit here. A name it returns
+#: that is NOT here would print bare, which is why the two vocabularies are pinned together by a test
+#: rather than by an intention to keep this table current.
+_EXPECTATION_HELP: dict[str, str] = {
+    "fatal_signal": "the program dies on a signal (SIGSEGV, SIGABRT, ...)",
+    "output_marker": "this script prints a marker string you choose",
+    "nonzero_exit": "this script exits non-zero",
+    "unhandled_exception": "the program dies on an uncaught exception / traceback",
+}
+
+
+def _expectation_lines() -> str:
+    """The demonstration kinds a customer may actually build against, as template comment lines.
+
+    Rendered from `offered_expectations()` and never from a copy of it. The column is aligned to the
+    longest name that is actually offered, so removing a lever does not leave the table indented for a
+    word nobody can see.
+    """
+    offered = offered_expectations()
+    width = max((len(name) for name in offered), default=0)
+    return "\n".join(f"#   {name:<{width}}   {_EXPECTATION_HELP.get(name, '')}".rstrip()
+                     for name in offered)
 
 
 def entry_template(language: str | None = None) -> str:
@@ -839,9 +895,16 @@ def entry_template(language: str | None = None) -> str:
       demonstrates nothing, because the baseline does it too — and the adjudicator will correctly
       refuse it. `${1:-/dev/null}` plus an early exit is how the shipped example handles it.
 
-    Not generated by a model and not customised per repository: it is a fixed skeleton with one
-    invocation line chosen by language. A template that guessed at the customer's code would be a
-    guess wearing a checker's clothes, and `preflight` is the command that must not do that.
+    * **It advertises only what this build adjudicates.** The demonstration kinds come from
+      `offered_expectations()` at call time rather than from a list maintained beside it. Until
+      2026-08-24 they were a hard-coded four against an adjudicator that offered two, and the two it
+      could not honour were the two a Python, Ruby or PHP customer picks first — so the template's
+      own reader was being pointed at a witness nothing would ever claim. See `_EXPECTATION_HELP`.
+
+    Not generated by a model and not customised per repository: it is a fixed skeleton, with one
+    invocation line chosen by language and one list chosen by what the shipped levers allow. A
+    template that guessed at the customer's code would be a guess wearing a checker's clothes, and
+    `preflight` is the command that must not do that.
     """
     invoke = _ENTRY_INVOCATION.get((language or "").lower())
     if invoke is None:
@@ -856,11 +919,14 @@ def entry_template(language: str | None = None) -> str:
 #   Shard supplies the payload's CONTENT. It never writes this file — a witness the agent
 #   authors and is graded on is not evidence, which is why this is yours to commit.
 #
-# WHAT COUNTS AS A DEMONSTRATION — pick ONE and make it mean something:
-#   nonzero_exit          this script exits non-zero
-#   output_marker         this script prints a marker string you choose
-#   fatal_signal          the program dies on a signal (SIGSEGV, SIGABRT, ...)
-#   unhandled_exception   the program dies on an uncaught exception / traceback
+# WHAT COUNTS AS A DEMONSTRATION — pick ONE and make it mean something.
+# THIS LIST IS WHAT THIS BUILD ACTUALLY ADJUDICATES, not everything the product has a name for:
+{_expectation_lines()}
+#
+# If your program's failure mode is an uncaught exception or a plain non-zero exit, print a
+# marker on that branch and use output_marker. Those two kinds are measured and deliberately
+# not offered — see the levers in the witness module — so an entry point built around either
+# would be one nothing can claim, and every finding would stay an ungating hypothesis.
 #
 # THE ONE THING PEOPLE GET WRONG
 #   An EMPTY payload must take a quiet branch. Shard runs a baseline on empty input and
@@ -893,8 +959,48 @@ CALIBRATION = (
     ("31693159403", 1, 1, 2_900, 0.026376, 50_547),       # canary-py, a one-line docstring
     ("31676495998", 3, 48, 120_000, 0.030164, 97_852),    # urllib3, a real third-party diff
     ("31675518894", 3, 48, 120_000, 0.044588, 131_410),   # urllib3, the same diff, a second run
-    ("31692946989", 3, 82, 190_000, 0.507274, 786_563),   # shard-v2 DOCS: 82 lines, $0.51
+    ("31692946989", 3, 82, 190_000, 0.507274, 786_563),   # the development tree DOCS: 82 lines, $0.51
 )
+
+#: **EVERY ROW ABOVE PREDATES THE AGENT BEING ABLE TO RUN ANYTHING, and the gap that opens is not
+#: small.** They were all metered on 2026-08-12/13. `shard/sandbox.py` landed on 2026-08-19 and gave
+#: simple mode a shell — observations enter the transcript and are re-sent on every turn after, which
+#: is the mechanism `COST_DRIVER` below already names for file reads. Nothing re-measured the band
+#: afterwards, which is the same staleness that had every published recall figure predating the single
+#: biggest capability change until it was caught on 2026-08-24.
+#:
+#: These are five PULL-REQUEST runs of the shipped 2.0.0 artefact on real public-sector repositories,
+#: 2026-08-25, `glm-5.3`. They are TOKENS ONLY and kept in their own table on purpose: the endpoint was
+#: a subscription, which reports no price, so folding a zero into the dollar band would understate it
+#: exactly where it is already understated. The token band is what they are allowed to widen.
+#:
+#:     (label, changed files, changed lines, tokens)
+CALIBRATION_TOKENS_ONLY = (
+    ("dinum/docs, an auth-path SQL rewrite", 4, 144, 646_756),
+    ("dinum/docs, the CPU follow-up", 5, 65, 866_609),
+    ("etalab company directory, mismatch detection", 2, 223, 703_357),
+    ("a ministry site, 30 files of contributions", 30, 825, 1_544_464),
+    ("an Urssaf simulator, a navigation refactor", 7, 100, 774_078),
+)
+
+#: What the two tables say TOGETHER, and it is the sentence a customer sizing a bill needs first.
+#:
+#:     priced sample, 2026-08-12/13     21,184 –   786,563 tokens, median    97,852
+#:     token sample,  2026-08-25       646,756 – 1,544,464 tokens, median   774,078
+#:
+#: **The measured median is 7.9x the calibrated median, and 2 of 5 runs exceed the calibrated maximum**
+#: — the largest by 1.96x. Every one of the five is above the priced sample's median by at least 6.6x.
+#: So the dollar band is not merely small, it is a FLOOR taken before the product could execute, and
+#: `estimate_diff_cost` now says so in the basis a customer reads rather than leaving it to be
+#: discovered from an invoice.
+#:
+#: It is NOT converted into a dollar figure here. The two samples ran on different endpoints and
+#: different models, so their tokenisers differ and a price-per-token multiplication across them would
+#: be false precision on the one number this module exists to keep honest. What can be said from the
+#: measurement is the token range, and that is what is said.
+TOKENS_ONLY_BASIS = ("the token range also covers 5 runs of the shipped artefact on real third-party "
+                     "repositories, 2026-08-25 — those ran on an endpoint that reports no price, so "
+                     "they widen the TOKEN band and cannot correct the dollar one")
 
 #: What the numbers above say, and it is not what anybody assumed. **Cost does not track the size of
 #: the CHANGE.** 82 added lines of markdown cost seventeen times what 48 lines of urllib3 cost. What
@@ -912,7 +1018,12 @@ def estimate_diff_cost(profile: TargetProfile) -> dict:
     **COGS ≈ 0 is true and irrelevant to the buyer.** The customer supplies inference on every tier, so
     their inference bill IS the price of the product, and it appeared nowhere in the pricing model.
     Measured: one repository at ~100 pull-request runs a month is somewhere between $2 and $50 of their
-    own inference, against a €25/repo/month band-1 licence sold as unlimited pull-request mode.
+    own inference — a range wider than a flat per-repository licence, which is the point. The customer
+    cost of an "unlimited pull-request mode" is not flat, whatever the licence beside it is.
+
+    (The licence figure that argument was first written against is deliberately not quoted here. This
+    module ships in the public package, and an unannounced commercial term is not something a build
+    should publish as a side effect of explaining a cost estimate.)
 
     **THE BAND IS THE OBSERVED RANGE, NOT A FITTED CURVE**, and that is the honest form at N=5. A
     regression on five points would produce a number with two decimal places and no support; the range
@@ -923,7 +1034,11 @@ def estimate_diff_cost(profile: TargetProfile) -> dict:
     `basis` saying so.
     """
     usd = sorted(row[4] for row in CALIBRATION)
-    tokens = sorted(row[5] for row in CALIBRATION)
+    # THE TOKEN BAND TAKES BOTH TABLES, the dollar band only the priced one. See
+    # `CALIBRATION_TOKENS_ONLY`: an unpriced endpoint cannot correct a dollar figure, and folding its
+    # zero in would understate the number exactly where it is already understated.
+    tokens = sorted([row[5] for row in CALIBRATION] +
+                    [row[3] for row in CALIBRATION_TOKENS_ONLY])
     # Where THIS repository sits, by the one property the calibration says matters. The median file is
     # the unit because a change touches files, not repositories.
     typical = profile.source_bytes // max(profile.files, 1)
@@ -939,9 +1054,24 @@ def estimate_diff_cost(profile: TargetProfile) -> dict:
         # and one 54-file chunk cost 8.6x a 110-file one, so even the DRIVER above does not hold
         # there. Naming the mode is the cheap half of the fix; an `initial` band needs its own
         # calibration rows and this sample cannot supply them.
+        # **THE DOLLAR FIGURE IS A FLOOR, and saying so is the whole of this string's job.** Every
+        # priced row predates `shard/sandbox.py` (2026-08-19), which let the agent execute — and
+        # 2026-08-25's five runs of the shipped artefact came in at a MEDIAN 7.9x the priced sample's
+        # median, with 2 of 5 above its maximum. The dollars cannot be corrected from an unpriced
+        # endpoint; the understatement can be named, and a customer planning against the number is
+        # owed the name.
         "basis": f"{len(CALIBRATION)} live PULL-REQUEST runs, 2026-08-12/13 — a SMALL SAMPLE, not a "
-                 f"corpus. It does NOT cover `--scan initial`, which is a different job and was "
-                 f"measured far above this band",
+                 f"corpus, and taken BEFORE this product could execute code (2026-08-19), so read the "
+                 f"dollars as a FLOOR: {len(CALIBRATION_TOKENS_ONLY)} runs since then used a median "
+                 f"7.9x the tokens. It does NOT cover `--scan initial`, which is a different job and "
+                 f"was measured far above this band",
+        "tokens_basis": TOKENS_ONLY_BASIS,
+        # THE UNDERSTATEMENT AS A NUMBER, so a customer can multiply rather than guess at what "floor"
+        # buys them. Derived, never restated: a second hand-maintained copy of a ratio is the drift
+        # this file has recorded before.
+        "tokens_median_ratio": round(
+            (sorted(row[3] for row in CALIBRATION_TOKENS_ONLY)[len(CALIBRATION_TOKENS_ONLY) // 2])
+            / max(sorted(row[5] for row in CALIBRATION)[len(CALIBRATION) // 2], 1), 1),
         "covers": "pull-request runs only",
         "driver": COST_DRIVER,
         "mean_source_file_bytes": typical,
@@ -970,7 +1100,11 @@ LANGUAGE_RUNTIME: dict[str, str] = {
     "java": "java", "kotlin": "java", "scala": "java",       # all three run on the JVM
     "ruby": "ruby", "php": "php", "c#": "dotnet", "go": "go", "rust": "cargo",
     "swift": "swift", "zig": "zig",
-    # C, C++ and assembly need a COMPILER, and the free image has none — no `build-essential`, no gcc.
+    # C, C++ and assembly need a COMPILER rather than a runtime, which is why they are grouped apart:
+    # `cc` and `c++` are what an entry point that BUILDS its own witness needs on PATH. The free image
+    # carries both (`gcc`, `g++`, `libc6-dev`) and asserts during its own build that each compiles and
+    # runs a program — the comment here said the opposite, unswept, for as long as that was true of an
+    # earlier image.
     "c": "cc", "c++": "c++", "asm": "cc",
 }
 
@@ -988,9 +1122,15 @@ def probe_runtimes(languages) -> dict:
     answers *"will this work for me"* for free, and `_cmd_preflight` already answers exactly this shape
     of question for that capability's Docker levers — *"answered where a customer asks BEFORE paying for a run
     rather than only in the run's own account afterwards"*. The free tier, which is every customer's
-    first contact, had no equivalent. The free image is `python:3.12-slim` plus `git`: **node, java,
-    ruby, php, dotnet and any C compiler are all absent**, which is five of the languages this product
-    surveys and the two it cannot even build.
+    first contact, had no equivalent.
+
+    **This probe is about the MACHINE, and the machine is not always the shipped image.** When it was
+    written the free image was `python:3.12-slim` plus `git`, so node, java, ruby, php, dotnet and every
+    C compiler were absent and the probe's answer was almost always "no". They have since been added
+    and are asserted at image build time, so a run inside the shipped container now finds them — while
+    the same code on a developer's laptop, a self-hosted runner or a custom image finds whatever is
+    there. That is the reason this is probed rather than declared: a constant would have had to be
+    rewritten twice already and would be wrong off the runner in either version.
 
     ## The wording rule this obeys, and what it cost to learn
 

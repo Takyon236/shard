@@ -1,0 +1,46 @@
+# What running this repository's own test suite leaves behind.
+#
+# `CONTRIBUTING.md` invites pull requests and `README.md` promises that
+# `pip install -e ".[dev]" && pytest` works from a clean clone. Both were true and
+# neither was tidy: the suite compiles the C example and Python writes bytecode, so a
+# contributor's first `git status` after following those instructions listed files they
+# did not create and could not explain — and `git add -A` before a pull request would
+# have committed a 16 KB binary into a repository that ships source.
+#
+# WRITTEN FOR THIS PACKAGE rather than copied from the tree that generates it. That
+# one ignores paths which mean nothing here and name things a reader cannot open.
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Test and lint caches
+.pytest_cache/
+.ruff_cache/
+
+# Built by the examples' own entry points when the suite exercises them. Each is the
+# artefact of a `.shard/entry.sh`, which is exactly what those scripts are for — the
+# manifest tells you to build in an earlier step, and here the test suite is that step.
+examples/*/record
+examples/*/*.o
+examples/*/*.out
+
+# What a run of Shard itself writes. `--out-dir` is where the action puts them, and a
+# customer trying the quickstart against their own checkout gets them at the root.
+shard-out/
+shard-report.md
+shard.sarif
+shard_journal.jsonl
+shard-telemetry.json
+shard-run.log
+
+# Credentials. Never committed, and named here so that is a property of the repository
+# rather than of whoever is typing.
+.env
+.env.*
+!.env.example

@@ -25,7 +25,7 @@ template instead. It asks for different things.
 <!--
 The workflow step or command line, with secrets removed. For example:
 
-    - uses: Takyon236/shard@v1
+    - uses: Takyon236/shard@v2
       with:
         mode: diff
         fail-on: gate-eligible

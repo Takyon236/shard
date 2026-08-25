@@ -67,8 +67,8 @@ import tempfile
 from dataclasses import dataclass, field
 
 from .tools import OBS_WINDOW_CHARS, Tool, ToolContext, ToolResult, _file_index
-from .witness import (DEFAULT_TIMEOUT, FATAL_SIGNAL_CODES, TIMEOUT_KILL_CODES, _normalise, entry_env,
-                      resolve_entry)
+from .witness import (DEFAULT_TIMEOUT, FATAL_SIGNAL_CODES, NETWORK_ISOLATION, TIMEOUT_KILL_CODES,
+                      _normalise, entry_env, isolation_prefix, redact_secrets, resolve_entry)
 
 #: Seconds one `run` / `run_entry` call may take. DERIVED from the adjudicator's own timeout
 #: (`witness.DEFAULT_TIMEOUT`) rather than restating a number: this file claims `run_entry` is
@@ -208,13 +208,15 @@ class ExecState:
 
 # ── network containment ─────────────────────────────────────────────────────────────────────────────
 
-#: The probe, and the prefix, kept together so they cannot drift apart. `--` stops `unshare` parsing
-#: further options, the same belt-and-braces `witness.adjudicate` applies to `bash`.
-_UNSHARE = ("unshare", "-n", "--")
+#: The probe, and the prefix, kept together so they cannot drift apart — and since 2026-08-24 they live
+#: in `witness`, which is the module the ADJUDICATOR reads. Re-exported under the old name because this
+#: module's callers name it, and because a second literal `("unshare", "-n", "--")` is exactly the
+#: two-copies-of-one-value drift the maintainers' notes is about.
+_UNSHARE = NETWORK_ISOLATION
 
 
 def network_mode(state: ExecState, runner=None) -> str:
-    """Probe ONCE whether this container can enter a network namespace; cache it on the state.
+    """Probe whether this container can enter a network namespace; cache it on the state.
 
     **This is a real control where it works and an honest `unrestricted` where it does not**, which is
     the shape `containment.py` already argues for: confirming containment is the burden of proof, and
@@ -225,16 +227,23 @@ def network_mode(state: ExecState, runner=None) -> str:
     `_run_shell` is the live one. It is probed rather than assumed because the answer depends on the
     customer's runner configuration, not on ours, and a self-hosted runner with a wider capset gets the
     stronger arm for free.
+
+    The probe itself is `witness.isolation_prefix`, so the answer the AGENT's tools get and the answer
+    the ADJUDICATOR gets come from one implementation. They were two, and the second one did not
+    exist: the model's shell was wrapped and the customer's entry point never was. This function keeps
+    its own cache because `ExecState.network` is journalled — the word in the record has to be the word
+    this run acted on.
     """
     if state.network != "unknown":
         return state.network
-    run = runner or subprocess.run
-    try:
-        proc = run([*_UNSHARE, "true"], capture_output=True, text=True, errors="replace", timeout=10)
-        state.network = "isolated" if proc.returncode == 0 else "unrestricted"
-    except (OSError, subprocess.SubprocessError):
-        state.network = "unrestricted"
+    state.network = "isolated" if isolation_prefix(runner or subprocess.run) else "unrestricted"
     return state.network
+
+
+def _isolation(state: ExecState, runner) -> tuple[str, ...]:
+    """The argv prefix for one execution, routed through `network_mode` so the journal's word and the
+    argv agree. Two call sites — the shell and the entry point — and neither may have its own."""
+    return NETWORK_ISOLATION if network_mode(state, runner) == "isolated" else ()
 
 
 # ── tamper detection ────────────────────────────────────────────────────────────────────────────────
@@ -338,8 +347,15 @@ def _observation(rc, stdout: str, stderr: str, note: str, state: ExecState) -> T
     There is deliberately no `demonstrated`, no `expectation` and no `why_not` here. Those words belong
     to `witness.Witness`, which is built after this loop has ended and which this module never imports
     a verdict from.
+
+    **REDACTED HERE TOO, and this site is worse than the adjudicator's.** `witness.redact_secrets`
+    explains why `entry_env` alone does not hold: the child is root in our container and
+    `/proc/1/environ` still carries the block the kernel copied at exec time. Everything this function
+    returns goes into the model's message history, and from there into the journal, the transcript and
+    any artifact that carries them — so a `cat /proc/1/environ` through `run` would publish the key
+    even on a run that never reached adjudication at all.
     """
-    out, err = _capped(stdout, stderr)
+    out, err = _capped(redact_secrets(stdout), redact_secrets(stderr))
     return ToolResult(True, data={
         "note": note,
         "exit_code": rc,
@@ -386,7 +402,11 @@ def _run_entry_point(ctx: ToolContext, state: ExecState, *, repo, entry: str, ru
         return ToolResult(False, error=f"could not stage the payload: {e}")
 
     state.entry_calls += 1
-    argv = ["bash", "--", str(resolved), str(input_path)]
+    # THE SAME PREFIX THE ADJUDICATOR USES, for the same reason the timeout and the environment are
+    # the same: this function's whole worth is that what the agent observes is what the grader will
+    # observe, and a program with a network here and none there is a different program. `()` wherever
+    # the kernel refuses — see `witness.isolation_prefix`.
+    argv = [*_isolation(state, runner), "bash", "--", str(resolved), str(input_path)]
     try:
         proc = runner(argv, cwd=str(repo), capture_output=True, text=True, errors="replace",
                       timeout=DEFAULT_EXEC_TIMEOUT, env=entry_env())
@@ -468,9 +488,7 @@ def _run_shell(ctx: ToolContext, state: ExecState, *, repo, runner,
 
     state.shell_calls += 1
     state.log.append(cmd)
-    argv = ["bash", "-c", cmd]
-    if network_mode(state, runner) == "isolated":
-        argv = [*_UNSHARE, *argv]
+    argv = [*_isolation(state, runner), "bash", "-c", cmd]
     env = entry_env()
     # The scratch directory is ANNOUNCED rather than enforced by cwd. Setting cwd outside the checkout
     # would prevent nothing (`cd` exists) and would break every relative path the other three tools
