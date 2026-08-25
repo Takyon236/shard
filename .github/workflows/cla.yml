@@ -54,7 +54,13 @@ jobs:
           path-to-signatures: 'signatures/v1/cla.json'
           path-to-document: 'https://github.com/Takyon236/shard/blob/main/CLA.md'
           branch: 'main'
-          allowlist: 'dependabot[bot],github-actions[bot]'
+          # `shard-release` IS THIS PROJECT'S OWN RELEASE IDENTITY, not a contributor. Every commit
+          # in this repository that was generated rather than written is authored by it — the whole
+          # distribution is regenerated on each release — and there is no person behind it to sign
+          # anything. Without this entry the CLA check is red on every release, which trains a
+          # maintainer to merge past a red check; that is the same cost the CI retry was landed for,
+          # one repository along.
+          allowlist: 'dependabot[bot],github-actions[bot],shard-release'
           custom-notsigned-prcomment: >
             Thank you for the pull request.
 

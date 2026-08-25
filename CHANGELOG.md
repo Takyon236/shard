@@ -12,6 +12,17 @@ local rule that is stricter than semver and exists because of what this product 
 > gates is not a patch. A customer who pinned `v1` and merged on a Friday is entitled to the same
 > answer on Monday.
 
+## [2.1.2] — 2026-08-25
+
+### Fixed
+
+- **The CLA check was red on the release itself.** Every generated commit in the published repository
+  is authored `shard-release` — the whole distribution is regenerated on each release — and there is
+  no person behind that identity to sign anything, so the check failed on the release pull request
+  while every build and test job passed. A check that is red on every release trains a maintainer to
+  merge past a red check, which is the cost the retry above was landed to avoid. `dependabot[bot]` and
+  `github-actions[bot]` were already exempt; this identity was the one that was missing.
+
 ## [2.1.1] — 2026-08-25
 
 ### Fixed
