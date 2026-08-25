@@ -12,7 +12,12 @@ local rule that is stricter than semver and exists because of what this product 
 > gates is not a patch. A customer who pinned `v1` and merged on a Friday is entitled to the same
 > answer on Monday.
 
-## [Unreleased]
+## [2.1.0] — 2026-08-25
+
+**Nothing here widens what gates.** Three of the four changes are about what the product TELLS you —
+what a review ran, what it will cost, and what the package says about itself — and the fourth is a
+file that keeps a contributor's checkout tidy. No demonstration kind was added or withdrawn, no
+action input changed, and `@v2` continues to resolve.
 
 ### Added
 
@@ -43,8 +48,6 @@ local rule that is stricter than semver and exists because of what this product 
   it now says plainly that it is a floor and by how much — and the **token** band, which those runs
   can correct, is re-measured and printed. That last part is also the first cost number available at
   all to a customer on a self-hosted vLLM or a subscription, where dollars are never reported.
-
-### Added
 
 - **The report now says what the review actually RAN.** The header stated `witness | none declared —
   nothing in this run could be proven by execution`, which is true of *adjudication* and reads as a
