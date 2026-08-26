@@ -12,6 +12,41 @@ local rule that is stricter than semver and exists because of what this product 
 > gates is not a patch. A customer who pinned `v1` and merged on a Friday is entitled to the same
 > answer on Monday.
 
+## [2.1.3] — 2026-08-26
+
+### Changed
+
+- **Free forever on public repositories; a size line on private ones.** The Additional Use Grant
+  permitted production use *"at any scale"*, so a 50,000-engineer organisation had exactly the grant a
+  two-person startup had, and nothing in the terms ever converted internal use into a conversation.
+  There are now two doors and you need only one of them.
+
+  **Public repositories are free without qualification** — no limit on repositories, pipeline runs,
+  findings or contributors, and **no limit on the size of your organisation.** A trillion-dollar
+  company reviewing its open-source projects needs nothing from us. Repository visibility is a fact
+  rather than a self-assessment, which is what makes this door both generous and unarguable.
+
+  **Private repositories** are free while your group is under **both** USD $5,000,000 annual revenue
+  **and** 10 individuals contributing to the private repositories Shard reviews. Revenue is counted
+  across parents and affiliates, so a small team inside a large organisation is measured by that
+  organisation. The contributor limb counts contributors **to the repositories reviewed**, not your
+  own headcount — pointing Shard at a large private codebase exceeds it whoever you are, which is what
+  keeps the consultancy rule below honest without a special case for it.
+
+  **Whose code you review is no longer part of the test.** A consultancy, contractor or managed
+  service provider is treated exactly like anyone else: the line is size, not client relationship.
+  That also removes a contradiction the previous text carried, in which one paragraph permitted work
+  on code you were *"contractually engaged to … secure"* and a later one forbade performing
+  *"vulnerability-discovery services to third parties"* with it. The not-as-a-service prohibition now
+  says what it always meant — you may not offer **Shard itself** to others to run.
+
+  **And modifications to Shard come back — or you buy the right to keep them.** Run a modified version
+  in production and you either publish those modifications under the same licence within 90 days, or
+  take a commercial licence, which permits you to keep them private. Publishing asks nothing else of
+  you: not a pull request, not a contribution to us, not support for what you publish. **Your own
+  source, configuration, entry points and findings are never covered** — reviewing your code with
+  Shard has never obliged you to publish that code and still does not.
+
 ## [2.1.2] — 2026-08-25
 
 ### Fixed

@@ -1668,15 +1668,6 @@ def _baseline_contradicts(spec: WitnessSpec, rc: int | None, output: str, *, con
     return ""
 
 
-def _demonstrated(spec: WitnessSpec, rc: int | None, output: str) -> bool:
-    """The observation, and nothing else, decides. `_adjudge`'s first half, kept for readers.
-
-    Pure and separately tested. Keeping it out of `adjudicate` is what lets every branch be driven from
-    literals rather than from a subprocess.
-    """
-    return _adjudge(spec, rc, output)[0]
-
-
 def _adjudge(spec: WitnessSpec, rc: int | None, output: str) -> tuple[bool, str]:
     """`(demonstrated, why not)` — the verdict and the sentence naming which check said no.
 

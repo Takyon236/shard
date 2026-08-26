@@ -376,7 +376,12 @@ outputs:
 # in README.md, which Actions never parses. A guard in the suite fails if one reappears.
 runs:
   using: "docker"
-  image: "Dockerfile"
+# THIS ACTION RUNS A PUBLISHED IMAGE. `image:` below names one exact artefact by digest, so
+# GitHub PULLS it instead of building 934 MB on your runner at the start of every job. The
+# `Dockerfile` beside this file still ships and still builds the same image: it is what you
+# read to audit what executes in your pipeline, and what you build if you would rather run
+# your own. The build-context paragraph above applies to that path rather than to this one.
+  image: "docker://ghcr.io/takyon236/shard@sha256:793396371d3a56598dab93bdb3220a5a9fbfda378cc6a71781a29299c09abfdb"
   # `args` is EXPLICIT and it is the whole defect this file carried until 2026-08-08: with no args
   # block a container action runs the image's CMD, which is `--help`, so the action printed help,
   # exited 0 — a passing check — and ignored every input above. See `shard/action.py`.

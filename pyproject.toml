@@ -1,6 +1,6 @@
 [project]
 name = "shard"
-version = "2.1.2"
+version = "2.1.3"
 description = "Security analysis that runs in your CI and reports a finding only when it can attach a reproducing input."
 readme = "README.md"
 requires-python = ">=3.11"

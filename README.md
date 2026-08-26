@@ -3,8 +3,10 @@
 Security analysis that runs in your CI, on a model endpoint you control, and reports a finding only when
 it can attach a reproducing input.
 
-> **Licensed under [BUSL 1.1](LICENSE).** Free to use in your own pipelines, on your own
-> repositories, at any scale — including production. You supply your own model inference; this project
+> **Licensed under [BUSL 1.1](LICENSE).** **Free forever on public repositories**, at any scale, for
+> any organisation. On private repositories it is free while you are under **$5M revenue and 10
+> contributing developers**; above either, a commercial licence applies. Your own code, config and
+> findings are never covered by anything here. You supply your own model inference; this project
 > operates no endpoint and receives none of your code.
 
 ## Quickstart — five minutes, no API key
@@ -519,7 +521,24 @@ image most people run on every pull request.
 
 ## Licence
 
-See [`LICENSE`](LICENSE).
+[`LICENSE`](LICENSE) is the terms; this is the shape of them, and where the two disagree the file wins.
+
+**Two doors, and you only need one of them.**
+
+| | |
+|---|---|
+| **Public repositories** | **free, always.** Any number of repositories, pipeline runs, findings or contributors, and **no limit on the size of your organisation.** A trillion-dollar company reviewing its open-source projects needs nothing from us |
+| **Private repositories** | free while your group is under **both** USD $5M annual revenue **and** 10 developers contributing to the private repositories Shard reviews |
+| **Whose code** | yours or a client's. A consultancy, contractor or MSP is treated exactly like anyone else — **the line is size, not client relationship** |
+| **Modifications** | change Shard and run the changed version in production, and you either publish those changes under this licence within 90 days **or** take a commercial licence and keep them private. **Your** source, config, entry points and findings are never covered — reviewing your code with Shard never obliges you to publish it |
+| **Not permitted** | offering Shard *itself* to third parties as a hosted, managed or embedded service. Using Shard to do your own work is not that |
+| **Above the line** | or to keep modifications private — <licensing@reyse.ai>, and we answer |
+| **Eventually** | each version converts to Apache 2.0 on 2030-08-22, or four years after that version was first published, whichever comes first |
+
+Revenue is measured **across your group** — parent and affiliates included — so a small team inside a
+large organisation is measured by that organisation. The developer count is of contributors to the
+**repositories reviewed**, not your own headcount: pointing Shard at a large private codebase exceeds
+it whoever you are, which is what keeps the consultancy rule honest without a special case for it.
 
 ## Security
 

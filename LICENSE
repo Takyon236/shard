@@ -7,28 +7,98 @@ Licensor:             Reyse
 Licensed Work:        Shard
                       The Licensed Work is (c) 2026 Reyse.
 
-Additional Use Grant: You may make production use of the Licensed Work, without
-                      limitation on the number of repositories, developers,
-                      pipeline runs or findings, provided that such use is
-                      within your own software development lifecycle — including
-                      continuous integration, code review and release
-                      engineering — on source code that you or your organisation
-                      own or are contractually engaged to develop or secure.
+Additional Use Grant: There are two ways to use the Licensed Work in production
+                      without a commercial licence. Section 1 is about the
+                      repositories You review. Section 2 is about You. Meeting
+                      EITHER is enough.
 
-                      You may not make the functionality of the Licensed Work
-                      available to third parties as a hosted, managed or
-                      embedded service, whether or not for a fee. Offering
-                      scanning, review or vulnerability-discovery services to
-                      third parties that are performed by the Licensed Work is
-                      not a permitted use.
+                      1. PUBLIC REPOSITORIES — ALWAYS FREE. You may make
+                      production use of the Licensed Work on any repository
+                      whose source code is publicly readable, without
+                      authentication and without payment, by anyone. There is no
+                      limit of any kind on this use: not on the number of
+                      repositories, pipeline runs, findings or contributors, and
+                      not on the size of Your organisation. A trillion-dollar
+                      company reviewing its open-source projects with the
+                      Licensed Work needs nothing from the Licensor.
 
-                      For the avoidance of doubt, and because it is the reason
-                      this grant exists: running the Licensed Work in your own
-                      CI pipeline, on your own repositories, at any scale, is
-                      permitted and is what the Licensed Work is for. You supply
-                      your own model inference; nothing in this licence requires
-                      you to send code, findings or telemetry to the Licensor,
-                      and the Licensed Work is built so that you do not.
+                      Repository visibility is assessed when the Licensed Work
+                      runs. A repository that is made private stops qualifying
+                      under this section from that point, and falls to section 2.
+
+                      2. SMALL ORGANISATIONS — PRIVATE REPOSITORIES TOO. For
+                      repositories that are not public, You may make production
+                      use of the Licensed Work within Your own software
+                      development lifecycle — including continuous integration,
+                      code review and release engineering — for so long as BOTH
+                      of the following are true:
+
+                        (a) the total annual gross revenue of You and Your
+                            Affiliates, for Your most recently completed fiscal
+                            year, is less than USD $5,000,000; and
+
+                        (b) no more than 10 individuals in total contribute
+                            source code to the non-public repositories the
+                            Licensed Work reviews for You.
+
+                      "Affiliates" means any entity that controls, is controlled
+                      by, or is under common control with You. Revenue is
+                      counted across the whole group, so a small team inside a
+                      larger organisation is measured by that organisation.
+
+                      Limb (b) counts contributors to the REPOSITORIES REVIEWED,
+                      not Your own headcount. This is deliberate and it is what
+                      makes section 3 self-executing: pointing the Licensed Work
+                      at a large private codebase exceeds it, whoever You are.
+
+                      If either limb ceases to be true, this grant ends for Your
+                      non-public repositories and a commercial licence is
+                      required to continue. Contact licensing@reyse.ai.
+
+                      3. WHOSE CODE. Within the limits above it does not matter
+                      whose source code You review. Running the Licensed Work on
+                      code You are contractually engaged to develop or secure —
+                      as a consultancy, a contractor or a managed service
+                      provider — is permitted on the same terms as running it on
+                      Your own. The line drawn here is size, not client
+                      relationship.
+
+                      4. NOT AS A SERVICE. You may not make the functionality of
+                      the Licensed Work available to third parties as a hosted,
+                      managed or embedded service, whether or not for a fee.
+                      This prohibits offering the Licensed Work ITSELF to others
+                      to run; it does not prohibit using the Licensed Work to
+                      perform Your own work, which section 3 permits.
+
+                      5. MODIFICATIONS COME BACK. If You modify the Licensed
+                      Work and make production use of the modified version, You
+                      must EITHER:
+
+                        (a) make the source of Your modifications publicly
+                            available, at no charge, under this same License,
+                            within 90 days of that use beginning; OR
+
+                        (b) obtain a commercial licence, which permits You to
+                            keep Your modifications private. Contact
+                            licensing@reyse.ai.
+
+                      Under (a) You are not required to contribute anything to
+                      the Licensor, to open a pull request, or to support what
+                      You publish — only to publish it, so that anyone who
+                      received the Licensed Work can also receive Your
+                      improvements to it.
+
+                      This obligation covers changes to the Licensed Work
+                      itself. It does NOT cover Your own source code, Your
+                      configuration, Your entry points, Your benign controls,
+                      Your findings, or any work that merely invokes the
+                      Licensed Work. Reviewing Your code with the Licensed Work
+                      never obliges You to publish that code.
+
+                      6. WHAT THIS DOES NOT ASK OF YOU. You supply Your own
+                      model inference; nothing in this License requires You to
+                      send code, findings or telemetry to the Licensor, and the
+                      Licensed Work is built so that You do not.
 
 Change Date:          2030-08-22
 
