@@ -13,7 +13,7 @@ executed. the design notes, "Found by wiring the budget".
 
 A fixed `args:` block cannot do the job: the three modes take different flags (`--base-ref` is diff's,
 `--harness` is deep's, `survey` takes neither), so one static argument list is wrong for two modes out
-of three. And `args:` cannot write `$GITHUB_OUTPUT`, which is where the five declared outputs have to
+of three. And `args:` cannot write `$GITHUB_OUTPUT`, which is where the declared outputs have to
 end up. That leaves a shell script or this. It is this because the maintainers' notes's quality bar asks for a
 deterministic test with no LLM call for everything that ships, and `argv_for` is a pure function from a
 dict to a list of strings — the maintainers' suite proves every input reaches a flag, which is the guard
@@ -233,7 +233,12 @@ def argv_for(env) -> list[str]:
 
 
 def outputs_for(mode: str, payload: dict) -> dict[str, str]:
-    """The five declared outputs, off the run's own payload.
+    """The declared outputs, off the run's own payload.
+
+    **The count is not stated here.** It said "five" while the manifest declared eight, for long
+    enough that a reader checking the two against each other found a docstring wrong rather than a
+    wiring defect. the maintainers' suite asserts this function's key set equals `action.yml`'s
+    `outputs:` keys, which is the check a number in prose was pretending to be.
 
     `survey` emits no findings by construction — it is a scan, not a hunt — so its counts are 0 and
     `sarif-path` and `bundle-path` are empty. That is the honest answer rather than a missing key a
@@ -261,6 +266,7 @@ def outputs_for(mode: str, payload: dict) -> dict[str, str]:
         "bundle-path": str(pathlib.Path(bundles[0]).parent) if bundles else "",
         # THE RUN'S OWN TELEMETRY. Everything above describes the CODE; these describe the RUN — where
         # the seconds and tokens went, how the context grew, which tools failed. EMPTY when the run
+        "result-path": str(artefacts.get("result", "")),
         "telemetry-path": str(artefacts.get("telemetry", "")),
         "log-path": str(artefacts.get("log", "")),
     }

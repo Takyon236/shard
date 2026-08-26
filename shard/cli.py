@@ -84,6 +84,11 @@ def _optional_probe(module: str):
 # the truthful arrangement rather than a weaker probe: it is dependency-free, it is part of the
 # free CLI, and every command now genuinely loads it.
 from shard.telemetry import render_log as _render_log, summarise as _telemetry
+# THE SAME ARRANGEMENT, FOR THE SAME REASON, one module along. `shard.resultdoc` writes
+# `shard-result.json` from inside `_emit`, so a function-scoped import scored unreachable on the
+# probe above and the module shipped as dead weight. It is dependency-free and imports only
+# `shard.report`, which every command already loads.
+from shard.resultdoc import build as _build_result
 from shard.target import (cargo_fuzz_targets, demonstrability, entry_template, estimate_diff_cost,
                           free_tier_verdict, probe_runtimes, profile_repo, validate_workdir)
 
@@ -576,7 +581,7 @@ def _cmd_diff(args) -> int:
     facts = _diff_run_facts(args, run, spend=spend, scan_facts=scan_facts,
                             changed=changed, tokens=governor.spent("tokens"))
     written = _emit(findings, args.out_dir, status=run.status, target=args.slug or str(repo),
-                    gate_reasons=gate_reasons, scope_reasons=scope_reasons, run=facts,
+                    mode="diff", gate_reasons=gate_reasons, scope_reasons=scope_reasons, run=facts,
                     journal_path=journal.path)
     outcome = _write_state(state, args, scope=scope, findings=findings,
                            survey_payload=survey_payload, prior_reasons=state_reasons,
@@ -940,7 +945,7 @@ def _write_artefact(what: str, failed: list, write) -> bool:
         return False
 
 
-def _emit(findings: list, out_dir: str | None, *, status: str, target: str,
+def _emit(findings: list, out_dir: str | None, *, status: str, target: str, mode: str,
           gate_reasons=(), scope_reasons=(), run=None, journal_path=None) -> dict:
     """Write the artefacts. Returns what was written, for the JSON payload and the action outputs.
 
@@ -979,6 +984,25 @@ def _emit(findings: list, out_dir: str | None, *, status: str, target: str,
                                           run=run),
                            encoding="utf-8")):
         written["report"] = str(report)
+
+    # **THE WHOLE RESULT, FOR THE TOOL ON THE OTHER SIDE.** Written LAST of the three finding
+    # artefacts because it names the other two: `artefacts` in the document is what actually survived,
+    # so a consumer following a path from it is following a path to a file that exists. That is
+    # `_write_artefact`'s rule — a key is a claim the file is there — applied one level out.
+    #
+    # It is not a fourth spelling of the report. `shard/resultdoc.py` records what it replaces: five
+    # partial views of one result, the only complete one being the markdown, which is the one a
+    # machine cannot read.
+    result = out / "shard-result.json"
+    if _write_artefact("shard-result.json", failed,
+                       lambda: result.write_text(
+                           json.dumps(_build_result(findings, status=status, mode=mode, target=target,
+                                                   run=run, gate_reasons=gate_reasons,
+                                                   scope_reasons=scope_reasons,
+                                                   artefacts=dict(written)),
+                                      indent=2, sort_keys=True),
+                           encoding="utf-8")):
+        written["result"] = str(result)
 
     # THE RUN'S OWN TELEMETRY. Everything above describes the CODE — what was found, whether it gates.
     # These two describe the RUN: where the seconds and the tokens went, how the context grew, which
@@ -1270,6 +1294,11 @@ def _diff_run_facts(args, run, *, spend: dict, scan_facts: dict, changed, tokens
         # bare word until 2026-08-22.
         error_kind=getattr(run, "error_kind", "") or "",
         step_flag="--max-steps",
+        # WHETHER ANYTHING ACCUMULATES BETWEEN RUNS. The declared flag, not the opened repository:
+        # `no_baseline` in the result document is the question "is a state repository configured",
+        # and a configured one that failed to open is a different fact with its own reasons already
+        # travelling through `_write_state`.
+        stateful=bool(args.state_repo),
         # WHETHER THE EXECUTION CEILING CUT THE RUN SHORT, which no artefact could say until
         # 2026-08-21. `spend` refused the agent and told only the agent, so a run that could not finish
         # verifying wrote the same report as one that finished — and on the first paying engagement

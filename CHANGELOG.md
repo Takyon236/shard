@@ -12,6 +12,66 @@ local rule that is stricter than semver and exists because of what this product 
 > gates is not a patch. A customer who pinned `v1` and merged on a Friday is entitled to the same
 > answer on Monday.
 
+## [2.2.0] — 2026-08-27
+
+### Added
+
+- **`shard-result.json` — the whole result of a scan, as one versioned document.** Written beside the
+  SARIF and the report, and declared as the `result-path` action output. Until now a tool consuming a
+  Shard run had five places to look and no complete one among them: the SARIF carries none of the run
+  facts, `bundles/<fp>/metadata.json` has no run context, `shard-telemetry.json` has no findings, and
+  `--json` was stdout-only, unversioned, and spelled its keys differently on `diff` and `deep`. **The
+  only artefact carrying the whole result was `shard-report.md`, which is prose.**
+
+  The document splits findings into `reproduced` and `hypotheses` as **separate arrays**, because a
+  consumer looping a flat list with a boolean it forgot to check rebuilds the triage queue this
+  product exists to eliminate. `gate_eligible`, `level`, and whether `reproduction` is `null` are
+  three views of one fact and cannot disagree.
+
+  It carries a **`limits` array**: fourteen codes naming what the run does *not* establish — an
+  unfinished run, a ceiling that bound, a walk that truncated, an alert anchored on the entry point
+  rather than the fault, a run with no baseline. `no_coverage_statement` is present on **every** run,
+  including a clean one: Shard reports what it found and does not report what it covered. A dashboard
+  cannot read a careful sentence; it can read a code.
+
+  `schema` is an integer and bumps only when a consumer would misread an older file.
+
+- **`synthesized_c`: deep mode on a repository that fuzzes nothing.** Three harness kinds were
+  registered and every one needed something you had already done — a `test_poc.sh` you wrote, or a
+  repository that already fuzzes. Two mainstream C projects were measured reporting *"no harness kind
+  applies"* for exactly that reason.
+
+  Shard now **generates** the libFuzzer body. You name a function your own header declares and how
+  bytes reach it; Shard writes the code, compiles it against your sources with AddressSanitizer, and
+  the sanitiser decides. No model writes C, and the generated body has no verdict of its own — the
+  same property that has always made the `cargo_fuzz` and `libfuzzer_c` harnesses sound.
+
+  Registered last, so a repository that ships its own fuzz target still wins: your target is stronger
+  evidence than one we generated.
+
+- **`gdb` and the docker client in the deep image** (+81.7 MB). Four registered tools previously
+  failed 100% of their calls on any workdir that could have used them. A client, never a daemon.
+
+### Fixed
+
+- **The markdown report ignored its own reporting cap.** Measured on 505 findings: it rendered all 505
+  and printed *"5 further finding(s) were ranked below the reporting cap and omitted"* underneath
+  them. The SARIF capped correctly, so the human artefact described a larger set than the machine one.
+  No effect on gating.
+
+- **The egress ledger claimed to list every request the container made, and could not know it.** The
+  solver holds an unrestricted shell; one measured run fetched four upstream source revisions while
+  the ledger reported none. The claim is now scoped to what it can actually see.
+
+- **A read-only source mount silently disabled the `libfuzzer_c` kind.** Its build probe wrote into
+  the checkout, so mounting your source `:ro` — the careful thing to do — produced *"no harness kind
+  applies"*, indistinguishable from a genuine build failure. It builds in a temporary directory now.
+
+- **A run that shelled outside the workdir left no trace.** Deep mode copies your checkout and strips
+  its VCS metadata so a finding has to be constructed rather than looked up; a `--repo` mount let a
+  run reach the original anyway. That now records a journal event naming what happened. It records;
+  it does not block.
+
 ## [2.1.3] — 2026-08-26
 
 ### Changed

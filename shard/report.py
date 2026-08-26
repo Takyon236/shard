@@ -689,6 +689,17 @@ class RunFacts:
     #: report say four levers were lost on runs that lost nothing. The two fields answer different
     #: questions and only their conjunction is a loss.
     levers_image_bound: bool | None = None
+    #: Whether a STATE REPOSITORY is configured for this run. `False` means nothing accumulates
+    #: between runs, so no finding here can be called new and no suppression the business has accepted
+    #: can be applied; `None` means the mode never established it.
+    #:
+    #: Carried for the RESULT DOCUMENT rather than for this header, which is why it prints no row.
+    #: the design notes A3 measured the gap it names — `--state-repo` exists on
+    #: `diff` and is absent from `deep`, so every deep run starts from nothing — and the free tier has
+    #: said so in its own step log since state existed (*"no state repository configured; nothing will
+    #: accumulate between runs"*). A consumer of the artefacts could not read it anywhere, which is
+    #: this class's founding defect: a fact the run knows, in a channel that is deleted with the runner.
+    stateful: bool | None = None
 
 
 #: Which statuses mean the run reached its own end. Anything else and the finding count is a floor.
@@ -1009,7 +1020,15 @@ def build_markdown(findings, *, status: str, dropped: int = 0, target: str = "",
     *"there is no bug here"* is unfalsifiable. That distinction is `SolveResult.audited`'s and it is
     carried through to the customer rather than flattened into a green tick.
     """
-    ordered = rank(findings)
+    # **CAPPED HERE, like every other writer.** `write_sarif` caps, `resultdoc.build` caps, and this
+    # one did not: measured 2026-08-26 on 505 synthetic findings, the markdown rendered all 505 and
+    # printed *"5 further finding(s) were ranked below the reporting cap and omitted"* underneath
+    # them. The one artefact whose job is to state what was dropped was the one artefact that dropped
+    # nothing, so the sentence was false and the two machine-readable artefacts described a smaller
+    # set than the human one. `cap` is pure and every writer calls it independently — see `cli._emit`,
+    # which explains why the number is passed in rather than returned from whichever write ran first.
+    kept, _capped = cap(findings)
+    ordered = rank(kept)
     reproduced = [f for f in ordered if f.gate_eligible]
     hypotheses = [f for f in ordered if not f.gate_eligible]
 
