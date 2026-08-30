@@ -59,6 +59,10 @@ from dataclasses import dataclass, fields
 # place a model-written string becomes markdown structure rather than markdown prose: the heading.
 from shard.target import HARNESS_NAME
 from shard.diffscope import prompt_safe
+# MODULE SCOPE, and it has to be: `Finding.crash` is a property every writer here reads, so a lazy
+# import would run inside the render path on the customer's runner. Free-tier and stdlib-only, which
+# is what makes that safe — see `shard/crashstate.py` and `FREE_MODULES`.
+from shard import crashstate
 
 #: Conservative against code scanning's per-run alert limits. Exceeding them rejects the WHOLE upload,
 #: so the cap is on our side where a drop can at least be reported.
@@ -376,6 +380,22 @@ class Finding:
         return "error" if self.gate_eligible else "note"
 
     @property
+    def crash(self) -> crashstate.CrashState:
+        """This finding's sanitiser report, classified — or an abstaining `CrashState` when the
+        observed output is not one.
+
+        DERIVED, never stored, and that is the whole reason this needed no new producer field: every
+        input it reads (`evidence`, `sanitizer`) is already on the record, set by whichever mode
+        built it. A stored field would have to be populated by the separate package, by `simple.py` and
+        by every future producer, and the one that forgot would emit a finding with no CWE and no
+        way for a reader to tell that from a finding that has no class.
+
+        Cheap enough to be a plain property: a handful of regexes over at most `evidence`'s cap,
+        against a `DEFAULT_SARIF_CAP` of 500 findings.
+        """
+        return crashstate.classify(self.evidence, self.sanitizer)
+
+    @property
     def fingerprint(self) -> str:
         """Stable identity for de-duplication across runs.
 
@@ -455,6 +475,7 @@ def build_sarif(findings, *, limit: int = DEFAULT_SARIF_CAP, status: str = "done
             "shortDescription": {"text": f.rule_title or f.title},
             "defaultConfiguration": {"level": f.level},
         }
+        rule["properties"] = _rule_properties(f)
         if f.location_is_harness:
             # THE SAME SENTENCE THE MARKDOWN CARRIES, in the channel a security team actually reads.
             # `_sarif_message`'s own docstring is that both channels must say the same thing, and the
@@ -493,6 +514,41 @@ def build_sarif(findings, *, limit: int = DEFAULT_SARIF_CAP, status: str = "done
     }
 
 
+def _rule_properties(f: Finding) -> dict:
+    """The rule's `properties` bag — the two fields GitHub code scanning RANKS and FILTERS on, plus
+    the one that says how much to trust the alert.
+
+    the design notes A4: a Shard rule arrived in the Security tab carrying only a
+    level, so an estate could neither sort it by severity nor slice it by weakness. That document
+    calls this the *"smallest fix with the largest reporting payoff"* on the CISO's list, and the
+    reason is that the design notes closes the question of building a control plane — GitHub IS
+    the control plane, so GitHub's taxonomy is this product's reporting surface, not a nice-to-have.
+
+    **PER-RULE, so every field here must be true of every alert of the class.** That invariant is why
+    `_rule_id` now carries the access: a `heap-buffer-overflow` READ is CWE-125 at medium and a WRITE
+    is CWE-787 at high, and one rule cannot honestly state both. `rule_title` records what putting a
+    per-instance value in a per-rule field already cost here once.
+
+    **`precision` is where confidence lives, and it is separate from severity on purpose.**
+    `security-severity` describes the WEAKNESS — how bad this class of defect is — and is adopted
+    from ClusterFuzz's bands unchanged. How sure we are that this particular alert is real is a
+    different axis, and SARIF has a field for it. A Shard `error` always carries a reproducing input
+    that was replayed, so it is `very-high`; a hypothesis is `note` and makes no such claim.
+    """
+    state = f.crash
+    props: dict = {
+        "tags": list(state.tags),
+        # CodeQL's convention, and the field GitHub falls back to when there is no security-severity.
+        "problem.severity": "error" if f.gate_eligible else "recommendation",
+        "precision": "very-high" if f.gate_eligible else "medium",
+    }
+    if state.security_severity:
+        # A STRING, which is the schema's type and not a stylistic choice: GitHub parses this field
+        # as text and a JSON number is silently ignored, which loses the ranking without an error.
+        props["security-severity"] = state.security_severity
+    return props
+
+
 #: How much observed output rides in the SARIF message. Far below the markdown's allowance: this text
 #: is rendered inside a code-scanning alert card, where a long tail pushes the sentence that matters
 #: off the screen. One line is enough to tell two alerts apart, which is the entire job here.
@@ -529,7 +585,29 @@ def _sarif_result(f: Finding) -> dict:
         "message": {"text": _sarif_message(f)},
         # `partialFingerprints` is what makes an alert persist across runs instead of closing and
         # re-opening on every push. Cheap to emit and expensive to retrofit once history exists.
-        "partialFingerprints": {"shardCrashSignature": f.fingerprint},
+        #
+        # **AND UNTIL 2026-08-28 IT DID THE OPPOSITE.** The value was `Finding.fingerprint`, which
+        # for a deep finding is `oracle._behaviour_sig` — a hash of the whole normalised harness
+        # output. Measured on one cJSON heap-buffer-overflow reported six ways that differ only as
+        # two ordinary runs differ (build directory, pid, ASLR addresses, a source line moved by an
+        # unrelated edit, the sanitiser's own interceptor frames): **4 identities for 1 defect.** So
+        # the alert closed and re-opened on almost every push, losing its triage state and its
+        # assignee — the exact failure this field exists to prevent, caused by the field.
+        #
+        # `crash.signature` is ClusterFuzz's crash state: the class plus the top three APPLICATION
+        # frames, everything volatile discarded rather than normalised. Same six runs: 1 identity.
+        #
+        # ONE KEY, not two. A second key would raise a question about GitHub's matching that this
+        # repository cannot answer by measurement, and the fallback answers it instead: an
+        # unclassified finding keeps exactly today's value, so nothing regresses where nothing was
+        # classified.
+        #
+        # `Finding.fingerprint` is deliberately NOT changed with it. That value names the bundle
+        # DIRECTORY, where per-run uniqueness is the requirement — two findings that share a crash
+        # state are one defect to code scanning and must still be two directories on disk, because
+        # `_sweep_poc` records what a shared bundle path already cost: two findings, one PoC, and a
+        # heap-buffer-overflow shipping a bundle that reproduces a stack-buffer-overflow.
+        "partialFingerprints": {"shardCrashSignature": f.crash.signature or f.fingerprint},
         "locations": [{
             "physicalLocation": {
                 # **PERCENT-ENCODED, because this field is a URI reference and a repository path is
@@ -1251,6 +1329,23 @@ def _finding_block(f: Finding, *, reproduced: bool) -> list[str]:
     if f.sanitizer:
         fence = _fence_for(f.sanitizer)
         out += [fence, f.sanitizer, fence, ""]
+    crash = f.crash
+    if crash.parsed:
+        # WHERE, next to WHAT. This module's own header records the gap as a defect: "`sanitizer` —
+        # the error-type line — and the frames are not on it. `oracle._top_frames` exists and is
+        # pure, but no field carries its output." A reader of a crash report could see the class and
+        # never the call path, and the call path is the first thing an engineer needs.
+        #
+        # The frame names come from the customer's own binary, so they are program output and are
+        # flattened by `prompt_safe` like every other captured string on this record.
+        classified = [f"Crash state: {_inline_code(prompt_safe(crash.describe(), limit=300))}"]
+        if crash.cwe_ids:
+            # The same ids the SARIF rule carries, so the artefact a human keeps and the one their
+            # dashboard aggregates do not disagree about the weakness. That disagreement is this
+            # module's most-recorded defect class.
+            classified.append("Weakness: " + ", ".join(f"CWE-{n}" for n in crash.cwe_ids)
+                              + f" · severity {crash.severity} ({crash.security_severity})")
+        out += classified + [""]
     if f.evidence:
         # TRUNCATED HARDER THAN THE BUNDLE'S COPY. This is read inline in a pull request, where a
         # 4,000-character tail buries the finding it is supporting; the bundle carries the whole thing.
@@ -1369,8 +1464,12 @@ def _findings(result, workdir: pathlib.Path, setup) -> list:
     for one in verdicts:
         sanitizer = getattr(one, "sanitizer", None)
         signature = getattr(one, "signature", "")
+        # ONE reading, shared by the rule id and by the record. `_rule_id` needs the access line, and
+        # the access line is in the evidence rather than on the sanitiser line — so computing it
+        # twice would be two chances for the id and the alert's own classification to disagree.
+        observed = _repo_relative(getattr(one, "evidence", "") or "", workdir)
         findings.append(Finding(
-            rule_id=_rule_id(sanitizer),
+            rule_id=_rule_id(sanitizer, observed),
             title=_finding_title(sanitizer, signature),
             # The CLASS's name, kept clean of this instance's signature. `_finding_title` suffixes the
             # per-finding title so a sweep's markdown headings differ; the SARIF RULE describes every
@@ -1383,7 +1482,7 @@ def _findings(result, workdir: pathlib.Path, setup) -> list:
                      f"{one.replays} replays. The crashing input is attached as a reproduction bundle."),
             # THE OUTPUT THE HARNESS PRINTED. Empty until 2026-08-17, which is why a sweep returning
             # two different defects wrote the same finding twice. See `oracle.Verdict.evidence`.
-            evidence=_repo_relative(getattr(one, "evidence", "") or "", workdir),
+            evidence=observed,
             gate_eligible=True,
             # A real file in the customer's repository and a true statement: this harness reproduces a
             # crash. Not a claim about which line is at fault — see `shard/report.py` on why nothing
@@ -1470,11 +1569,31 @@ def _finding_title(sanitizer: str | None, signature: str) -> str:
         return base
     return f"{base} ({signature[:12]})"
 
-def _rule_id(sanitizer: str | None) -> str:
-    """A stable rule id, so code scanning groups alerts of the same class together across runs."""
+def _rule_id(sanitizer: str | None, evidence: str = "") -> str:
+    """A stable rule id, so code scanning groups alerts of the same class together across runs.
+
+    **THE ACCESS IS PART OF THE CLASS, and adding it on 2026-08-28 was forced by `_rule_properties`
+    rather than chosen.** A rule's `properties` are per-rule and must be true of every alert under
+    it. A `heap-buffer-overflow` READ is CWE-125 at severity medium; a WRITE is CWE-787 at high.
+    Under one rule id, whichever finding happened to be first would have set the severity and the
+    CWE for both — which is exactly the per-instance-value-in-a-per-rule-field defect that
+    `Finding.rule_title` exists to record, arriving through the change that adds the fields.
+
+    Upstream agrees and is the reason this is not an invention: ClusterFuzz's crash TYPE is
+    `Heap-buffer-overflow READ`, one string. The access is not a modifier there either.
+
+    **This changes alert identity for overflow classes, once.** Existing `shard/heap-buffer-overflow`
+    alerts close and `shard/heap-buffer-overflow-read` opens. That cost is real and is stated in
+    `CHANGELOG.md`; it is paid once against a field that was re-opening every alert on every run
+    anyway (see `_sarif_result`). Classes with no read/write axis — use-after-free, leaks, integer
+    overflow, and the neutral `shard/reproducing-input` — keep the id they have.
+    """
     title = _crash_title(sanitizer)
     slug = title.replace(" reproduced", "").replace(" ", "-").lower()
-    return f"shard/{slug}" if slug != "reproducing-input-found" else "shard/reproducing-input"
+    if slug == "reproducing-input-found":
+        return "shard/reproducing-input"
+    access = crashstate.classify(evidence, sanitizer).access
+    return f"shard/{slug}-{access.lower()}" if access else f"shard/{slug}"
 
 def _report_id() -> str:
     """This run's report number. One reading of the environment, shared by every mode.

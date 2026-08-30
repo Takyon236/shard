@@ -388,7 +388,7 @@ runs:
 # `Dockerfile` beside this file still ships and still builds the same image: it is what you
 # read to audit what executes in your pipeline, and what you build if you would rather run
 # your own. The build-context paragraph above applies to that path rather than to this one.
-  image: "docker://ghcr.io/takyon236/shard@sha256:7fcd357937a9f48433227d00e4be3e568a0e6d1baa55e9aed4935e012b191838"
+  image: "docker://ghcr.io/takyon236/shard@sha256:8f40ca5532c16a1249838171737e67a58a698512a17e74d3a8761111252e141c"
   # `args` is EXPLICIT and it is the whole defect this file carried until 2026-08-08: with no args
   # block a container action runs the image's CMD, which is `--help`, so the action printed help,
   # exited 0 — a passing check — and ignored every input above. See `shard/action.py`.

@@ -12,6 +12,76 @@ local rule that is stricter than semver and exists because of what this product 
 > gates is not a patch. A customer who pinned `v1` and merged on a Friday is entitled to the same
 > answer on Monday.
 
+## [2.3.0] — 2026-08-31
+
+### Added
+
+- **A finding now carries its weakness: a CWE, a severity a dashboard can rank, and a crash state.**
+  A Shard rule reached GitHub code scanning with a level and nothing else, so an estate could
+  neither sort it by severity nor slice it by weakness. On a product whose position is that GitHub
+  *is* the control plane, that left the reporting surface half empty. The SARIF rule now carries
+  `security-severity`, `tags` including `external/cwe/cwe-NNN`, `problem.severity` and `precision`;
+  `shard-result.json` carries the same values in a new `weakness` object, derived from the same
+  place so the two artefacts cannot disagree; the report names the crash state and the CWE.
+
+  `weakness` is **null**, and the SARIF fields absent, when the observed output was not a sanitiser
+  report. There is no default severity and no fallback CWE. A finding that says how a defect was
+  *demonstrated* is not a finding that says what class it is, and Shard does not invent a defect
+  class.
+
+  The severity bands are ClusterFuzz's, adopted unchanged including its cap: a `WRITE` bumps one
+  band, and nothing reaches `critical` from a crash type alone. How confident Shard is that the
+  alert is real is a different axis and rides on `precision`, which is `very-high` only for a
+  finding carrying a replayed reproducing input.
+
+- **Deep mode proposes which function to fuzz, on a repository that ships no fuzz target.** When
+  Shard generates the harness body itself, it previously showed the model a list of header paths and
+  asked it to name an entry point. On a well-known project that works; on your code it was a guess,
+  and a wrong guess fuzzes the wrong thing and quietly finds nothing. Discovery now offers a ranked
+  shortlist built from your own headers, each row carrying the evidence for its rank — what the name
+  suggests, whether the signature is length-delimited, and whether the header is public.
+
+  It is a hint, not a constraint: the model may still name a function the ranking missed, and the
+  probe compile remains the only hard gate. Nothing about the witness rule changes — Shard picks a
+  function and a byte shape from enumerated sets, and writes no C.
+
+- **Deep mode proposes the seed corpus too, and says when to leave it blank.** Every harness kind
+  takes a `corpus`, and nothing helped fill it — the field said *"if there is one"* and never where.
+  A seed corpus is the single largest lever on fuzzing coverage; OSS-Fuzz puts it at an order of
+  magnitude. Discovery now ranks the directories in your repository that actually look like sample
+  inputs, and shows what it measured about each: how many of the files are data rather than source,
+  and the median size.
+
+  The discriminator is **the contents, not the name**. A test directory full of `.c` files is a
+  test suite, and copying it as a corpus starts the fuzzer from source text; the `testdata`
+  directory beside it is the thing worth having. A corpus nested one level under a
+  conventionally-named parent is recognised through that parent.
+
+  It also says **leave the field empty** when it finds nothing, and that is the safe direction
+  rather than the timid one: a corpus path that is not a directory fails the whole acquisition, so
+  an unhelped guess costs the run.
+
+### Fixed
+
+- **The field that exists to stop alerts churning was causing it.** Code scanning matches alerts
+  across runs on `partialFingerprints`, and Shard's value was a hash of the whole harness output.
+  Measured on one cJSON `heap-buffer-overflow` reported six ways that differ only as two ordinary
+  runs differ — build directory, process id, ASLR addresses, a source line moved by an unrelated
+  edit, the sanitiser's own interceptor frames — that value produced **4 distinct identities for 1
+  defect**. So an alert closed and re-opened on almost every push, losing its triage state and its
+  assignee. The fingerprint is now the crash state: the defect class plus the top three frames of
+  your code, with sanitiser and fuzzing-engine frames filtered out. Same six runs, **1 identity**.
+
+### Changed
+
+- **Alert identity changes once, for the overflow classes.** `shard/heap-buffer-overflow` becomes
+  `shard/heap-buffer-overflow-read` or `shard/heap-buffer-overflow-write`. This is forced rather
+  than chosen: a SARIF rule's properties describe every alert under that rule, and an out-of-bounds
+  READ is CWE-125 at medium severity while a WRITE is CWE-787 at high. One rule cannot state both
+  without mislabelling half its alerts. Existing alerts of those classes close and new ones open,
+  once, on the first run after upgrading. Classes with no read/write distinction — use-after-free,
+  leaks, integer overflow, and the neutral `shard/reproducing-input` — keep the id they have.
+
 ## [2.2.0] — 2026-08-27
 
 ### Added

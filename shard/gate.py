@@ -42,6 +42,27 @@ from __future__ import annotations
 #: error reported as 1 would be indistinguishable from a reproduced finding.
 EXIT_OK, EXIT_GATED, EXIT_CONFIG = 0, 1, 2
 
+
+class ConfigError(Exception):
+    """A problem with the invocation or the target — never a security finding. Exits `EXIT_CONFIG`.
+
+    **It lives here for this module's own founding reason.** `shard/action.py` had to re-enter the
+    entry point to learn what a 1 means, and the fix was to put the contract where a caller can read
+    it. This is what a 2 means, expressed as an exception, and it had exactly the same problem one
+    layer in: it was defined in `shard/cli.py`, so every module the CLI is being decomposed into
+    would have had to import the dispatcher to refuse an argument — a cycle, and the cycle that
+    passing handlers into `cliargs.build_parser` was arranged to avoid.
+
+    Raised from twenty-one sites and caught in exactly one, `cli.main`, which turns it into
+    `EXIT_CONFIG` and a message with no traceback. That asymmetry is the design: a customer whose
+    repository cannot be acquired has a setup problem, and reporting it as a security finding would
+    be a false positive of the most annoying kind.
+
+    Public where `cli._ConfigError` was private, because a name three modules import is not private
+    to any of them.
+    """
+
+
 #: `new` needs NO baseline storage. It asks whether THIS change introduced the demonstrated defect,
 #: and since 2026-08-12 it asks CAUSALLY where it can: `diffscope.base_tree` extracts the repository as
 #: it was and `witness.attribute` re-runs the reproducing input against it, so a silent exploit with no

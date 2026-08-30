@@ -41,12 +41,30 @@ to eliminate. The shape refuses the mistake rather than documenting against it.
 one expression each, so whichever a consumer reads it gets the same answer.
 the maintainers' suite asserts the agreement per finding rather than trusting this paragraph.
 
+## The classification, added 2026-08-28
+
+`weakness` carries the CWE ids, the severity band and the crash state — the SAME values
+`report._rule_properties` puts in the SARIF, read from the SAME `Finding.crash` property, so the
+document a dashboard parses and the alert a security team triages cannot disagree about the
+weakness. Two spellings of one fact is this repository's most-recorded defect class, and the fix
+each time was one derivation rather than two.
+
+It is **null when the observed output was not a sanitiser report** — a free-tier `output_marker`
+finding, a target with no sanitiser compiled in — because `shard/crashstate.py` abstains rather
+than defaulting. A consumer must read null as "this run did not establish a class", never as
+"unclassified means low".
+
 ## What this is NOT
 
-Not a coverage report, not a severity ranking, and not a CWE mapping. `docs/
-ADOPTION-GAPS-2026-08-26.md` A4 wants the last two in the SARIF, where code scanning ranks on them;
-inventing a severity number here so the document looks complete would be a manufactured fact in the
-one artefact built to carry none.
+Not a coverage report. the design notes A2 is open and `limits` reports it on
+every run rather than papering over it.
+
+**And `weakness` is not a re-ranking of the finding.** The severity describes the WEAKNESS CLASS and
+is ClusterFuzz's band for that class, unchanged; how much to trust the alert is a different axis and
+lives in `gate_eligible`. The earlier version of this paragraph said a CWE mapping did not belong
+here at all — that was right while the alternative was inventing one, and wrong once the mapping
+became a measured lookup that the SARIF already carries. Withholding it from the machine-readable
+artefact would have meant the only complete document was, again, the one a machine cannot read.
 """
 
 from __future__ import annotations
@@ -169,6 +187,38 @@ def build(findings, *, status: str, mode: str, target: str = "", run=None,
     }
 
 
+def _weakness(f) -> dict | None:
+    """The finding's defect class, or **null** when the observed output was not a sanitiser report.
+
+    Null rather than an empty object, and rather than a zeroed one. An empty object reads as "we
+    looked and there is no weakness"; a zeroed severity reads as "harmless". Both are claims this
+    run did not make, and the second is trap 7 of `RunFacts` — a zero you cannot distinguish from an
+    unknown is a lie with a number on it.
+
+    `severity_score` is the string GitHub's SARIF field carries and is emitted as a string here too,
+    so a consumer diffing the two artefacts sees the same token rather than `5.5` against `"5.5"`.
+    """
+    state = f.crash
+    if not state.parsed:
+        return None
+    return {
+        "class": state.crash_type,
+        "access": state.access or None,
+        "sanitizer": state.sanitizer,
+        # The top application frames, sanitiser and fuzzing-engine frames removed. NOT a claim that
+        # the defect is IN the first frame — it is where the fault was detected, which is the same
+        # distinction `location.is_entry_point` already draws one field up.
+        "crash_state": list(state.frames),
+        "cwe": [f"CWE-{n}" for n in state.cwe_ids],
+        "severity": state.severity or None,
+        "severity_score": state.security_severity or None,
+        # The cross-run identity, named so a consumer knows what to key its own history on. This is
+        # the value in the SARIF's `partialFingerprints`, and it is deliberately NOT `id` above:
+        # `id` names this run's bundle directory and must stay unique within a run.
+        "signature": state.signature,
+    }
+
+
 def _finding(f) -> dict:
     """One finding. `reproduction` is null when there is none, which is the only thing that gates."""
     reproduced = bool(f.gate_eligible)
@@ -191,6 +241,7 @@ def _finding(f) -> dict:
             "measured": bool(f.location_measured),
         },
         "attribution": {"verdict": f.attribution, "reason": f.attribution_reason},
+        "weakness": _weakness(f),
         "reproduction": {
             "replays": f.replays,
             "crashes": f.crash_count,
