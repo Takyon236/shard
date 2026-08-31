@@ -313,6 +313,13 @@ reach for.** Pick one deliberately rather than discovering the gap on the pull r
 own build. It runs in the **base** repository's context, so the secret is available, and the fork's
 code is analysed as data rather than executed as a trusted step. Two things it needs, neither optional:
 
+**Shard writes this file for you**, because three lines in it are load-bearing and a copy-paste error
+in any of the three produces a green check that reviewed nothing rather than an error:
+
+```bash
+shard preflight --fork-workflow > .github/workflows/shard-fork.yml
+```
+
 ```yaml
 name: shard-fork
 on:

@@ -159,6 +159,17 @@ def _preflight_parser(sub, handler) -> None:
                      help="print a ready-to-commit .shard/entry.sh for this repository's primary "
                           "language and exit. Redirect it: --entry-template > .shard/entry.sh. It is "
                           "a fixed skeleton, not generated from your code")
+    # THE SECOND SKELETON PREFLIGHT CAN PRINT, and the argument for emitting it rather than leaving
+    # the README to be transcribed: the fork workflow's recipe is fixed and three of its lines are
+    # load-bearing, where a copy-paste error produces a GREEN CHECK THAT REVIEWED NOTHING rather
+    # than an error — the exact failure this product's own documentation exists to name. Beside
+    # `--entry-template` because the contract is the same one: printed, not written, so committing
+    # it stays the customer's act.
+    pre.add_argument("--fork-workflow", action="store_true",
+                     help="print a ready-to-commit .github/workflows/shard-fork.yml — the "
+                          "workflow_run workflow that reviews a fork's pull request with secrets "
+                          "the pull_request event withholds. Redirect it: --fork-workflow > "
+                          ".github/workflows/shard-fork.yml")
     pre.add_argument("--witness-entry", default="",
                      help="the repo-relative entry point your workflow declares, if it is not at a "
                           "conventional path. Preflight checks whether it exists and is runnable, "
