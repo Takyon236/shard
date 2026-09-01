@@ -104,7 +104,8 @@ def _optional_probe(module: str):
 from shard.clidiff import _cmd_diff
 from shard.cliprint import _print_preflight
 from shard.target import (cargo_fuzz_targets, demonstrability, entry_template, estimate_diff_cost,
-                          free_tier_verdict, probe_runtimes, profile_repo, validate_workdir)
+                          fork_workflow_template, free_tier_verdict, probe_runtimes, profile_repo,
+                          validate_workdir)
 
 # THE GATE — the contract with CI, which is not the CLI's to own. `shard/gate.py` holds the exit codes,
 # the `fail-on` vocabulary and the two rules that decide a build, so that `action.py` can read what a 1
@@ -183,6 +184,14 @@ def _cmd_preflight(args) -> int:
     # soundness argument a generated file would quietly spend.
     if args.entry_template:
         print(entry_template(profile.primary_language), end="")
+        return EXIT_OK
+
+    # THE SECOND SKELETON, same contract as the one above: printed rather than written, so the
+    # file is committed by the customer and reviewed like any other workflow change. Returned
+    # before the payload for the same redirectability reason — `--fork-workflow >
+    # .github/workflows/shard-fork.yml` must produce YAML and nothing else.
+    if args.fork_workflow:
+        print(fork_workflow_template(), end="")
         return EXIT_OK
 
     payload = {

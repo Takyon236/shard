@@ -12,6 +12,27 @@ local rule that is stricter than semver and exists because of what this product 
 > gates is not a patch. A customer who pinned `v1` and merged on a Friday is entitled to the same
 > answer on Monday.
 
+## [Unreleased]
+
+### Added
+
+- **`preflight --fork-workflow`: the fork-PR workflow emitted, not transcribed.** Reviewing a
+  fork's pull request needs a `workflow_run` workflow, because GitHub withholds secrets from
+  the `pull_request` event a fork triggers — the recipe has always been in the README, and it
+  was a file a customer copied by hand. Three lines in that copy are load-bearing and a
+  copy-paste error in any of the three produces a GREEN CHECK THAT REVIEWED NOTHING rather
+  than an error: without `repository:`/`ref:` the run reviews your own code at the base
+  branch; without `fetch-depth: 0` there is nothing to diff against; without `slug:` the
+  report and the alerts name YOUR repository for a review of somebody else's code.
+
+  The flag prints a ready-to-commit `.github/workflows/shard-fork.yml` — printed rather than
+  written, the same contract as `--entry-template`, so committing the file stays the
+  customer's act. A test pins the load-bearing lines in BOTH the emitted file and the README,
+  which is the property a transcription never had: the skeleton cannot drift from the
+  documentation it replaces. The one line the product cannot know — the name of the
+  fork-triggered build to wait for — carries its own CHANGE-ME comment rather than a guessed
+  default kept silently wrong.
+
 ## [2.3.0] — 2026-08-31
 
 ### Added
