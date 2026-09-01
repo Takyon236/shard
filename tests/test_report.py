@@ -167,3 +167,75 @@ def test_reproduced_findings_are_ranked_above_hypotheses():
     ordered = rank([_finding(gate_eligible=False, title="guess"),
                     _finding(gate_eligible=True, title="proven")])
     assert ordered[0].title == "proven"
+
+
+# --- a location's provenance is stated, in every channel -------------------------------------------
+
+
+def _located(gate_eligible=True, **kwargs):
+    from shard.report import Finding
+    return Finding(rule_id="shard/simple", title="t", message="m", gate_eligible=gate_eligible,
+                   location="src/app.py", line=17, **kwargs)
+
+
+def test_a_claimed_location_is_qualified_in_the_sarif_message():
+    """The finding's own `path:line`, unmeasured and not harness-anchored, is what a reviewer's
+    cursor lands on in the Security tab — and until this was pinned it shipped bare, identical to a
+    line a traceback produced. The clause says what it is: a claim, not a measurement."""
+    from shard.report import CLAIMED_CLAUSE, _sarif_message
+    assert CLAIMED_CLAUSE in _sarif_message(_located())                          # claimed
+    assert CLAIMED_CLAUSE not in _sarif_message(_located(location_measured=True))  # measured
+
+
+def test_a_claimed_location_is_qualified_at_both_severities():
+    """A hypothesis is the common claimed-location case, but a DEMONSTRATED finding whose output
+    names no file lands there too — at `error` level, which is the worst place an unqualified
+    guess can sit. Both severities carry the clause."""
+    from shard.report import CLAIMED_CLAUSE, _sarif_message
+    for eligible in (True, False):
+        assert CLAIMED_CLAUSE in _sarif_message(_located(gate_eligible=eligible)), eligible
+
+
+def test_the_harness_clause_and_the_claimed_clause_never_mix():
+    """Two different anchors, two different clauses. A harness-anchored finding keeps the entry-point
+    clause alone; a claimed location gets the claimed clause alone. Mixing them would say the alert
+    is anchored on an entry point it is not anchored on."""
+    from shard.report import (ANCHOR_CLAUSE, CLAIMED_CLAUSE, _sarif_message)
+    harness = _sarif_message(_located(location_is_harness=True))
+    assert ANCHOR_CLAUSE in harness and CLAIMED_CLAUSE not in harness
+    claimed = _sarif_message(_located())
+    assert CLAIMED_CLAUSE in claimed and ANCHOR_CLAUSE not in claimed
+
+
+def test_the_markdown_location_row_states_the_same_provenance():
+    """Both channels, one fact. The SARIF says it in a clause; the report says it on the Location
+    row — positively for a measured line (the strongest location fact there is, previously stated
+    only on disagreement), as a claim for a claimed one."""
+    md = build_markdown([_located(location_measured=True)], status="done")
+    assert "read from the demonstration's own output" in md
+    md = build_markdown([_located()], status="done")
+    assert "no execution resolved this line" in md
+
+
+def test_the_result_document_names_a_claimed_location_as_a_limit():
+    """The third channel. `shard-result.json` is what a dashboard slices, and a consumer needs the
+    same caveat the alert message now carries — without it the document that looks most precise is
+    the one overstating a guess."""
+    from shard.resultdoc import limits
+    codes = [row["code"] for row in limits([_located()], status="done")]
+    assert "location_from_claim" in codes
+    for clean in (_located(location_measured=True), _located(location_is_harness=True)):
+        assert "location_from_claim" not in [
+            row["code"] for row in limits([clean], status="done")]
+
+
+def test_a_finding_with_no_location_claims_nothing():
+    """The non-vacuity arm. An empty location makes no claim to qualify, and a run whose findings
+    are all location-free must not grow a limit that says one of them guessed."""
+    from shard.report import Finding
+    from shard.resultdoc import limits
+    bare = Finding(rule_id="shard/simple", title="t", message="m", gate_eligible=True,
+                   location="", line=1)
+    from shard.report import CLAIMED_CLAUSE, _sarif_message
+    assert CLAIMED_CLAUSE not in _sarif_message(bare)
+    assert "location_from_claim" not in [row["code"] for row in limits([bare], status="done")]

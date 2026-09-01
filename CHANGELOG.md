@@ -16,6 +16,20 @@ local rule that is stricter than semver and exists because of what this product 
 
 ### Added
 
+- **A claimed location now says it is one, in every channel.** A finding's location has one of
+  three provenances: MEASURED (the demonstration's own output named the line, via
+  `witness.observed_location`), HARNESS (deep mode's entry-point anchor, which carries the
+  existing `ANCHOR_CLAUSE`), or CLAIMED — the line the agent's report pointed at. The third is
+  the common case for hypotheses and the reachable case for a demonstrated finding whose output
+  names no file, and until now it shipped bare: the claimed `path:line` anchored the code-scanning
+  alert, at `error` level for the demonstrated case, identical to a line a traceback produced,
+  with nothing in any artefact saying it was a guess. The SARIF result message now carries
+  `CLAIMED_CLAUSE`, the markdown's Location row states the provenance both ways (positively for
+  a measured line, which was previously stated only when claim and observation disagreed), and
+  `shard-result.json` gains a `location_from_claim` limit beside `location_is_entry_point` —
+  three channels, one fact, no drift. No gate, level or fingerprint changes: a claimed line
+  already could not gate `fail-on: new`; now it cannot masquerade as a measurement either.
+
 - **`preflight --fork-workflow`: the fork-PR workflow emitted, not transcribed.** Reviewing a
   fork's pull request needs a `workflow_run` workflow, because GitHub withholds secrets from
   the `pull_request` event a fork triggers — the recipe has always been in the README, and it

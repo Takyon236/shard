@@ -37,6 +37,15 @@ positive in the most damaging possible place, and the whole product rests on fin
 the design notes records what would close it: carry `_top_frames`' output on `Verdict` and thread it
 out of the solve. That is a change to the oracle and belongs in a commit that measures it.
 
+**Simple mode already closes it for the findings it can: `witness.observed_location` reads the
+demonstration's own output and anchors the alert on the line a traceback or sanitiser frame NAMED,
+marked `location_measured`.** For the findings it cannot — a hypothesis, where nothing executed, or a
+demonstration whose output names no file — the location is the line the agent's report CLAIMED, and a
+claimed line is a guess wearing the same `path:line` a measurement wears. The provenance is stated
+rather than hidden: `CLAIMED_CLAUSE` in the SARIF result message, the qualifier on the markdown's
+Location row, and a `location_from_claim` limit in the result document. Three channels, one fact —
+the rule this module's own header has been fixed for repeatedly.
+
 ## Ranking and capping
 
 Code scanning rejects uploads exceeding its alert and thread-flow limits, so findings are ranked and
@@ -136,6 +145,22 @@ ANCHOR_DISCLAIMER = (
 #: The same claim in one clause, for the per-result message. GitHub's alert LIST renders the message and
 #: nothing else, and that list is where somebody decides which file is at fault.
 ANCHOR_CLAUSE = "filed against the entry point that reproduces it, not the line at fault"
+
+#: **THE THIRD PROVENANCE, AND UNTIL NOW THE ONE NO CHANNEL NAMED.** A location is either MEASURED
+#: (`location_measured` — `witness.observed_location` resolved it from the demonstration's own
+#: output), HARNESS (`location_is_harness` — deep mode's entry-point anchor, which carries
+#: `ANCHOR_CLAUSE`), or it is the line the AGENT'S REPORT CLAIMED — and a claimed line is a guess
+#: about where the defect sits, shipped as the alert's `file:line` in the Security tab with nothing
+#: to say it is one. A hypothesis is the common case (`observed_location` runs only on a
+#: demonstrated witness), but a demonstrated finding with no frames in its output — a marker on
+#: output that names no file — lands here too, at `error` level, which is the worst place an
+#: unqualified guess can sit.
+#:
+#: Same shape as `ANCHOR_CLAUSE` for the same reason: the alert LIST shows the message and nothing
+#: else, and that list is where somebody decides which file to open. Per-RESULT rather than
+#: per-rule, because provenance is a property of the one finding — `location_is_harness` is per-mode
+#: and can lean on the rule field, and this cannot.
+CLAIMED_CLAUSE = "location from the report's own claim, not read from any execution"
 
 # --- THE REPORT NUMBER ------------------------------------------------------------------------------
 
@@ -575,6 +600,18 @@ def _sarif_message(f: Finding) -> str:
         # alert LIST shows the message and nothing else, and that list is where somebody decides which
         # file is at fault. Short enough not to push the observed output out of view.
         text += f" ({ANCHOR_CLAUSE})"
+    elif f.location and not f.location_measured:
+        # THE CLAIMED LINE, QUALIFIED — and until this elif it shipped bare. A finding whose
+        # demonstration resolved no location keeps the agent's claimed `path:line` as the alert's
+        # anchor, which is the file a reviewer's cursor lands on, and nothing in the message said
+        # the line was a claim. The harness branch above says why it is not the fault line; this
+        # one says why it is not a measurement. Both are one clause for the same reason: the alert
+        # list renders the message and nothing else.
+        #
+        # GUARDED ON A NON-EMPTY LOCATION, exactly as `resultdoc.limits` guards it: a finding with
+        # no location makes no claim to qualify, and a clause about a location that does not exist
+        # is noise a reader learns to skip.
+        text += f" ({CLAIMED_CLAUSE})"
     return text
 
 
@@ -1317,8 +1354,23 @@ def _finding_block(f: Finding, *, reproduced: bool) -> list[str]:
     # records whether it was READ from an execution, and that distinction gates `fail-on: new` rather
     # than being re-argued here.
     if f.location:
-        out += [f"Location: {_inline_code(f'{prompt_safe(f.location, limit=200)}:{max(1, f.line)}')}",
-                ""]
+        where = _inline_code(f'{prompt_safe(f.location, limit=200)}:{max(1, f.line)}')
+        # **AND THE PROVENANCE IS PART OF THE LOCATION, not a footnote under it.** A `path:line`
+        # that a traceback produced and a `path:line` the model pointed at are different facts, and
+        # until 2026-09-01 this row printed both identically — while the SARIF carried `ANCHOR_CLAUSE`
+        # for the harness case and NOTHING for the claimed case, so the channel with less room was
+        # the one saying more. The measured case is stated positively rather than left silent: it is
+        # the strongest location fact there is, and `simple._to_finding` says it only on
+        # DISAGREEMENT, so the ordinary case — claim and observation agree — carried no provenance
+        # anywhere. The harness case stays bare: the blockquote above the findings already carries
+        # `ANCHOR_DISCLAIMER`, and a second spelling of it here is the drift this file keeps fixing.
+        if f.location_measured:
+            out += [f"Location: {where} — read from the demonstration's own output.", ""]
+        elif not f.location_is_harness:
+            out += [f"Location: {where} — the report's own claim; no execution resolved this line.",
+                    ""]
+        else:
+            out += [f"Location: {where}", ""]
     if reproduced:
         out.append(f"Reproduced **{f.crash_count}/{f.replays}** replays.")
     else:

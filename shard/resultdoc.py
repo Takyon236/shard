@@ -113,6 +113,9 @@ LIMIT_STATEMENTS: dict[str, str] = {
     "location_is_entry_point":
         "alerts are anchored on the entry point that reproduces them, not on the line at fault. "
         "Shard resolves a reproduction, not a source location, and does not guess a line",
+    "location_from_claim":
+        "at least one alert is anchored on the line the finding's report named, which no execution "
+        "read. That location is a claim, not a measurement — open it as a lead, not a verdict",
     "no_coverage_statement":
         "Shard reports what it found. It does not report what it covered, so a result with no "
         "findings is not a statement that the attack surface was examined",
@@ -333,6 +336,12 @@ def limits(findings, *, status: str, run=None, gate_reasons=(), scope_reasons=()
         codes.append("witness_refused")
     if any(f.location_is_harness for f in findings):
         codes.append("location_is_entry_point")
+    # THE COMPLEMENT of the row above, and until 2026-09-01 the harness anchor was the only one the
+    # limits named. A finding whose location is neither harness nor `location_measured` is anchored
+    # on the agent's own claim, and a consumer slicing this document needs the same caveat the
+    # SARIF message now carries — one fact, three channels, no drift.
+    if any(f.location and not f.location_is_harness and not f.location_measured for f in findings):
+        codes.append("location_from_claim")
     refused = getattr(run, "exec_refused", None)
     if refused:
         codes.append("executions_refused")
