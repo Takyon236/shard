@@ -105,6 +105,51 @@ def test_a_repository_that_does_not_exist_is_refused(tmp_path, capsys):
     assert capsys.readouterr()
 
 
+# --- preflight --check-entry ------------------------------------------------------------------------
+
+
+def test_check_entry_validates_a_conventional_entry_point_end_to_end(tmp_path, capsys):
+    """`--check-entry` driven the way a workflow drives it: the entry point found by convention,
+    executed on an empty payload, the answer in the machine-readable payload. The repository
+    declares no benign controls, so the check passes with the measured-risk advisory rather than
+    a failure — the check must not be stricter than the adjudicator it predicts."""
+    repo = _repo(tmp_path / "repo")
+    shard = repo / ".shard"
+    shard.mkdir()
+    (shard / "entry.sh").write_text(
+        '#!/bin/sh\n[ ! -s "$1" ] && exit 0\ncat "$1" >/dev/null\nexit 0\n', encoding="utf-8")
+    rc = main(["preflight", "--repo", str(repo), "--check-entry", "--json"])
+    assert rc == 0, capsys.readouterr().out
+    payload = json.loads(capsys.readouterr().out)
+    check = payload["check_entry"]
+    assert check["ran"] is True and check["ok"] is True, check["problems"]
+    assert any(a["id"] == "no_benign_controls" for a in check["advisories"])
+
+
+def test_check_entry_names_the_broken_baseline_in_the_human_rendering(tmp_path, capsys):
+    """The terminal rendering, not only the JSON: the failure row a customer reads before deciding
+    to spend anything, beside the `can gate` line it elaborates."""
+    repo = _repo(tmp_path / "repo")
+    shard = repo / ".shard"
+    shard.mkdir()
+    (shard / "entry.sh").write_text('#!/bin/sh\necho "usage: entry.sh <file>" >&2\nexit 1\n',
+                                    encoding="utf-8")
+    rc = main(["preflight", "--repo", str(repo), "--check-entry"])
+    assert rc == 0, "a failed check is a report, not a gate — preflight stays report-only"
+    out = capsys.readouterr().out
+    assert "entry check  FAIL" in out
+    assert "must be silent and exit 0" in out
+
+
+def test_check_entry_without_an_entry_point_says_so(tmp_path, capsys):
+    """A repository with nothing to check gets the sentence, not a crash — and the exit code
+    stays 0, because preflight's contract is `0 = the run completed`."""
+    repo = _repo(tmp_path / "repo")
+    rc = main(["preflight", "--repo", str(repo), "--check-entry"])
+    assert rc == 0
+    assert "NOT RUN" in capsys.readouterr().out
+
+
 # --- the ceilings bind ------------------------------------------------------------------------------
 
 

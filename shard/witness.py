@@ -1326,7 +1326,7 @@ def _controlled_verdict(spec: WitnessSpec, repo, *, runner, timeout: int, argv: 
         # ANY control reproducing the observation refutes it. More controls can only ever refuse more,
         # which is the direction a gate must fail in.
         try:
-            controls, dropped = _stage_controls(input_path, repo, spec)
+            controls, dropped = _stage_controls(input_path, repo, spec.entry)
         except OSError as e:
             # A control the customer DECLARED and we could not stage is a refusal, not a quiet fallback
             # to the weaker one. Silently grading against fewer controls than the repository asked for
@@ -1488,8 +1488,198 @@ def _base_control(spec: WitnessSpec, base_repo, *, runner, timeout, workdir) -> 
     return None if result is None else result[0]
 
 
+def _check_finding(id: str, what: str, consequence: str, fix: str = "") -> dict:
+    """One row of a `check_entry` answer: what was observed, what it costs a real run, how to fix it.
+
+    `consequence` names what ADJUDICATION would do later, never a generic warning — the row exists
+    so a customer can decide whether to spend the run, and "might be a problem" is not decidable.
+    """
+    return {"id": id, "what": what, "consequence": consequence, "fix": fix}
+
+
+def check_entry(repo, entry: str, *, runner=subprocess.run,
+                timeout: int = DEFAULT_TIMEOUT) -> dict:
+    """Validate the customer's entry point BY EXECUTING IT, before the inference is paid for.
+
+    **`demonstrability` ANSWERS WHETHER ONE EXISTS; THIS ANSWERS WHETHER IT CAN EVER PRODUCE A
+    VERDICT.** The gap between the two is the one this product's own documentation sends the
+    customer to discover by hand — the README's quickstart says *"bash .shard/entry.sh /dev/null
+    must be SILENT and exit 0 before you go further"* — and every failure mode that sentence
+    gestures at is one `adjudicate` refuses on LATER, after a review has been paid for:
+
+    * a baseline that exits non-zero breaks `attribute`'s liveness probe, so under `--fail-on new`
+      every finding is UNATTRIBUTED (`_base_control` refuses to trust a non-reproduction at base
+      when the entry point does not exit 0 on its control);
+    * a baseline that dies on a fatal signal refuses every `fatal_signal` claim
+      (`_baseline_contradicts`: the payload cannot have caused what nothing causes);
+    * a runtime the image does not carry is a REFUSAL on every proposal (`_nothing_adjudicated`),
+      which reads in the report as though the code were clean.
+
+    The checks are the adjudicator's own, run through the adjudicator's own plumbing — the same
+    argv shape, the same staging outside the checkout, the same `entry_env` scrubbing, the same
+    `redact_secrets` on everything captured — so this can never report a verdict adjudication
+    would disagree with. It stages with `_stage_controls` and executes with `_run` for that
+    reason: a second spelling of either would be a second adjudicator, and the two would drift.
+
+    Never raises, and never demonstrates anything: it decides nothing about any finding, only
+    about the configuration a run would be asked to grade with. `problems` are the failures a
+    paid run would hit; `advisories` are facts worth knowing that refuse nothing on their own
+    (a non-silent baseline, a missing benign control — the 4-of-4 false-gate measurement in
+    `benign_controls`' docstring is the citation for the second).
+    """
+    resolved = resolve_entry(repo, entry)
+    if resolved is None:
+        return {"entry": entry or "", "ran": False, "ok": False, "baseline": None,
+                "controls": [], "controls_dropped": 0,
+                "problems": [_check_finding(
+                    "no_entry",
+                    f"nothing to check — no runnable entry point at {(entry or '(none declared)')!r}",
+                    "every finding a run reports here stays informational; see the 'can gate' line",
+                    "start from: shard preflight --repo . --entry-template > .shard/entry.sh")],
+                "advisories": []}
+
+    # STAGED OUTSIDE THE CHECKOUT, exactly as `adjudicate` stages the payload: the repository under
+    # review is the one place neither attacker-shaped bytes nor our scratch files may land, and a
+    # check that dirtied the tree it was validating would be a new way to fail a customer's build.
+    scratch = pathlib.Path(tempfile.mkdtemp(prefix="shard-check-entry-"))
+    input_path = scratch / "shard_witness_input"
+    try:
+        input_path.write_bytes(b"")
+        controls, dropped = _stage_controls(input_path, repo, entry)
+    except OSError as e:
+        return {"entry": entry, "ran": False, "ok": False, "baseline": None,
+                "controls": [], "controls_dropped": 0,
+                "problems": [_check_finding(
+                    "control_unreadable",
+                    f"the benign control declared at {entry}{BENIGN_SUFFIX} could not be staged ({e})",
+                    "adjudication REFUSES rather than grading against fewer controls than the "
+                    "repository declared")],
+                "advisories": []}
+
+    problems: list[dict] = []
+    advisories: list[dict] = []
+    argv = [*isolation_prefix(), "bash", "--", str(resolved), str(input_path)]
+
+    def _row(label: str, run: tuple[int, str] | None) -> dict:
+        return {"input": label, "finished": run is not None,
+                "exit": None if run is None else run[0],
+                "output": "" if run is None else run[1][:MAX_EVIDENCE_CHARS]}
+
+    # THE BASELINE FIRST, in refusal-precedence order: a missing runtime names the FIRST thing
+    # wrong and skips the controls, which would fail on the same missing interpreter and tell the
+    # customer nothing new.
+    baseline = _run(runner, argv, repo, timeout)
+    baseline_row = _row("an empty payload", baseline)
+    skip_controls = False
+    if baseline is None:
+        problems.append(_check_finding(
+            "baseline_unfinished",
+            f"the empty-input baseline did not finish within {timeout}s, or could not be executed",
+            "a control run that cannot be completed is a REFUSAL, so nothing could demonstrate",
+            "an empty payload must exit quickly — check for a hang or a read from stdin"))
+    else:
+        code = _normalise(baseline[0])
+        output = baseline[1]
+        if missing := _missing_runtime(baseline[0], output):
+            problems.append(_check_finding(
+                "missing_runtime",
+                f"the entry point could not run: {missing}",
+                "every witness proposal is REFUSED, so a run would report nothing gate-eligible "
+                "while nothing was adjudicated — NOT a clean result",
+                "run an entry point whose runtime this image carries, or build in an earlier "
+                "workflow step and run the artefact"))
+            skip_controls = True
+        elif code in TIMEOUT_KILL_CODES:
+            problems.append(_check_finding(
+                "baseline_unfinished",
+                f"the empty-input baseline was killed (rc={code}) rather than finishing",
+                "a kill is not a demonstration and not a clean result; adjudication refuses on it"))
+        elif code in FATAL_SIGNAL_CODES:
+            problems.append(_check_finding(
+                "baseline_fatal_signal",
+                f"the entry point died on a fatal signal (rc={code}) on an EMPTY payload",
+                "every fatal_signal claim is refused — the baseline reproduces the observation, "
+                "so the payload cannot be what caused it",
+                "the empty-input branch must exit 0; keep the `[ ! -s \"$PAYLOAD\" ]` guard from "
+                "the template"))
+        elif code != 0:
+            problems.append(_check_finding(
+                "baseline_nonzero",
+                f"the entry point exited {code} on an EMPTY payload — it must be silent and exit 0",
+                "under fail-on: new, attribution treats a non-zero control run as 'could not run', "
+                "so every finding is UNATTRIBUTED and none can gate as new",
+                "the empty-input branch must exit 0; keep the `[ ! -s \"$PAYLOAD\" ]` guard from "
+                "the template"))
+        if output.strip() and not skip_controls:
+            first = output.strip().splitlines()[0]
+            advisories.append(_check_finding(
+                "baseline_not_silent",
+                f"the empty-input baseline printed {len(output)} chars (first line: {first!r})",
+                "a marker that appears in this output cannot demonstrate — the baseline reproduces "
+                "it — but ordinary output here refuses only the markers contained in it",
+                "print nothing on empty input; the template's guard branch is the ordinary fix"))
+
+    # THE CONTROLS THE CUSTOMER DECLARED, named by the path in THEIR repository — the sentence is
+    # read by someone deciding which of their own fixtures to go and look at.
+    control_rows: list[dict] = []
+    benign, _dropped = benign_controls(repo, entry)
+    for source, (_what, staged) in zip(benign, controls[1:]):
+        rel = source.relative_to(pathlib.Path(repo).resolve())
+        if skip_controls:
+            # NOT RUN, and the row must not read as a timeout: the missing-runtime problem above is
+            # the first thing wrong, and a JSON consumer needs to tell "never executed" apart from
+            # "executed and did not finish".
+            control_rows.append({"input": str(rel), "finished": False, "exit": None,
+                                 "output": "", "skipped": True})
+            continue
+        run = _run(runner, argv[:-1] + [str(staged)], repo, timeout)
+        control_rows.append(_row(str(rel), run))
+        if run is None:
+            problems.append(_check_finding(
+                "control_unfinished",
+                f"the benign input {rel} did not finish within {timeout}s, or could not be "
+                f"executed",
+                "a control run that cannot be completed is a REFUSAL, so nothing could "
+                "demonstrate"))
+            continue
+        code = _normalise(run[0])
+        fatal = code in FATAL_SIGNAL_CODES or code in TIMEOUT_KILL_CODES
+        if fatal or code != 0:
+            how = (f"died on rc={code}, not an ordinary exit" if fatal
+                   else f"exited {code}")
+            problems.append(_check_finding(
+                "control_nonzero",
+                f"the benign input {rel} {how} — the program rejects the input meant to be its "
+                f"ORDINARY one",
+                "under fail-on: new the first benign control is the base-revision liveness probe, "
+                "so a non-zero exit there makes every finding UNATTRIBUTED; and a control the "
+                "program rejects exercises no branch, which is the 4-of-4 false-gate shape the "
+                "controls exist to close",
+                "one benign input per branch the entry point takes, each one the program ACCEPTS"))
+
+    if not benign and not skip_controls:
+        advisories.append(_check_finding(
+            "no_benign_controls",
+            f"no benign controls are declared at {entry}{BENIGN_SUFFIX}",
+            "the only control is an EMPTY input, which takes a different branch through almost any "
+            "program — measured on a five-class Java target, four fixtures containing no attack at "
+            "all produced gate-eligible findings without them, and a run made without one says so "
+            "in the finding itself",
+            f"add {entry}{BENIGN_SUFFIX}/ with one ordinary input per branch the entry point takes"))
+    if dropped:
+        advisories.append(_check_finding(
+            "controls_capped",
+            f"{dropped} benign control(s) beyond the first {MAX_BENIGN_CONTROLS} were not checked",
+            f"adjudication runs at most {MAX_BENIGN_CONTROLS} too, so this check and a real run "
+            f"refuse on the same set"))
+
+    return {"entry": entry, "ran": True, "ok": not problems, "baseline": baseline_row,
+            "controls": control_rows, "controls_dropped": dropped,
+            "problems": problems, "advisories": advisories}
+
+
 def _stage_controls(input_path: pathlib.Path, repo,
-                    spec: WitnessSpec) -> tuple[list[tuple[str, pathlib.Path]], int]:
+                    entry: str) -> tuple[list[tuple[str, pathlib.Path]], int]:
     """The inputs the observation must be ABSENT on, in the order they are run. Raises OSError.
 
     Every one is staged BESIDE the payload rather than read from the checkout, so all executions take an
@@ -1501,7 +1691,7 @@ def _stage_controls(input_path: pathlib.Path, repo,
     than N.
     """
     controls = [("an empty payload", _stage_baseline(input_path))]
-    benign, dropped = benign_controls(repo, spec.entry)
+    benign, dropped = benign_controls(repo, entry)
     root = pathlib.Path(repo).resolve()
     for i, source in enumerate(benign):
         staged = input_path.with_name(f"{input_path.name}{BENIGN_SUFFIX}{i}")
@@ -1861,7 +2051,8 @@ __all__ = [
     "NETWORK_ISOLATION",
     "TIMEOUT_KILL_CODES", "TRACEBACK_TOKENS", "UNATTRIBUTED", "UNHANDLED_EXCEPTION",
     "UNMEASURED_EXPECTATIONS", "Witness", "WitnessSpec", "adjudicate", "attribute", "benign_controls",
-    "entry_digest", "entry_env", "isolation_prefix", "observed_location", "offered_expectations",
+    "check_entry", "entry_digest", "entry_env", "isolation_prefix", "observed_location",
+    "offered_expectations",
     "payload_readings", "redact_secrets", "reset_isolation_cache", "resolve_entry",
     "secret_values",
     "self_defeating_marker", "witness_contract",

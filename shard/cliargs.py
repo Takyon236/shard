@@ -166,6 +166,19 @@ def _preflight_parser(sub, handler) -> None:
     pre.add_argument("--probe-endpoint", action="store_true",
                      help="spend one request confirming the endpoint supports native tool calling. "
                           "Without it a scan on an incapable endpoint finds nothing and looks clean.")
+    # THE OTHER OPT-IN CHECK, and it costs EXECUTIONS rather than inference. §6c's sentence —
+    # "preflight refuses rather than producing a bad run" — applies to the entry point as much as
+    # to the endpoint: every failure mode this reports is one the ADJUDICATOR refuses on after a
+    # review has been paid for, and the README's own quickstart sends the customer to check the
+    # first one by hand. A flag rather than a default for the same reason `--probe-endpoint` is
+    # one: preflight is otherwise free and side-effect-free, and a profiling command that quietly
+    # executes the repository's scripts is worse than one that has to be asked.
+    pre.add_argument("--check-entry", action="store_true",
+                     help="EXECUTE the entry point (declared with --witness-entry, or found by "
+                          "convention) on an empty payload and on every benign control it "
+                          "declares, and report what adjudication would refuse on later — a "
+                          "baseline that is not silent, a runtime this image does not carry, a "
+                          "benign input the program rejects. Costs executions, not inference")
     _endpoint_args(pre)
     pre.add_argument("--json", action="store_true")
     pre.set_defaults(handler=handler)

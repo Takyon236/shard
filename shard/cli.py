@@ -231,6 +231,16 @@ def _cmd_preflight(args) -> int:
 
         payload["endpoint"] = probe_endpoint(_backend(args), model=args.model,
                                              validated_model=DEFAULT_MODEL)
+    if args.check_entry:
+        # THE SAME REFUSAL-RATHER-THAN-A-BAD-RUN RULE FOR THE ENTRY POINT, and it costs executions
+        # rather than inference. `demonstrability` (already in the payload) resolved WHICH entry
+        # point — declared, conventional, or none; `check_entry` then answers whether it can ever
+        # produce a verdict, using the adjudicator's own plumbing so the two cannot disagree. An
+        # empty path (nothing declared, nothing conventional) is `check_entry`'s own first answer,
+        # which is why there is no branch here.
+        from shard.witness import check_entry
+
+        payload["check_entry"] = check_entry(repo, payload["demonstrable"]["entry"])
     if args.workdir is not None:
         payload["workdir"] = _report_payload(validate_workdir(args.workdir))
 

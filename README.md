@@ -51,6 +51,20 @@ shard preflight --repo . --entry-template > .shard/entry.sh
 bash .shard/entry.sh /dev/null        # must be SILENT and exit 0 before you go further
 ```
 
+**Then let the product check it for you** — the line above, plus your benign controls, run by the
+adjudicator's own plumbing and with the failure named as the refusal a paid run would deliver
+later:
+
+```bash
+shard preflight --repo . --check-entry
+```
+
+It executes the entry point on an empty payload and on every benign input in
+`.shard/entry.sh.benign/`, and reports: a baseline that is not silent or does not exit 0 (which
+breaks `fail-on: new` attribution), a runtime this image does not carry (which refuses every
+witness proposal), and a benign input the program rejects (which is no control for the branch it
+was meant to exercise). Costs executions, not inference.
+
 **Then see a finished one working**, with a real defect and real benign controls, in
 [`examples/`](examples/) — five small projects that need no key either. Back in the Shard checkout:
 
@@ -112,7 +126,9 @@ Java target: **four fixtures containing no attack at all produced gate-eligible 
 With four benign inputs declared, all four were refused and every honest finding survived.
 
 A run made without a benign control says so in the finding itself, so this is a limit you can see
-rather than one you have to already know about.
+rather than one you have to already know about. `shard preflight --repo . --check-entry` runs the
+empty-input baseline and every declared benign control for you and names any of these failures
+before you pay for a run.
 
 ### What one actually looks like
 
@@ -477,7 +493,7 @@ Every row is a behaviour of this build, with the symptom you actually see.
 | `exit 2` and a line about an API key | the key's environment variable is unset. A configuration error, deliberately not reported as a finding | set the variable named by `api_key_env` — the default is `OPENROUTER_API_KEY`. Pass the secret through `env:`, never through `with:` |
 | a green check, and "no changed files in scope" | `actions/checkout` defaults to `fetch-depth: 1`, so there is no base commit to diff against. **A green check that reviewed nothing** | `fetch-depth: 0` in the checkout step |
 | findings appear, but `gate-eligible` is 0 and nothing fails | no entry point, so nothing could be demonstrated. Working as designed — a hypothesis never gates | declare `witness_entry`. Start with `shard preflight --entry-template` |
-| an entry point exists, and findings still cannot gate | the entry point prints its marker, or dies, on empty input — so the baseline reproduces it | `bash .shard/entry.sh /dev/null` must be silent and exit 0 |
+| an entry point exists, and findings still cannot gate | the entry point prints its marker, or dies, on empty input — so the baseline reproduces it | `bash .shard/entry.sh /dev/null` must be silent and exit 0 — or run `shard preflight --repo . --check-entry`, which checks that and every benign control |
 | a defect you know is real is refused | a benign control reproduced it, so the observation was not attributable to the input | correct: it is the adjudicator working. Narrow the marker to something only the defect produces |
 | the run finds nothing and looks clean | the endpoint may not support native tool calling, which this product requires | `shard preflight --probe-endpoint` — one request, and it refuses a bad endpoint rather than producing a bad run |
 | `deep mode is not present in this build` | deep mode is a separate, commercially licensed image | use `mode: diff`, `survey` or `preflight` |

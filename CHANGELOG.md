@@ -12,6 +12,30 @@ local rule that is stricter than semver and exists because of what this product 
 > gates is not a patch. A customer who pinned `v1` and merged on a Friday is entitled to the same
 > answer on Monday.
 
+## [Unreleased]
+
+### Added
+
+- **`preflight --check-entry`: the entry point validated by EXECUTION, before the inference is
+  paid for.** `preflight` could already say an entry point exists and what a run costs; it could
+  not say whether the entry point can ever produce a verdict, and every way it cannot is a
+  refusal the adjudicator delivers after the review has been paid for. The README's own
+  quickstart sent the customer to check the first failure mode by hand. The new flag executes
+  the declared (or conventional) entry point on an empty payload and on every benign control it
+  declares, and reports each failure as the refusal a real run would produce: a baseline that
+  exits non-zero (which makes every `fail-on: new` finding UNATTRIBUTED), a baseline that dies
+  on a signal (which refuses every `fatal_signal` claim), a runtime the image does not carry
+  (a refusal on every proposal), and a benign input the program rejects (no control for the
+  branch it was meant to exercise, and the `fail-on: new` liveness probe besides).
+
+  The check runs through the adjudicator's own staging, argv shape, environment scrubbing and
+  output redaction, so it cannot report a verdict adjudication would disagree with — it is a
+  prediction made by the mechanism it predicts. Problems fail the check; advisories do not: a
+  non-silent baseline refuses only the markers contained in its output, and a missing benign
+  control is the documented 4-of-4 false-gate risk rather than a certainty, and reporting either
+  as a failure would make the check stricter than the adjudicator. The exit code is unchanged —
+  preflight is report-only, `0` means the check ran.
+
 ## [2.3.0] — 2026-08-31
 
 ### Added

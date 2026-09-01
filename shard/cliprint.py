@@ -137,6 +137,31 @@ def _print_price(payload: dict) -> None:
         print(f"             needs {need}")
 
 
+def _print_entry_check(payload: dict) -> None:
+    """What `--check-entry` found, beside the `can gate` line it elaborates. Present only when the
+    customer asked for the check, which is why the caller guards on the key rather than this
+    function handling its absence — a section that printed an empty state would teach readers to
+    skip it."""
+    check = payload["check_entry"]
+    controls = check["controls"]
+    if not check["ran"]:
+        print(f"entry check  NOT RUN — {check['problems'][0]['what']}")
+    elif check["ok"]:
+        tail = (f" and {len(controls)} benign control{'s' if len(controls) != 1 else ''} "
+                f"ran clean" if controls else "")
+        print(f"entry check  PASS — the empty-input baseline is quiet and exits 0{tail}")
+    else:
+        print("entry check  FAIL — a paid run would refuse findings for the reasons below")
+    for p in check["problems"]:
+        print(f"             {p['what']}")
+        print(f"             -> {p['consequence']}")
+        if p["fix"]:
+            print(f"             fix: {p['fix']}")
+    for a in check["advisories"]:
+        print(f"             advisory: {a['what']}")
+        print(f"             -> {a['consequence']}")
+
+
 def _print_preflight(payload: dict, profile) -> None:
     """The whole preflight answer, in the order a reader needs it.
 
@@ -156,6 +181,11 @@ def _print_preflight(payload: dict, profile) -> None:
     _print_profile(payload, profile)
     _print_capability(payload)
     _print_gateability(payload)
+    # BESIDE `can gate`, because it is the check's evidence: `can gate` says an entry point exists,
+    # this says whether executing it can ever produce a verdict. Above the money for the same
+    # reason `can gate` sits there — a broken entry point decides what the money buys.
+    if "check_entry" in payload:
+        _print_entry_check(payload)
     _print_price(payload)
     if "workdir" in payload:
         w = payload["workdir"]
