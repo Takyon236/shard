@@ -44,3 +44,8 @@ shard-run.log
 .env
 .env.*
 !.env.example
+
+# Local agent-tooling session state. It is machine-local scratch — transcripts of coding
+# sessions against this checkout — and `git add -A` has already swept one of its JSON
+# files into a commit once. Nothing in it belongs to the product.
+.opencode/
