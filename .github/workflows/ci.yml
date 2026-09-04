@@ -1,0 +1,112 @@
+# The published repository's own CI.
+#
+# Runs on every push and every pull request, including pull requests from forks.
+# Nothing here needs a secret, and that is deliberate rather than incidental: the
+# whole test suite runs with no API key and no network, so an outside
+# contributor's first pull request gets a real green check without a maintainer
+# having to approve a workflow run that could read credentials.
+#
+# `permissions: contents: read` and no secrets means a fork pull request cannot
+# reach anything. `pull_request` (not `pull_request_target`) runs the fork's code
+# against the fork's own permissions, which is the safe direction.
+#
+# EVERY ACTION IS PINNED BY COMMIT, INCLUDING GITHUB'S OWN. `contents: read` bounds the TOKEN, not
+# the process: `setup-python` runs arbitrary Node on the runner before `pytest` does, so a repointed
+# tag rewrites the checkout and this file's green tick then attests a tree that was never tested.
+# The `actions/*` namespace was exempt from the gate until 2026-09-02 on the argument that it is
+# GitHub's own; the argument is about the token and this is not. The exact version stays in a
+# trailing comment so a reader knows WHAT is pinned and a bot can propose the bump.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor is the version the action's own image ships. The ceiling
+        # catches a deprecation before a runner image upgrade does it for us.
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      # No API key, no network. If a test here needs either, it is the test that
+      # is wrong — see CONTRIBUTING.md.
+      - name: Tests
+        run: python -m pytest -q
+
+      - name: Lint
+        run: python -m ruff check shard/
+
+  image:
+    # THE ARTEFACT A USER ACTUALLY PULLS. The suite above tests the source; this
+    # builds the container the action runs, and then drives it the way GitHub
+    # does — `args: [action]`, `INPUT_*` in the environment, the workspace
+    # mounted. Every input-mapping defect this project has had lived in the gap
+    # between those two things.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Build
+        # **A CONTRIBUTOR'S PULL REQUEST MUST NOT GO RED BECAUSE A REGISTRY HAD A BAD MINUTE.**
+        # Measured on `main`, 2026-08-25: this step failed in 36 seconds with
+        # `failed to fetch oauth token: POST https://auth.docker.io/token: 500 Internal Server
+        # Error` — both base images, before a single layer was built. The identical commit had
+        # passed on a pull request thirteen seconds earlier, and a plain re-run went green.
+        #
+        # It is not a one-off to wait out, either: these are ANONYMOUS pulls, and Docker Hub rate
+        # limits those per IP while GitHub-hosted runners share addresses. So the failure mode is
+        # recurring and belongs to the network rather than to the change under test.
+        #
+        # This repository's whole invitation to contribute rests on that check meaning something.
+        # A red tick a contributor cannot explain and did not cause teaches them to ignore it,
+        # which costs more than the outage did.
+        #
+        # THREE ATTEMPTS, WIDENING GAPS, AND STILL A FAILURE AT THE END. The retry loop exits
+        # non-zero if the last attempt fails, so a genuinely broken Dockerfile fails exactly as it
+        # did before — this buys tolerance for a transient, never silence about a real defect.
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if docker build -t shard:ci .; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "::warning::docker build failed on attempt ${attempt}/3 — retrying in $((attempt * 15))s"
+              sleep $((attempt * 15))
+            fi
+          done
+          echo "::error::docker build failed three times; this is the image, not the registry"
+          exit 1
+
+      - name: Smoke-test through the real entry point
+        run: |
+          set -euo pipefail
+          mkdir -p ws && printf 'def f(x):\n    return eval(x)\n' > ws/app.py
+          docker run --rm \
+            -v "$PWD/ws:/github/workspace" -w /github/workspace \
+            -e INPUT_MODE=survey -e INPUT_OUT-DIR=/tmp/out \
+            shard:ci action

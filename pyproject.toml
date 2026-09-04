@@ -1,0 +1,82 @@
+[project]
+name = "shard"
+version = "3.0.2"
+description = "Security analysis that runs in your CI and reports a finding only when it can attach a reproducing input."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "Reyse" }]
+keywords = ["security", "sast", "ci", "static-analysis", "fuzzing", "llm"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Information Technology",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+    "Topic :: Software Development :: Quality Assurance",
+]
+
+# THE CORE IS DEPENDENCY-FREE, and this empty list is the statement rather than an omission. Shard runs
+# inside other people's build pipelines; every dependency it declares is one they inherit, one more
+# thing their supply-chain policy has to clear, and one more package that can be compromised upstream.
+# The whole product runs on the standard library.
+dependencies = []
+
+[project.optional-dependencies]
+# The test runner and the linter. Nothing here is needed to RUN Shard — only to work on it.
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[project.scripts]
+shard = "shard.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Takyon236/shard"
+Issues = "https://github.com/Takyon236/shard/issues"
+Changelog = "https://github.com/Takyon236/shard/blob/main/CHANGELOG.md"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["shard"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+# Enforce the meaningful defaults — pyflakes (F: dead code, unused imports, redefinitions, undefined
+# names), plus the pycodestyle logic/error classes (E4 imports, E7 statements incl. E741 ambiguous
+# names, E9 syntax) and pyflakes warnings (W).
+#
+# THE STYLE FAMILIES ARE DELIBERATELY OFF — not an oversight, and not a lower bar. `I`, `UP`, `B`,
+# `C4` and `SIM` flag conventions this codebase uses on purpose rather than defects: import grouping
+# that keeps a section-local import beside the block that needs it, `try/except` shapes whose except
+# arm carries the reasoning, explicit `if/else` where a ternary would hide a decision.
+#
+# Enabling them here would also make this repository's CI RED on the day it was published, over 36
+# findings in code that is working as designed — which teaches the first contributor that the check
+# is noise. A lint that a project's own source cannot pass is worse than no lint.
+select = ["E4", "E7", "E9", "F", "W"]
+ignore = [
+    "E701",  # compound statement on one line (colon) — used in tight guard/dispatch clauses
+    "E702",  # compound statement on one line (semicolon) — the deliberate compact test-setup style
+    "E401",  # multiple imports on one line — compact grouping in test helpers
+    "E402",  # module import not at top — section-local imports beside the block that uses them
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# `-q` because a green run should be one line. The interesting output is a failure.
+#
+# `-rs` because without it a skip is one dot, and a dot is what a pass looks like. MEASURED 2026-09-02
+# on a clean clone: `python -m pytest` reported "83 passed, 3 skipped" and named neither the tests nor
+# the reason, while `-rs` names both — "SKIPPED [3] tests/test_examples.py:54: php is not on PATH".
+# Those three are the php example's whole witness check, so a machine without php produced output
+# byte-identical to one that ran it. It also survives a contributor who types `-q` out of habit: the
+# resulting `-qq` drops the count line and keeps this report.
+addopts = "-q -rs"

@@ -1,0 +1,1 @@
+Archived: the migration ran on the second attempt and the rollback was never needed.
