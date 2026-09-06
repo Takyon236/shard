@@ -186,7 +186,7 @@ runs:
 # `Dockerfile` beside this file still ships and still builds the same image: it is what you
 # read to audit what executes in your pipeline, and what you build if you would rather run
 # your own. The build-context paragraph above applies to that path rather than to this one.
-        SHARD_ACTION_IMAGE: "docker://ghcr.io/takyon236/shard@sha256:4c7b7cdddd77ce19e9e20e5dc63679451c628c42d7e4b776d5605fde5c4096dd"
+        SHARD_ACTION_IMAGE: "docker://ghcr.io/takyon236/shard@sha256:2afc485637c9e37499deaeff849a95c129c310f2b6daaeafcb29cbf5f7f97b70"
         INPUT_MODE: ${{ inputs.mode }}
         INPUT_MODEL_ENDPOINT: ${{ inputs.model_endpoint }}
         INPUT_MODEL: ${{ inputs.model }}
@@ -240,9 +240,26 @@ runs:
           echo "shard: a 256-bit Action handoff key could not be generated" >&2
           exit 2
         fi
+        # THE THREE CAPABILITIES THE BOUNDARY NEEDS, AND `SYS_ADMIN` ALONE WAS NEVER ENOUGH.
+        # Measured 2026-09-06 inside this image, `witness.isolation_prefix` under exactly these
+        # flags, one capability at a time:
+        #
+        #   --cap-drop ALL --cap-add SYS_ADMIN   `could not mount a private writable trial: errno 13`
+        #   + DAC_OVERRIDE                       `could not lock root capability semantics: errno 1`
+        #   + SETPCAP                            demonstrated: exit 139, benign control ran
+        #
+        # So every witness execution in the shipped image refused before this line changed, and the
+        # product reported hypotheses it could have proved. `prctl(PR_SET_SECUREBITS)` has always
+        # required CAP_SETPCAP, so this was never a property of one kernel.
+        #
+        # THIS DOES NOT WIDEN WHAT CUSTOMER CODE HOLDS. The namespace initializer needs them only to
+        # build the mounts; it then drops the bounding set, clears every capability set and sets
+        # no_new_privs BEFORE it execs the entry point — and it is the SETPCAP grant that lets it do
+        # so. Without SETPCAP the hardening cannot run, which is why the probe refuses rather than
+        # executing anything.
         docker_args=(
           run --rm --interactive
-          --cap-drop ALL --cap-add SYS_ADMIN
+          --cap-drop ALL --cap-add SYS_ADMIN --cap-add DAC_OVERRIDE --cap-add SETPCAP
           --group-add "$host_gid"
           --security-opt seccomp=unconfined
           --security-opt apparmor=unconfined

@@ -8,6 +8,26 @@ an exact version or commit when updates need review.
 
 ## [Unreleased]
 
+## [4.0.3] — 2026-09-07
+
+**Upgrade from 4.0.2. It could not demonstrate anything.** Measured against the published 4.0.2 image
+under the Action's own flags: the execution boundary probe returned nothing, so every witness refused
+and `reproduced: true` was unreachable.
+
+### Fixed
+
+- **The Action could not execute a witness, so no finding could ever gate a build.** The review
+  container was launched with `SYS_ADMIN` alone; the trusted namespace initializer also needs
+  `DAC_OVERRIDE` to mount the private writable trial and `SETPCAP` to lock securebits before the
+  entry point starts. Without them the execution boundary could not be established, and every
+  demonstration was correctly refused and reported as an unproven hypothesis. All three capabilities
+  are now granted to the initializer, which then drops them before repository code runs. Measured
+  inside the image, one capability at a time; the published CI now runs a real witness in the
+  container under exactly these flags on every push and pull request.
+- Adjudication tests that require the execution boundary now skip, naming the missing capability,
+  on a runner that cannot provide it — instead of failing on a hosted runner, and instead of
+  passing without having observed anything.
+
 ## [4.0.2] — 2026-09-06
 
 `Takyon236/shard` is public. Anonymous source installs and `uses: Takyon236/shard@v4.0.2` work; the

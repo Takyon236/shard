@@ -803,6 +803,23 @@ def network_isolated(prefix: tuple[str, ...]) -> bool:
 #: The probe's answer for the default runner, computed once per process. `None` = not yet asked.
 _ISOLATION_CACHE: tuple[str, ...] | None = None
 
+#: What the LAUNCHER must hold for `PRIVILEGED_NETWORK_ISOLATION` to build the boundary, in the order
+#: the probe hits them. Measured 2026-09-06 inside the shipping free image, one capability at a time,
+#: against `action.yml`'s own `--security-opt seccomp=unconfined --security-opt apparmor=unconfined`:
+#:
+#:     --cap-drop ALL --cap-add SYS_ADMIN     `could not mount a private writable trial: errno 13`
+#:     + DAC_OVERRIDE                         `could not lock root capability semantics: errno 1`
+#:     + SETPCAP                              a real witness demonstrated: exit 139, control ran
+#:
+#: Dropping any one of the three returns the probe to `()`. That is not a property of one kernel:
+#: `prctl(PR_SET_SECUREBITS)` has required CAP_SETPCAP since it existed, so `--cap-add SYS_ADMIN`
+#: ALONE — what `action.yml` shipped until this commit — could never have contained anywhere.
+CONTAINMENT_CAPABILITIES: tuple[str, ...] = ("CAP_SYS_ADMIN", "CAP_DAC_OVERRIDE", "CAP_SETPCAP")
+
+#: The stderr of the last refused probe, per prefix, so a refusal can quote the kernel rather than
+#: guess. Written by `_probe_isolation` and read by `containment_unavailable`.
+_ISOLATION_DIAGNOSIS: tuple[str, ...] = ()
+
 
 def isolation_prefix(runner=None) -> tuple[str, ...]:
     """A verified private PID and network namespace prefix, or `()` where the kernel refuses it.
@@ -835,8 +852,35 @@ def isolation_prefix(runner=None) -> tuple[str, ...]:
     return _ISOLATION_CACHE
 
 
+def containment_unavailable(runner=None) -> str:
+    """`""` when this runner can build the hostile-execution boundary, else WHY it cannot.
+
+    One probe, one sentence, and the sentence NAMES the missing capability instead of saying
+    "unsupported". It exists because a runner that cannot contain is the single environment in which
+    every witness verdict on this machine is `refusal`, and the three places that have to notice —
+    the shipped suite, the regression bench and the image check — were each guessing separately.
+
+    The reason quotes the probe's own stderr. On a GitHub-hosted ubuntu runner that reads
+    `unshare: write failed /proc/self/uid_map: Operation not permitted`, which is the AppArmor
+    restriction on unprivileged user namespaces, and the privileged form then fails for want of
+    `CONTAINMENT_CAPABILITIES`.
+
+    An injected `runner` is passed straight through, so a caller that scripts the probe is answered
+    from its script and never from this process's cached verdict.
+    """
+    if network_isolated(isolation_prefix(runner)):
+        return ""
+    measured = "; ".join(line for line in _ISOLATION_DIAGNOSIS if line)
+    return ("this runner cannot build the private user/PID/mount/procfs/network boundary, so no "
+            "attacker-authored code may be executed here: it needs either an unprivileged user "
+            "namespace or a launcher granting " + ", ".join(CONTAINMENT_CAPABILITIES)
+            + (" — measured: " + measured if measured else ""))
+
+
 def _probe_isolation(runner) -> tuple[str, ...]:
     """Prove PID 1, private procfs/network, overlay and pivot before trusting the boundary."""
+    global _ISOLATION_DIAGNOSIS
+    diagnosis: list[str] = []
     with tempfile.TemporaryDirectory(prefix="shard-containment-probe-") as probe_root:
         root = pathlib.Path(probe_root)
         protected = root / "protected"
@@ -862,10 +906,17 @@ def _probe_isolation(runner) -> tuple[str, ...]:
                     [*prefix, "bash", "-c", check, "bash", str(hidden)],
                     capture_output=True, text=True, errors="replace", timeout=10, env=env,
                 )
-            except (OSError, subprocess.SubprocessError):
+            except (OSError, subprocess.SubprocessError) as exc:
+                diagnosis.append(f"{prefix[0]}: {exc}")
                 continue
             if proc.returncode == 0:
+                _ISOLATION_DIAGNOSIS = ()
                 return prefix
+            # A scripted probe need not carry streams; a real one always does. Keep the LAST line,
+            # which is where `unshare` and the namespace init both put the reason.
+            said = (getattr(proc, "stderr", "") or "").strip().splitlines()
+            diagnosis.append(said[-1] if said else f"exit {proc.returncode}")
+    _ISOLATION_DIAGNOSIS = tuple(diagnosis)
     return ()
 
 
@@ -951,8 +1002,9 @@ def _contained_entry_env(*readonly_paths, jail_root, writable_paths=(), bind_fil
 
 def reset_isolation_cache() -> None:
     """Forget the probe's answer. For tests, which must not inherit a verdict from an earlier one."""
-    global _ISOLATION_CACHE
+    global _ISOLATION_CACHE, _ISOLATION_DIAGNOSIS
     _ISOLATION_CACHE = None
+    _ISOLATION_DIAGNOSIS = ()
 
 
 #: What the agent may propose today, UNCONDITIONALLY. Both are sound on their own observation:
@@ -3052,10 +3104,11 @@ def _refuse(spec: WitnessSpec, why: str, *, digest: str = "") -> Witness:
 __all__ = [
     "BENIGN_SUFFIX", "DEFAULT_TIMEOUT", "DIFFERENTIAL_NONZERO_EXIT", "EXPECTATIONS",
     "FATAL_SIGNAL_CODES", "INHERITED", "INTRODUCED", "MAX_BENIGN_CONTROLS", "MAX_EVIDENCE_CHARS",
+    "CONTAINMENT_CAPABILITIES",
     "NETWORK_ISOLATION", "PID_ISOLATION", "PRIVILEGED_NETWORK_ISOLATION",
     "TIMEOUT_KILL_CODES", "TRACEBACK_TOKENS", "UNATTRIBUTED", "UNHANDLED_EXCEPTION",
     "UNMEASURED_EXPECTATIONS", "Witness", "WitnessSpec", "adjudicate", "attribute", "benign_controls",
-    "controls_digest",
+    "containment_unavailable", "controls_digest",
     "entry_digest", "entry_env", "isolation_prefix", "network_isolated", "observed_location",
     "offered_expectations",
     "payload_readings", "redact_secrets", "reset_isolation_cache", "resolve_entry",

@@ -1,6 +1,6 @@
 [project]
 name = "shard"
-version = "4.0.2"
+version = "4.0.3"
 description = "Security analysis in your CI: hypotheses stay informational, and demonstrated findings include a reproducing input."
 readme = "README.md"
 requires-python = ">=3.11"

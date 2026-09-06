@@ -15,6 +15,13 @@ every way this can wrongly say yes is a false positive that fails somebody's bui
 
 Deterministic: the entry point is a real script executed by a real subprocess, but there is no model,
 no network, and no repository but the temporary one each test writes.
+
+**Every test whose subject is what an entry point DID asks for the `contained` fixture**, and on a
+machine that cannot build the execution boundary it skips with the kernel's own reason rather than
+failing or, worse, passing. A refusal makes `demonstrated` False for a reason that has nothing to do
+with adjudication, so the refusal tests below — a missing entry point, an unknown expectation, an
+entry the agent wrote — deliberately do NOT take the fixture: they are decided before anything runs
+and are the same result everywhere.
 """
 
 from __future__ import annotations
@@ -78,7 +85,7 @@ MARKER_ON_BOOM = ('#!/bin/sh\nif grep -q BOOM "$1" 2>/dev/null; then\n'
 
 @pytest.mark.skipif(subprocess.run(["which", "bash"], capture_output=True).returncode != 0,
                     reason="needs bash")
-def test_a_process_killed_by_a_signal_IS_a_demonstration(tmp_path):
+def test_a_process_killed_by_a_signal_IS_a_demonstration(tmp_path, contained):
     """SIGSEGV, produced by one specific input. Nothing here is interpretation: the process died on a
     signal, and it did so on the agent's payload and not on the control. The containment supervisor
     reports a child's signal with the shell convention, ``128 + signal``."""
@@ -88,7 +95,7 @@ def test_a_process_killed_by_a_signal_IS_a_demonstration(tmp_path):
     assert w.exit_code == 139
 
 
-def test_an_ORDINARY_FAILURE_is_not_a_fatal_signal(tmp_path):
+def test_an_ORDINARY_FAILURE_is_not_a_fatal_signal(tmp_path, contained):
     """**The most important refusal in the file.** A non-zero exit is the single most common thing a
     program does when it is unhappy, and treating it as a crash would make almost every repository
     look defective. A signal is a signal; `exit 1` is a program working as designed."""
@@ -97,12 +104,12 @@ def test_an_ORDINARY_FAILURE_is_not_a_fatal_signal(tmp_path):
     assert w.demonstrated is False
 
 
-def test_a_CLEAN_EXIT_is_not_a_demonstration(tmp_path):
+def test_a_CLEAN_EXIT_is_not_a_demonstration(tmp_path, contained):
     w = _adjudicate(tmp_path, "#!/bin/sh\necho ok\nexit 0\n", "fatal_signal", payload=b"BOOM")
     assert w.demonstrated is False
 
 
-def test_a_declared_marker_in_the_output_IS_a_demonstration(tmp_path):
+def test_a_declared_marker_in_the_output_IS_a_demonstration(tmp_path, contained):
     """`output_marker` is how a repository tells Shard what its own failure looks like — an assertion
     string, a sanitiser banner, a panic line."""
     w = _adjudicate(tmp_path, MARKER_ON_BOOM, "output_marker",
@@ -110,7 +117,7 @@ def test_a_declared_marker_in_the_output_IS_a_demonstration(tmp_path):
     assert w.demonstrated is True
 
 
-def test_ORDINARY_OUTPUT_does_not_satisfy_a_marker(tmp_path):
+def test_ORDINARY_OUTPUT_does_not_satisfy_a_marker(tmp_path, contained):
     """The non-vacuity arm, and it is the one that catches a marker so generic it always matches. A
     check that fires on every run carries no information and costs a false positive every time."""
     w = _adjudicate(tmp_path, MARKER_ON_BOOM, "output_marker",
@@ -127,7 +134,7 @@ def test_an_EMPTY_marker_cannot_demonstrate_anything(tmp_path):
 # --- the benign control, which is what makes any of the above mean anything -----------------------
 
 
-def test_an_entry_point_THAT_CRASHES_ON_EVERYTHING_demonstrates_nothing(tmp_path):
+def test_an_entry_point_THAT_CRASHES_ON_EVERYTHING_demonstrates_nothing(tmp_path, contained):
     """**The single most valuable check in adjudication, and the one that is easiest to leave out.**
 
     A witness that crashes on the agent's payload has proven nothing until you know it does NOT crash
@@ -143,7 +150,7 @@ def test_an_entry_point_THAT_CRASHES_ON_EVERYTHING_demonstrates_nothing(tmp_path
     assert w.controls, "no control was run, so the verdict rests on one observation"
 
 
-def test_the_control_is_reported_so_a_reader_can_see_it_happened(tmp_path):
+def test_the_control_is_reported_so_a_reader_can_see_it_happened(tmp_path, contained):
     """A defence nobody can see is a defence nobody can check. The verdict names the controls it ran,
     which is what lets a reviewer tell "it passed the control" from "there was no control"."""
     w = _adjudicate(tmp_path, CRASH_ON_BOOM, "fatal_signal", payload=b"BOOM")
@@ -170,7 +177,7 @@ def test_an_UNKNOWN_expectation_is_refused_and_says_so(tmp_path):
     assert "unknown expectation" in w.refusal
 
 
-def test_an_entry_point_that_HANGS_is_stopped_and_does_not_demonstrate(tmp_path):
+def test_an_entry_point_that_HANGS_is_stopped_and_does_not_demonstrate(tmp_path, contained):
     """A timeout is not a crash. Left unbounded it is also a CI job that runs until the runner's own
     ceiling, which costs money and reports nothing.
 
@@ -226,7 +233,7 @@ def test_an_entry_point_OUTSIDE_the_checkout_is_refused(tmp_path):
 # --- the entry point is fingerprinted ------------------------------------------------------------
 
 
-def test_the_adjudicated_entry_point_is_recorded_by_DIGEST(tmp_path):
+def test_the_adjudicated_entry_point_is_recorded_by_DIGEST(tmp_path, contained):
     """A verdict is about a specific entry point, and the digest is what ties them together. Without
     it, a reproduction bundle says "this script crashed" about a script that may since have changed —
     which is exactly the claim a bundle exists to make checkable."""

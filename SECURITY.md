@@ -66,7 +66,10 @@ supported.
 
 ## Execution boundary
 
-The outer Action container retains only `SYS_ADMIN` so a trusted initializer can create the boundary.
+The outer Action container retains `SYS_ADMIN`, `DAC_OVERRIDE` and `SETPCAP` — no more — so a trusted
+initializer can create the boundary. All three are load-bearing and were measured one at a time:
+`SYS_ADMIN` alone cannot mount the private writable trial, and without `SETPCAP` the initializer
+cannot lock securebits, which is the step that takes the capabilities away again.
 Before any model-authored or repository-provided code starts, the initializer:
 
 - creates private PID, mount, proc and network namespaces;
@@ -82,7 +85,7 @@ Before any model-authored or repository-provided code starts, the initializer:
 Shard has no raw subprocess or PID-only fallback. If the complete boundary is unavailable, the run
 records a containment refusal and cannot turn that observation into a demonstrated finding.
 
-The analysis container retains `SYS_ADMIN` only for the trusted namespace initializer. After that
+The analysis container retains those three capabilities only for the trusted namespace initializer. After that
 container exits, the Action uses a separate helper with `no_new_privs`, no network, and only `CHOWN` to
 validate file types and link counts and return output/publication ownership to the runner. That helper
 does not execute repository code.

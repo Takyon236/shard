@@ -110,3 +110,58 @@ jobs:
             -v "$PWD/ws:/github/workspace" -w /github/workspace \
             -e INPUT_MODE=survey -e INPUT_OUT_DIR=/tmp/out \
             shard:ci action
+
+      # A REAL WITNESS EXECUTION, INSIDE THE IMAGE, UNDER THE FLAGS `action.yml` USES.
+      #
+      # The smoke test above runs `survey`, which makes no inference request and executes no witness
+      # — so nothing in this workflow had ever proved the one thing a finding rests on: that the
+      # image can build its execution boundary on a hosted runner and demonstrate a defect inside it.
+      #
+      # It could not. Measured 2026-09-06 in the image, `--cap-drop ALL --cap-add SYS_ADMIN` alone:
+      # the boundary probe returned nothing, so `adjudicate` refused every execution and every
+      # finding the product could have proved was reported as an unproven hypothesis. Adding
+      # DAC_OVERRIDE (the private writable trial is an overlay mount) and SETPCAP (the initializer
+      # locks securebits before the entry point starts) made the same script demonstrate: exit 139,
+      # with the benign control run.
+      #
+      # THE FLAGS BELOW MUST STAY BYTE-FOR-BYTE WHAT `action.yml` PASSES. A check with a wider grant
+      # than the product uses proves the kernel can contain and says nothing about the shipped
+      # configuration, which is the gap this step exists to close. The runner's own suite SKIPS these
+      # verdicts, by design and by name; this step is where they are actually measured, and it cannot
+      # skip.
+      - name: A witness demonstrates inside the image, with the Action's own capabilities
+        run: |
+          set -euo pipefail
+          mkdir -p wit/.shard
+          printf '#!/bin/sh\nif grep -q BOOM "$1" 2>/dev/null; then kill -SEGV $$; fi\necho fine\n' \
+            > wit/.shard/entry.sh
+          chmod 0755 wit/.shard/entry.sh
+          cat > check.py <<'PY'
+          import pathlib
+          from shard.witness import (WitnessSpec, adjudicate, containment_unavailable,
+                                     entry_digest)
+
+          gap = containment_unavailable()
+          if gap:
+              raise SystemExit("the image cannot contain execution under the Action's own "
+                               "capabilities, so no finding it reports could ever gate: " + gap)
+          repo, entry = pathlib.Path("/repo"), ".shard/entry.sh"
+          got = adjudicate(WitnessSpec(entry=entry, expectation="fatal_signal", payload=b"BOOM"),
+                           repo, baseline_digest=entry_digest(repo, entry), timeout=120)
+          print("demonstrated", got.demonstrated, "exit", got.exit_code,
+                "controls", got.controls, "refusal", repr(got.refusal))
+          if not (got.demonstrated and got.exit_code == 139 and got.controls):
+              raise SystemExit("a real witness did not demonstrate inside the image")
+          # THE NON-VACUITY ARM. A boundary that crashed everything would satisfy the line above.
+          benign = adjudicate(WitnessSpec(entry=entry, expectation="fatal_signal", payload=b"calm"),
+                              repo, baseline_digest=entry_digest(repo, entry), timeout=120)
+          print("benign demonstrated", benign.demonstrated, "refusal", repr(benign.refusal))
+          if benign.demonstrated or benign.refusal:
+              raise SystemExit("an ordinary input was not clean inside the image")
+          PY
+          docker run --rm \
+            --cap-drop ALL --cap-add SYS_ADMIN --cap-add DAC_OVERRIDE --cap-add SETPCAP \
+            --security-opt seccomp=unconfined \
+            --security-opt apparmor=unconfined \
+            -v "$PWD/wit:/repo" -v "$PWD/check.py:/check.py:ro" \
+            --entrypoint python shard:ci /check.py
