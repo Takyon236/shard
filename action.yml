@@ -1,489 +1,538 @@
-# Shard — the GitHub Action. The contract here IS the product surface.
+# Shard GitHub Action
 #
-# THIS FILE SHIPS VERBATIM IN THE PUBLIC FREE DISTRIBUTION, which is why it names no internal design
-# document and no path outside the published repository. The free build refuses a distribution that
-# references a file the distribution does not carry, so a breadcrumb added here for a colleague becomes
-# a dead reference for a customer and the build says so. Measured facts belong here; pointers to where
-# they were measured do not.
-#
-# That sentence named the refusing function until 2026-09-03, in a script the distribution does not
-# carry — the exact defect it describes, in the paragraph describing it, in the first thing a customer
-# reads. No substitution runs over this file, so nothing caught it; the gate that would have is a
-# `_MUST_NOT_SHIP` alternative added the same day.
-#
-# Every input below maps to a `python -m shard <subcommand>` flag that exists and is tested. This file
-# was an "interface sketch, not yet implemented" until 2026-08-07; where something is still not built,
-# it says so by name rather than being accepted and quietly ignored.
-#
-# THIS FILE LIVES AT THE REPOSITORY ROOT AND MAY NOT BE MOVED INTO A SUBDIRECTORY. It sat in `action/`
-# until 2026-08-11, and that layout could not run anywhere: GitHub resolves `runs.image` — and the
-# Docker BUILD CONTEXT — relative to the directory holding this file, so `image: "Dockerfile"` named
-# `action/Dockerfile`, which did not exist. Moving the Dockerfile there would not have fixed it either:
-# the context would then have been `action/`, which holds no `shard/` for the Dockerfile to COPY. Both
-# halves are why colocation at the root is the requirement rather than a preference, and a test asserts
-# that the image resolves and that its build context carries the source — nothing did until it was the
-# only thing standing between the product and its first real runner. The rule had been written down and
-# the failure predicted; colocation resolves it, rather than publishing from a hand-copied repository.
+# Customer workflow guidance lives in README.md and docs/. This manifest is the machine interface:
+# each field states its purpose, accepted values, default and the one caveat needed to use it safely.
 name: "Shard"
-description: "Security analysis with a reproducing input attached. Runs in your CI, on your model endpoint."
+description: "Security review with reproducing inputs, on your runner and model endpoint."
 author: "Reyse"
 
-# INPUT NAMES USE UNDERSCORES, NOT HYPHENS, and that is load-bearing: GitHub builds the container's
-# environment as `INPUT_<name>` upper-cased with SPACES replaced — hyphens pass through UNCHANGED
-# (actions/toolkit `core.getInput`; github/docs#32671; actions/runner#2283). A hyphenated declaration
-# arrives as `INPUT_WITNESS-ENTRY`, which the underscore-spelled lookup this action shipped with never
-# read — eleven of fourteen inputs were inert on a real runner, including the spend ceiling and the
-# witness entry point. Renaming was FREE on 2026-08-11 because the action was not yet published, and
-# would be a breaking change forever after. `shard/action.py::_input` still accepts the hyphenated
-# spelling from a hand-written `with:` block, preferring it over a declared default.
 inputs:
   mode:
-    description: >
-      survey  — what this codebase is and what we might look for. No inference. Free tier.
-      diff    — review a pull request. The free tier and the v1 artefact.
+    description: "Free image mode: survey or diff."
     required: false
     default: "diff"
 
   model_endpoint:
     description: >
-      An OpenAI-compatible base URL for self-hosted vLLM or Ollama. `bedrock` and `vertex` are
-      REFUSED by name until W3 lands their adapters, rather than failing obscurely inside an HTTP
-      client. Self-hosted vLLM is the guaranteed EU-residency path.
-
-      IT MUST STREAM. Every request this image sends carries `stream: true` and
-      `stream_options.include_usage`, unconditionally and with no non-streaming fallback, and the
-      reply is parsed as `text/event-stream`. That is not a preference: the socket timeout is an IDLE
-      gap between chunks rather than a cap on the whole generation, which is what lets a completion
-      run for minutes without a false abort while a genuine mid-stream stall is caught in seconds.
-
-      An endpoint that meets every other line of this description and answers `application/json`
-      yields ZERO chunks, which reads as an empty completion. Measured 2026-09-02 against a
-      non-streaming server returning the canonical `choices[0].message.tool_calls` shape:
-      `shard preflight --probe-endpoint --json` answers `"verdict": "unsupported"` with
-      `"why": "the endpoint answered with an error: empty response"`, and a real run spends its whole
-      wall-clock ceiling on empty turns and reports `budget` — advice that cannot help, on the
-      customer's own inference bill. Run that probe before a first scan. Buffering proxies and
-      gateways are where this bites; vLLM, Ollama, TGI and llama.cpp all stream by default.
-
-      SURVEY MODE REFUSES IT, because a survey makes no inference call at all — see `state_repo`
-      below for why a mode-inert input is refused here rather than dropped.
+      Streaming OpenAI-compatible base URL. Every request uses stream: true and native tool calls.
+      Run preflight --probe-endpoint before a review. Survey refuses model_endpoint because it makes
+      no inference request.
     required: false
+
   model:
-    description: >
-      Model identifier. See the supported configuration matrix in the docs. Not used by `mode: survey`,
-      which makes no inference call; it is not refused there because its declared default below reaches
-      every run whether or not you set it.
+    description: "Exact model identifier served by the endpoint."
     required: false
     default: "glm-5.2"
+
   api_key_env:
     description: >
-      Environment variable holding the endpoint's key. The customer supplies inference on EVERY tier,
-      including free — we operate no endpoint. Not used by `mode: survey`, which reads no key because
-      it makes no request; like `model` it is not refused there, because its default reaches every run.
-
-      THIS NAMES THE VARIABLE; IT IS NOT THE KEY. Shard never receives the secret as an input, so it
-      cannot reach an argv, a log line or this manifest. Store the secret once (Settings → Secrets and
-      variables → Actions), then map it onto the step's `env:` with a `secrets.OPENROUTER_API_KEY`
-      expression — README.md carries the block to copy, because a workflow expression cannot be written
-      literally in this file (see the note at the top of `runs:`).
-
-      GitHub injects a step's `env:` into the container, and `shard/cli.py::_backend` looks the name up
-      with `os.environ.get`. Set this only when your secret is called something else.
-
-      ON A FORK'S PULL REQUEST THERE IS NO SECRET, and that is GitHub's rule rather than ours: secrets
-      are withheld from `pull_request` runs originating in a fork. So on a public repository taking
-      outside contributions, Shard gets no key on exactly the pull requests a security tool most wants
-      to read, and the run stops with the configuration error below rather than pretending. The honest
-      answers are a non-fork trigger, or `pull_request_target` — which runs with secrets against the
-      BASE repository and is a documented footgun, because a fork controls the code under review. We do
-      not recommend it without a `permissions:` block and a human approval gate.
+      Name of the environment variable containing the endpoint key; never put the key itself in with:.
+      The launcher copies its value to a fixed internal carrier; the selected name is never forwarded
+      into the image. Survey does not read this default because it makes no inference request.
     required: false
     default: "OPENROUTER_API_KEY"
 
-  # --- what the run is allowed to cost -------------------------------------------------------------
-  # The measured 16x spread across tasks makes a per-run ceiling mandatory rather than advisory:
-  #
-  # ALL THREE ARE UNUSED BY `mode: survey`, which spends nothing. They are not refused there, because
-  # each declares a default that GitHub sets on every run — see `state_repo` for that argument in full.
   max_spend_usd:
     description: >
-      Hard ceiling on inference spend for this run, debited from the price the endpoint reports on
-      every response. 0 means unmetered. An endpoint that prices nothing — self-hosted vLLM — cannot
-      be metered in dollars however this is set, and the run says so rather than reporting $0.00.
-      A survey spends nothing and this ceiling meters nothing there.
-
-      The run stops BEFORE a model call it cannot afford at the highest price it has already paid
-      during that run, so this is a ceiling and not an estimate. Two cases still cross it by at most
-      one call, and both are stated here rather than rounded away: the FIRST call of a run has no
-      observed price behind it, and any call can be priced above every call before it. No endpoint
-      this action supports accepts a spend cap as a request parameter, so a call's true cost is
-      knowable only once its response arrives.
+      Observed inference-cost ceiling. 0 disables it. Use 0 when a self-hosted endpoint reports no
+      dollar price; token, time and step limits remain available.
     required: false
     default: "10"
-  max_minutes:
-    description: >
-      Hard wall-clock ceiling on the review loop. 0 means unmetered. There is no review loop in
-      `mode: survey`, so it bounds nothing there.
 
-      Checked BETWEEN steps, so a step in progress finishes rather than being killed part-way — and
-      one step is itself bounded, by a 900-second ceiling that covers a turn including every transport
-      retry inside it. Adjudication runs after the loop has ended and carries its OWN ceiling rather
-      than this one, because it spends runner time and not inference: cutting it short by a budget
-      meant for model calls would throw away the evidence the run was for. Both are stated here rather
-      than left to be discovered, because a ceiling with an exception is not the ceiling it is named.
+  max_minutes:
+    description: "Review-loop wall-clock ceiling. 0 disables it."
     required: false
     default: "60"
+
   max_tokens:
     description: >
-      Hard token ceiling. 0 does NOT mean unmetered. Set a number to override the default.
-      `mode: survey` consumes no tokens, so it is bounded by nothing here.
-
-      In diff mode 0 means no token ceiling, because no measurement of a diff-scoped run supports
-      one. Diff mode also has no floor: its runs finish in the hundreds of thousands, and a
-      4,000,000 floor would sit above the ceiling.
+      Explicit token ceiling for diff mode. 0 means no token ceiling.
     required: false
     default: "0"
 
   scan:
     description: >
-      Which kind of scan this is, and therefore what unset ceilings mean. THIS SETS A BUDGET, NOT A
-      SCOPE — in diff mode the run reviews exactly the diff whichever you pick. `initial` is a
-      first look at a target, sized for COVERAGE, because a first scan that stops early reports a
-      floor rather than a result; it also raises the step ceiling, which a first scan of a large
-      tree needs and which had to be passed by hand until 2026-08-21. `followup` is
-      every run after that: the baseline exists, so the run pays for the change rather than for the
-      tree. An explicit `max_tokens` always wins over both.
+      Budget profile: initial or followup. It changes ceilings, not diff scope.
 
-      Diff mode applies no profile to the finding count at all, keeping its unset `max_tokens`
-      unmetered.
-
-
-      SURVEY MODE REFUSES IT: a survey spends nothing, so there is no budget for a profile to size.
+      Survey refuses scan because a survey has no model budget to size.
     required: false
 
   max_steps:
     description: >
-      How many turns the review may take. DIFF MODE ONLY.
-
-      SURVEY MODE REFUSES IT outright, because a survey takes no turns at all — there is nothing to
-      state a drop about.
+      Maximum model turns in diff mode. When omitted, the measured default applies; a scan profile can
+      raise that floor. 0 is invalid.
 
 
-      UNLIKE THE THREE CEILINGS ABOVE, 0 IS REFUSED. The hunt runs `for step in 1..max_steps`, so zero
-      steps is not "unmetered", it is no review at all — a run that completes, reports nothing and
-      exits 0, which is the green-check-that-reviewed-nothing this product exists to refuse. To let a
-      run go long, raise `max_spend_usd`.
-
-      Left unset it is the measured default in `shard/simple.py` (40) — UNLESS `scan` names a profile
-      that sets a higher floor, which `initial` does since 2026-08-21. That number is worth knowing
-      before you rely on it: the first real pull request Shard reviewed — 3 files, 71 added lines —
-      used all 40 steps, spent $0.28 of a $0.30 allowance and stopped at `maxsteps` with no findings.
-      Dollars, minutes and tokens were all configurable and none of them was the constraint. Read the
-      `status` output: `maxsteps` means the review did not finish, and no findings is not a clean
-      result. Found by the first run this product ever made against a real pull request.
+      Survey refuses max_steps because a survey takes no model turns.
     required: false
 
   hunk_radius:
     description: >
-      Lines of context either side of a changed line to name as the change's neighbourhood.
-      DIFF MODE ONLY. Survey mode reads no diff, so there is no hunk for a radius to be about, and it
-      REFUSES this input rather than dropping it.
+      Diff attention window in lines around each changed line. 0 uses whole changed files.
 
-
-      Left unset it is the measured default in `shard/diffscope.py` (40), and these are the numbers
-      that earned it: on one line changed in a 6,895-line xmlparse.c it
-      cut 795,519 tokens to 476,601 and $0.0977 to $0.0564 at an identical step count, and the
-      defect planted 69 lines OUTSIDE the window was still found and gated 3 times out of 3 — the
-      window narrows attention, not capability. `0` scopes to whole files, which is what every run
-      before 2026-08-08 did.
+      Survey refuses hunk_radius because a survey reads no diff.
     required: false
 
-  # --- what the customer declares ------------------------------------------------------------------
   witness_entry:
     description: >
-      Repo-relative path to a RUNNABLE entry point you declare, e.g. `.shard/entry.sh`. Simple mode
-      supplies it data and observes what happens; it is read-only to the agent.
-      WITHOUT ONE, nothing diff mode reports can gate the build — every finding stays informational.
-      That is a real limit and it is the honest one: a gate that fired on the agent's own say-so
-      would make the anti-slop guarantee false.
-
-      THE CALLING CONVENTION, because getting it wrong costs a whole run and says nothing. Shard runs
-      `bash -- <your entry point> <payload file>` from the root of your checkout: the payload is a FILE
-      and its path is `$1`. NOTHING IS WRITTEN TO STDIN. An entry point that reads stdin therefore sees
-      an empty input on every execution, including every control, and the failure is silent in exactly
-      the way this description warns about below — the run completes, every finding stays a hypothesis
-      and gate-eligible is 0. Measured 2026-09-02, one payload through the adjudicator: the `$1` script
-      was demonstrated at exit 3 with its marker in the output, and a byte-identical run of a script
-      reading stdin was not demonstrated, at exit 0, with nothing. `shard preflight --entry-template`
-      prints a skeleton that already reads `$1`.
-
-      IT RUNS INSIDE THIS ACTION'S CONTAINER, so what it may invoke is what the image carries — and
-      the image asserts at build time that every one of these runs, rather than claiming it here:
-      python3, bash, git, node 22, a headless JRE, ruby, php, the .NET 8 runtime, and gcc/g++ with
-      libc6-dev. Absent: any JDK, the .NET SDK, and every other toolchain — Go, Rust, Swift among them.
-      `shard preflight` names whichever runtime YOUR repository needs and does not find, for free,
-      before you spend anything on a review.
-
-      WHAT IS NOT HERE IS YOUR BUILD, and that is the part worth planning around. A JRE runs the
-      classes your build already emitted and a .NET runtime runs your assembly; neither compiles.
-      So BUILD IN AN EARLIER STEP and have the entry point RUN what is already in the workspace.
-      C and C++ are the exception — a compiler is present, so an entry point that builds its own small
-      witness works too. Measured 2026-08-10, back when nothing here could compile: the same commit
-      produced 2 reproductions when the entry point had a prebuilt binary and 0 when it had to build
-      one, and the failure was QUIET — the run completed, every finding stayed a hypothesis,
-      gate-eligible was 0, and nothing said why. A build your entry point cannot perform still fails
-      exactly that way, which is why an earlier step is the reliable arrangement even where a compiler
-      would serve.
-
-      FOR A SANITISER BUILD set `ASAN_OPTIONS=abort_on_error=1`, so a detected fault raises a fatal
-      signal rather than ASAN's default exit 1 — which is indistinguishable from your program rejecting
-      the input, and is therefore not something this product will treat as a demonstration.
-
-      DECLARE BENIGN INPUTS BESIDE IT, and this is the single highest-value thing you can add. Put
-      ordinary, non-malicious inputs in a directory named after the entry point plus `.benign` —
-      `.shard/entry.sh.benign/` — one per branch your entry point can take. Every finding is then
-      checked against them, and a "demonstration" that is really just your program printing what it
-      always prints is refused.
-
-      WITHOUT THEM the only control is an EMPTY input, which takes a different branch through almost
-      any program: measured against a five-class Java target, four fixtures containing no attack at
-      all produced gate-eligible findings at exit 0. With four benign inputs declared, all four were
-      refused and every honest finding survived. A run that had no benign control says so in the
-      finding itself, so this is a limit you can see rather than one you have to know about.
+      Repository-relative executable used to demonstrate findings. Shard calls it from the repository
+      root with the payload file path in $1; stdin carries nothing. Without a witness, hypotheses can
+      be reported but cannot gate. Put benign controls in ENTRY.benign/.
     required: false
+
   base_ref:
     description: >
-      What the pull request is measured against. DIFF MODE ONLY — a survey reads no diff, and this
-      input is inert rather than refused there because its default reaches every run.
-
-      YOUR CHECKOUT MUST BE DEEP ENOUGH TO RESOLVE IT. `actions/checkout` defaults to `fetch-depth: 1`,
-      which fetches ONE commit — so the default `HEAD~1` does not exist, no diff can be read, and the
-      run reports `no changed files in scope` and exits 0. **That is a GREEN CHECK that reviewed
-      nothing.** The reason is printed in the log ("git could not resolve ..."), and a green check is
-      what most people look at. Measured 2026-08-10 on a depth-1 clone.
-
-      So set the depth, in the checkout step rather than here:
-
-        - uses: actions/checkout@v4
-          with: { fetch-depth: 0 }          # or a depth that covers the pull request
-
-      On `pull_request` you can instead point this at the base commit GitHub already gives you — a
-      `github.event.pull_request.base.sha` expression — with a checkout deep enough to contain it.
-
-      BUT `base.sha` IS THE BASE BRANCH TIP AT THE LAST SYNC, NOT THE MERGE BASE, and once the base
-      branch moves it stops being an ancestor of your head. Measured 2026-08-18 on
-      `mistralai/mistral-common` #285: `base.sha` was `693adfb43bcb` and the real merge base was
-      `bc022b91aa1c`. That is the ordinary case for any pull request open longer than the branch is
-      quiet, not a corner.
-
-      A diverged base is NOT fatal — the three-dot diff falls back to the merge base, which is the
-      right causal answer to "what did this change add" — and the run says so in `scope_reasons`. On a
-      `pull_request` event it does not arise at all: the runner checks out a MERGE commit whose first
-      parent IS `base.sha`, so there it and the default `HEAD~1` are the same commit.
-
-      Where it bites is a HEAD-BRANCH checkout — a fork, a `workflow_dispatch`, a local run. Until
-      2026-08-18 that combination also switched `fail-on` off and reported "the diff was not read"
-      about a diff it had read; that is fixed, and the remaining advice is simply: **on a head-branch
-      checkout prefer the merge base** — `git merge-base origin/$GITHUB_BASE_REF HEAD` — over
-      `base.sha`.
-
-      ONE RULE, because two documents disagreed on it and the failure was a green check: a shallow
-      checkout is safe ONLY with the default `HEAD~1`. `fetch-depth: 2` and `HEAD~1` is a valid pair
-      (on `pull_request` the runner checks out a MERGE commit, so `HEAD~1` is the base side of it);
-      `fetch-depth: 2` and a `base.sha` that has moved since the pull request opened is not, because
-      that commit is outside the shallow window — git answers `fatal: bad object`, the scope comes back
-      empty, and the run exits 0. If you pass `base_ref` at all, use `fetch-depth: 0`. Measured
-      2026-08-12.
+      Diff base, default HEAD~1. The checkout must contain it. Use fetch-depth: 0 when supplying a
+      revision; otherwise Git may answer fatal: bad object and the run can have no changed files.
     required: false
     default: "HEAD~1"
 
-  # --- where understanding accumulates -------------------------------------------------------------
   state_repo:
     description: >
-      Path to a checked-out DEDICATED repository you create for Shard's state. We never write to the
-      repository under review. Optional: without it nothing accumulates between runs, which keeps
-      install to one step. A state failure NEVER fails the build.
+      Optional checked-out dedicated state repository for diff mode. State failure never fails the
+      reviewed build.
 
-      DIFF MODE ONLY, AND SURVEY REFUSES IT rather than dropping it. `shard survey` takes no state
-      repository — a diff run is what writes `survey.json` and the run records under one — so a survey
-      scheduled against this input accumulated nothing, forever, and said nothing. Measured 2026-09-02
-      with every input set: twelve of seventeen produced no flag on a survey and no line of the run's
-      output named one of them.
-
-      THIS IS WHY THE REFUSAL IS PARTIAL, stated once here for every input that carries it. GitHub sets
-      `INPUT_<NAME>` from a DECLARED DEFAULT as well as from your `with:` block, so a value on an input
-      that has a default cannot be attributed to you and refusing on it would refuse every survey run
-      ever made. The inputs refused on a survey are therefore the ones declared with no default —
-      `model_endpoint`, `scan`, `max_steps`, `hunk_radius` and this one — plus `fail_on`, whose default
-      asks for nothing. The rest of the diff-only configuration is inert on a survey and says so in its
-      own description.
+      Survey refuses state_repo because a survey writes no cross-run state.
     required: false
+
   slug:
-    description: "<owner>/<name> of the repository under review. Normally a github.repository expression."
+    description: "owner/name attributed in reports and delivery."
     required: false
 
   fail_on:
     description: >
-      none (default, report only) | reproduced | new.
-      The check NEVER fails on a finding without a reproduction or a demonstration, whatever this says.
-
-      `new` additionally requires the defect to sit on a line THIS pull request introduced — the
-      diff's added lines plus the seams its deletions leave — so a pre-existing defect next to an
-      innocent edit reports without failing the build. Derived entirely from the diff in hand:
-      no baseline storage, no alert-history API, nothing GitHub-specific. Diff mode only.
+      none (default) | reproduced | new. Hypotheses never gate. New additionally requires evidence
+      that the change introduced the demonstrated defect.
 
 
-      A SURVEY ACCEPTS ANY VALUE AND STATES THE CONSEQUENCE: it reports candidates, never a finding
-      carrying a demonstration, so no gate it is asked for can fire and the step passes on every
-      survey — which the run says by name in its log rather than leaving silent.
-
-      It is NOT refused, unlike the five other inputs a survey cannot act on, and the difference is
-      that this is the only one of the six with a DEFAULT here. GitHub sets it on every run, so a
-      reusable workflow passing one `fail_on` to a diff step and a survey step is the arrangement this
-      file recommends — and refusing it made that survey step exit 2 on a build that was green the day
-      before, under a `@v2` tag that floats. The other five have to be typed into the survey's own
-      `with:` block, so a refusal there can only fire on a configuration somebody chose.
-
-      IT NEEDS THE DIFF. If git cannot answer (see base_ref above on checkout depth), `new` cannot be
-      evaluated: the gate does not fire and the run SAYS SO — a gate_reasons entry in the payload
-      echoed to this action's log, beside the scope_reasons naming what git refused. That run is
-      degraded, not clean.
-
-      WHAT EACH VALUE ACTUALLY COVERS, measured end to end on real repositories. Every row below is a
-      finding Shard DEMONSTRATED — it ran your entry point and observed the defect:
-
-        finding                                          none  reproduced  new
-        introduced defect, demonstration named the line    0        1       1
-        introduced defect, the exploit was SILENT          0        1       1
-        defect on a line this PR DELETED                   0        1       1
-        pre-existing defect, untouched by this PR          0        1       0
-
-      (0 = the build passes, 1 = the build fails.)
-
-      HOW `new` ANSWERS ROWS 2 AND 3, because neither is visible in the diff. A successful exploit is
-      often silent — real command injection exits 0 with no stack — so there is no line to look at; and
-      a removed bounds check introduces a defect while adding no line anywhere. Shard therefore asks the
-      question directly: it extracts your repository as it was at `base_ref` and re-runs the same
-      reproducing input against it. Reproduces at base, the defect was already there. Does not, this
-      change introduced it. No line needed, and the answer is about your program rather than about your
-      diff — so a pre-existing defect that merely MOVED onto an added line is correctly not new either.
-
-      WHAT IT COSTS: one `git archive` per run and one extra execution of your entry point per
-      demonstrated finding, and only under `new`. `reproduced` and `none` do neither.
-
-      WHEN IT CANNOT BE ANSWERED, `new` falls back to the diff — the finding's line must be one this
-      pull request added — and the run says so in gate_reasons rather than presenting a plain green
-      check. The common reason is a base checkout that cannot run: `git archive` carries tracked files
-      only, so an entry point that needs a binary an earlier workflow step built will not start there.
-      **An entry point that builds what it needs, or needs no build, is what makes `new` exact.**
+      Survey accepts fail_on but cannot gate; the run reports that consequence.
     required: false
     default: "none"
 
   out_dir:
-    description: "Where shard.sarif, shard-report.md and bundles/ are written."
+    description: >
+      Fresh workspace-relative directory. Diff writes shard-report.md, shard-result.json, shard.sarif,
+      optional shard-telemetry.json and shard-run.log, and bundles/ when a finding bundle is written. Survey
+      writes shard-report.md and shard-survey.json. The Action refuses absolute paths, parent traversal,
+      symlinks and a non-empty destination. Each path component may contain only ASCII letters, digits,
+      dot, underscore and hyphen; use a distinct directory for each Shard step in one job.
     required: false
     default: "shard-out"
 
   github_token:
     description: >
-      Pass `secrets.GITHUB_TOKEN` to publish this run's findings as code-scanning alerts. WITHOUT IT
-      THE RUN STILL WORKS AND STILL GATES — it simply produces no alerts, and says so in the log
-      rather than skipping quietly.
-
-      Needs `permissions: {security-events: write}` on the job. The upload happens from inside this
-      container, so installing Shard stays one step; if you would rather do it yourself, leave this
-      empty and pass `sarif-path` to `github/codeql-action/upload-sarif`. Both are the same API.
-
-      THE ONLY INPUT HERE THAT IS NOT A COMMAND-LINE FLAG. It is consumed by `shard/action.py` to
-      deliver what the run produced, never forwarded to a subcommand and never written to any
-      artefact. A run reviewing a repository other than the one this token belongs to refuses to
-      upload, because alerts would attribute another repository's findings to this one.
+      Optional GitHub token for pull-request comments and SARIF delivery. Requires pull-requests:
+      write and security-events: write. It is used for delivery and never forwarded to the scanner CLI.
     required: false
     default: ""
 
 outputs:
   status:
-    description: >
-      Whether the run FINISHED, in the run's own vocabulary. THIS IMAGE EMITS EXACTLY FIVE VALUES:
+    description: |
+        done      review finished
+        error     endpoint or review failed
+        budget    a configured ceiling stopped the review
+        maxsteps  the review ran out of turns
+        repeat    repeated identical tool calls stopped the review
+    value: ${{ steps.shard.outputs['status'] }}
 
-        done      the review finished. The ONLY value that means that.
-        error     the model endpoint or the loop failed; nothing was concluded.
-        budget    a spend, wall-clock or token ceiling stopped it.
-        maxsteps  it ran out of turns.
-        repeat    it stopped after one tool was called with byte-identical arguments six times running.
-
-      A survey reports `done`: it either produced a scan or it failed.
-
-      TEST FOR `done`, NEVER FOR A LIST OF FAILURES. Until 2026-09-02 this field named `audited` as a
-      second success value and did not name `repeat` — so a workflow written to the declared vocabulary
-      read a repeat-broken review as clean, which is the degraded-run-as-clean shape this product exists
-      to refuse, and one testing for `audited` was testing for a value no code path in this image can
-      assign.
-
-      THE CHECK STAYS GREEN under the default `fail_on: none` — installing Shard does not break your
-      build. Under `fail_on: reproduced` or `new` a run that ended `error` exits 2 instead, because a
-      review that never happened must not clear a gate you asked for. Every output here is still
-      written on that run, so this remains where a workflow reads what actually happened. The SARIF
-      carries the same fact in `invocations[].executionSuccessful`.
   findings:
-    description: "Count of findings emitted"
+    description: "Number of findings emitted."
+    value: ${{ steps.shard.outputs['findings'] }}
+
   gate-eligible:
-    description: "Count carrying a reproduction or a demonstration — the only ones that may gate"
+    description: >
+      Number of demonstrated findings. With fail_on: new, change attribution is recorded in
+      shard-result.json and exit 1 remains the authoritative gate result.
+    value: ${{ steps.shard.outputs['gate-eligible'] }}
+
   sarif-path:
-    description: "SARIF file for upload to code scanning"
+    description: "Path to SARIF for code scanning."
+    value: ${{ steps.shard.outputs['sarif-path'] }}
+
   report-path:
-    description: "The short markdown report, for a pull-request comment"
+    description: "Path to the Markdown report."
+    value: ${{ steps.shard.outputs['report-path'] }}
+
   bundle-path:
-    description: "Reproduction bundles: the crashing input and the command that produced it"
+    description: >
+      Path to finding bundles; empty when none were written. Inspect the reproduced field in each
+      bundle's metadata.json to distinguish a demonstration from a candidate whose witness did not
+      demonstrate the finding.
+    value: ${{ steps.shard.outputs['bundle-path'] }}
+
   result-path:
-    description: >
-      The whole result of this scan as one versioned JSON document — the findings split into
-      `reproduced` and `hypotheses`, the run facts behind them, and a `limits` array naming in codes
-      what this run does NOT establish. This is the output to give another tool: `sarif-path` is
-      GitHub's shape and drops the run facts, and `report-path` is prose. Empty on a run that wrote
-      none.
+    description: "Path to the versioned machine-readable result."
+    value: ${{ steps.shard.outputs['result-path'] }}
+
   telemetry-path:
-    description: >
-      Structured telemetry for this run as JSON — wall clock, model turns, per-tool call counts and
-      bytes returned, the context growth curve, and what each compaction reclaimed. Carries a gaps list
-      naming anything the run could not measure rather than reporting it as zero. Arguments and tool
-      output are described, never quoted, so it holds no source and no model prose and is safe to
-      forward. Empty on a run that wrote none.
+    description: "Path to source-free structured run metrics, when written."
+    value: ${{ steps.shard.outputs['telemetry-path'] }}
+
   log-path:
-    description: >
-      The same run, human-readable, in order, with timings and sizes. This is about the RUN;
-      report-path is about the CODE. Empty on a run that wrote none.
-# NO `${` + `{{` EXPRESSION MAY APPEAR ANYWHERE IN THIS FILE, INCLUDING INSIDE A DESCRIPTION.
-#
-# GitHub evaluates workflow expressions in action metadata, and the `secrets` and `github` contexts do
-# not exist here. Two of these sat in the `base_ref` and `slug` descriptions as COPY-PASTEABLE ADVICE
-# for months and the whole manifest failed to load on the first real runner:
-#
-#     Failed to load .../action.yml
-#     (Line 190, Col 18): Unrecognized named-value: 'github'. Located at position 1 within expression:
-#     github.repository
-#
-# Not the input being wrong — the FILE being unloadable, so every step using this action died before
-# the container was built and none of the fourteen inputs mattered. Measured 2026-08-11 on the first
-# pull request this repository ever opened, and invisible to every local check because `yaml.safe_load`
-# reads them as ordinary strings and nothing but GitHub's own parser evaluates them.
-#
-# Describe the expression by NAME (`a github.repository expression`) and keep the copy-pasteable block
-# in README.md, which Actions never parses. A guard in the suite fails if one reappears.
+    description: "Path to the human-readable run timeline, when written."
+    value: ${{ steps.shard.outputs['log-path'] }}
+
 runs:
-  using: "docker"
-# THIS ACTION RUNS A PUBLISHED IMAGE. `image:` below names one exact artefact by digest, so
+  using: "composite"
+  steps:
+    - id: shard
+      name: "Run Shard in its contained image"
+      shell: bash
+      env:
+# THIS ACTION RUNS A PUBLISHED IMAGE. `SHARD_ACTION_IMAGE` below names one exact artefact by
+# digest, so
 # GitHub PULLS it instead of building 934 MB on your runner at the start of every job. The
 # `Dockerfile` beside this file still ships and still builds the same image: it is what you
 # read to audit what executes in your pipeline, and what you build if you would rather run
 # your own. The build-context paragraph above applies to that path rather than to this one.
-  image: "docker://ghcr.io/takyon236/shard@sha256:57014413f44eee64127f405704d4c6bbda06e0c26d1ea9f6edff2935883ce175"
-  # `args` is EXPLICIT and it is the whole defect this file carried until 2026-08-08: with no args
-  # block a container action runs the image's CMD, which is `--help`, so the action printed help,
-  # exited 0 — a passing check — and ignored every input above. See `shard/action.py`.
-  #
-  # One argument, because the interface is the environment: GitHub passes each input as INPUT_<NAME>,
-  # and `shard action` maps those to the subcommand and flags. A static args list cannot, since the
-  # three modes take different flags, and it cannot write $GITHUB_OUTPUT either.
-  args:
-    - "action"
+        SHARD_ACTION_IMAGE: "docker://ghcr.io/takyon236/shard@sha256:4c7b7cdddd77ce19e9e20e5dc63679451c628c42d7e4b776d5605fde5c4096dd"
+        INPUT_MODE: ${{ inputs.mode }}
+        INPUT_MODEL_ENDPOINT: ${{ inputs.model_endpoint }}
+        INPUT_MODEL: ${{ inputs.model }}
+        INPUT_API_KEY_ENV: ${{ inputs.api_key_env }}
+        INPUT_MAX_SPEND_USD: ${{ inputs.max_spend_usd }}
+        INPUT_MAX_MINUTES: ${{ inputs.max_minutes }}
+        INPUT_MAX_TOKENS: ${{ inputs.max_tokens }}
+        INPUT_SCAN: ${{ inputs.scan }}
+        INPUT_MAX_STEPS: ${{ inputs.max_steps }}
+        INPUT_HUNK_RADIUS: ${{ inputs.hunk_radius }}
+        INPUT_WITNESS_ENTRY: ${{ inputs.witness_entry }}
+        INPUT_BASE_REF: ${{ inputs.base_ref }}
+        INPUT_STATE_REPO: ${{ inputs.state_repo }}
+        INPUT_SLUG: ${{ inputs.slug }}
+        INPUT_FAIL_ON: ${{ inputs.fail_on }}
+        INPUT_OUT_DIR: ${{ inputs.out_dir }}
+        INPUT_GITHUB_TOKEN: ${{ inputs.github_token }}
+      run: |
+        set -euo pipefail
+
+        if [[ "${RUNNER_OS:-Linux}" != "Linux" ]]; then
+          echo "shard: the contained Action requires a Linux runner" >&2
+          exit 2
+        fi
+        if ! command -v docker >/dev/null 2>&1; then
+          echo "shard: Docker is required to launch the contained Action image" >&2
+          exit 2
+        fi
+
+        image_spec="$SHARD_ACTION_IMAGE"
+        if [[ "$image_spec" == "Dockerfile" ]]; then
+          image="shard-action-local:${GITHUB_RUN_ID:-0}-${GITHUB_RUN_ATTEMPT:-0}-${RANDOM}"
+          docker build --file "$GITHUB_ACTION_PATH/Dockerfile" --tag "$image" "$GITHUB_ACTION_PATH"
+        elif [[ "$image_spec" == docker://* ]]; then
+          image="${image_spec#docker://}"
+        else
+          echo "shard: action image must be Dockerfile or a docker:// digest reference" >&2
+          exit 2
+        fi
+
+        host_workspace="${GITHUB_WORKSPACE:?shard: GITHUB_WORKSPACE is required}"
+        host_workspace="$(realpath -e -- "$host_workspace")"
+        host_uid="$(id -u)"
+        host_gid="$(id -g)"
+        if [[ ! "$host_uid" =~ ^[0-9]+$ || ! "$host_gid" =~ ^[0-9]+$ ]]; then
+          echo "shard: runner uid/gid could not be represented for the output relay" >&2
+          exit 2
+        fi
+        handoff_key="$(od -An -N32 -tx1 /dev/urandom | tr -d '[:space:]')"
+        if [[ ! "$handoff_key" =~ ^[0-9a-f]{64}$ ]]; then
+          echo "shard: a 256-bit Action handoff key could not be generated" >&2
+          exit 2
+        fi
+        docker_args=(
+          run --rm --interactive
+          --cap-drop ALL --cap-add SYS_ADMIN
+          --group-add "$host_gid"
+          --security-opt seccomp=unconfined
+          --security-opt apparmor=unconfined
+          --volume "$host_workspace:/github/workspace"
+          --workdir /github/workspace
+          --env GITHUB_WORKSPACE=/github/workspace
+          --env RUNNER_TEMP=/tmp
+          --env GIT_CONFIG_COUNT=1
+          --env GIT_CONFIG_KEY_0=safe.directory
+          --env GIT_CONFIG_VALUE_0=/github/workspace
+          --env SHARD_ACTION_HANDOFF=1
+        )
+
+        input_names=(
+          INPUT_MODE INPUT_MODEL_ENDPOINT INPUT_MODEL INPUT_MAX_SPEND_USD
+          INPUT_MAX_MINUTES INPUT_MAX_TOKENS INPUT_SCAN INPUT_MAX_STEPS INPUT_HUNK_RADIUS
+          INPUT_WITNESS_ENTRY
+          INPUT_BASE_REF INPUT_STATE_REPO INPUT_SLUG INPUT_FAIL_ON INPUT_OUT_DIR
+          INPUT_GITHUB_TOKEN
+        )
+        for name in "${input_names[@]}"; do
+          docker_args+=(--env "$name")
+        done
+
+        key_name="${INPUT_API_KEY_ENV:-OPENROUTER_API_KEY}"
+        if [[ ! "$key_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+          echo "shard: api_key_env must name an environment variable" >&2
+          exit 2
+        fi
+        case "$key_name" in
+          SHARD_ID_"TOKEN"|INPUT_ID_"TOKEN"|INPUT_GITHUB_"TOKEN"|GITHUB_"TOKEN"|ACTIONS_*)
+            echo "shard: api_key_env names a reserved Action credential" >&2
+            exit 2
+            ;;
+        esac
+        # The caller-selected name is DATA inside the image, never an environment selector. Passing
+        # it directly let PYTHONPATH, LD_PRELOAD or PATH replace the trusted entrypoint before it read
+        # the handoff key. The fixed carrier is not interpreted by Python or the dynamic loader.
+        docker_args+=(--env "INPUT_API_KEY_ENV=$key_name")
+        if [[ -n "${!key_name+x}" ]]; then
+          export SHARD_ACTION_MODEL_API_KEY="${!key_name}"
+          docker_args+=(--env SHARD_ACTION_MODEL_API_KEY)
+        fi
+
+
+        github_names=(
+          GITHUB_API_URL GITHUB_EVENT_NAME GITHUB_REF GITHUB_REPOSITORY GITHUB_REPOSITORY_ID
+          GITHUB_RUN_ATTEMPT GITHUB_RUN_ID GITHUB_RUN_NUMBER GITHUB_SHA
+        )
+        for name in "${github_names[@]}"; do
+          if [[ -n "${!name+x}" ]]; then
+            docker_args+=(--env "$name")
+          fi
+        done
+
+        requested_out="${INPUT_OUT_DIR:-shard-out}"
+        if [[ ! "$requested_out" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]]; then
+          echo "shard: out_dir must be a workspace-relative path of ordinary path components" >&2
+          exit 2
+        fi
+        case "/$requested_out/" in
+          */../*|*/./*)
+            echo "shard: out_dir may not contain '.' or '..' components" >&2
+            exit 2
+            ;;
+        esac
+        host_out="$host_workspace"
+        IFS='/' read -r -a out_parts <<< "$requested_out"
+        for part in "${out_parts[@]}"; do
+          candidate="$host_out/$part"
+          if [[ -L "$candidate" ]]; then
+            echo "shard: out_dir crosses a symlink in the checkout: $requested_out" >&2
+            exit 2
+          fi
+          if [[ -e "$candidate" && ! -d "$candidate" ]]; then
+            echo "shard: out_dir crosses a non-directory in the checkout: $requested_out" >&2
+            exit 2
+          fi
+          host_out="$candidate"
+        done
+        mkdir -p -- "$host_out"
+        resolved_out="$(realpath -e -- "$host_out")"
+        if [[ "$resolved_out" != "$host_workspace/"* ]]; then
+          echo "shard: out_dir resolves outside the checkout: $requested_out" >&2
+          exit 2
+        fi
+        if [[ -n "$(find -P "$host_out" -mindepth 1 -print -quit)" ]]; then
+          echo "shard: out_dir is not empty; refusing to mix this run with older evidence" >&2
+          exit 2
+        fi
+        chgrp "$host_gid" "$host_out"
+        chmod 0770 "$host_out"
+
+        host_temp="$(realpath -e -- "${RUNNER_TEMP:-/tmp}")"
+        publication_root="$(mktemp -d "$host_temp/shard-action-publish.XXXXXX")"
+        chgrp "$host_gid" "$publication_root"
+        chmod 0770 "$publication_root"
+        resolved_publication_root="$(realpath -e -- "$publication_root")"
+        docker_args+=(--volume "$host_out:/github/workspace/$requested_out")
+        # `actionsnapshot` republishes descriptor-validated bytes before exposing their paths. This
+        # dedicated host directory is mounted at the IDENTICAL absolute path, so a later runner step
+        # can open every declared output without exposing the rest of RUNNER_TEMP to customer code.
+        docker_args+=(--volume "$publication_root:$publication_root")
+        docker_args+=(--env "SHARD_ACTION_SNAPSHOT_ROOT=$publication_root")
+
+        relay_root="$(mktemp -d /tmp/shard-relay.XXXXXX)"
+        cleanup_relay() {
+          if [[ "$relay_root" != /tmp/shard-relay.?????? ]]; then
+            echo "shard: refusing to remove an unexpected relay path: $relay_root" >&2
+            return
+          fi
+          command rm -rf -- "$relay_root"
+        }
+        trap cleanup_relay EXIT
+        # The reviewing container only appends to two files created below. Directory write authority
+        # is unnecessary on a rootful daemon; rootless container root remains the host owner, so the
+        # keyed manifest — not this mode — is the authority against replacement.
+        chmod 0710 "$relay_root"
+        docker_args+=(--volume "$relay_root:/github/file-commands")
+        relay_files=()
+        relay_identities=()
+        output_relay=""
+        if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+          output_relay="$relay_root/output"
+          : > "$output_relay"
+          chmod 0620 "$output_relay"
+          relay_files+=("$output_relay")
+          relay_identities+=("$(stat -c '%d:%i:%u:%g:%h:%f' -- "$output_relay")")
+          docker_args+=(--env GITHUB_OUTPUT=/github/file-commands/output)
+        fi
+        summary_relay=""
+        if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+          summary_relay="$relay_root/summary"
+          : > "$summary_relay"
+          chmod 0620 "$summary_relay"
+          relay_files+=("$summary_relay")
+          relay_identities+=("$(stat -c '%d:%i:%u:%g:%h:%f' -- "$summary_relay")")
+          docker_args+=(--env GITHUB_STEP_SUMMARY=/github/file-commands/summary)
+        fi
+        relay_root_identity="$(stat -c '%d:%i:%u:%g:%h:%f:%Y:%Z' -- "$relay_root")"
+        # The key crosses stdin before any repository process starts. It is intentionally absent from
+        # argv and the environment: Linux can retain an unset initial environment value in /proc.
+        if printf '%s\n' "$handoff_key" | docker "${docker_args[@]}" "$image" action; then
+          shard_status=0
+        else
+          shard_status=$?
+        fi
+        unset SHARD_ACTION_MODEL_API_KEY
+        verify_handoff() {
+          local emit="${1:-}"
+          local verify_args=(
+            run --rm --interactive --network none
+            --cap-drop ALL --security-opt no-new-privileges
+            --group-add "$host_gid"
+            --volume "$publication_root:/shard-publish:ro"
+            --volume "$relay_root:/shard-relay:ro"
+            --entrypoint python "$image" -m shard.actionhandoff
+            /shard-publish /shard-relay
+          )
+          if [[ -n "$emit" ]]; then
+            verify_args+=(--emit "$emit")
+          fi
+          printf '%s\n' "$handoff_key" | docker "${verify_args[@]}"
+        }
+        ownership_status=0
+        # Docker has reaped the reviewing container and its descendants before this path transition.
+        # Validate EVERY relay identity first: chmod follows a path and must never touch a substituted
+        # symlink or hard link. The HMAC remains authoritative for expected in-place byte changes.
+        if [[ -L "$relay_root" || ! -d "$relay_root" \
+              || "$(stat -c '%d:%i:%u:%g:%h:%f:%Y:%Z' -- "$relay_root")" \
+                 != "$relay_root_identity" ]]; then
+          echo "shard: the command-file relay directory was replaced while the contained run executed" >&2
+          ownership_status=1
+        else
+          for index in "${!relay_files[@]}"; do
+            relay_file="${relay_files[$index]}"
+            if [[ -L "$relay_file" || ! -f "$relay_file" \
+                  || "$(stat -c '%d:%i:%u:%g:%h:%f' -- "$relay_file")" \
+                     != "${relay_identities[$index]}" ]]; then
+              echo "shard: a command-file relay was replaced while the contained run executed" >&2
+              ownership_status=1
+            fi
+          done
+        fi
+        if [[ "$ownership_status" == 0 ]]; then
+          for relay_file in "${relay_files[@]}"; do
+            if ! chmod 0640 "$relay_file"; then
+              echo "shard: a command-file relay could not be opened for verification" >&2
+              ownership_status=1
+            fi
+          done
+          if [[ "$ownership_status" == 0 ]] && ! chmod 0750 "$relay_root"; then
+            echo "shard: the command-file relay could not be opened for verification" >&2
+            ownership_status=1
+          fi
+        fi
+        if [[ "$ownership_status" != 0 ]]; then
+          :
+        elif [[ -L "$host_out" || ! -d "$host_out" \
+              || "$(realpath -e -- "$host_out")" != "$resolved_out" \
+              || "$(stat -c '%u:%g' -- "$host_out")" != "$host_uid:$host_gid" ]]; then
+          echo "shard: the host out_dir was replaced while the contained run executed" >&2
+          ownership_status=1
+        elif [[ -L "$publication_root" || ! -d "$publication_root" \
+              || "$(realpath -e -- "$publication_root")" != "$resolved_publication_root" \
+              || "$(stat -c '%u:%g' -- "$publication_root")" != "$host_uid:$host_gid" ]]; then
+          echo "shard: the publication directory was replaced while the contained run executed" >&2
+          ownership_status=1
+        # The reviewing container and every descriptor it retained are gone now. This second container
+        # gets read-only mounts and authenticates the exact snapshots and GitHub command-file bytes
+        # before one byte is chowned or relayed to a later workflow step.
+        elif ! verify_handoff; then
+          echo "shard: the contained run's authenticated handoff failed; no outputs were forwarded" >&2
+          ownership_status=1
+        elif ! docker run --rm --network none --cap-drop ALL --cap-add CHOWN \
+            --security-opt no-new-privileges --group-add "$host_gid" \
+            --volume "$host_out:/shard-output" \
+            --volume "$publication_root:/shard-publish" \
+            --entrypoint sh "$image" -c '
+              set -eu
+              bad="$(find -P /shard-output /shard-publish -xdev -mindepth 1 \
+                ! -type d ! -type f -print -quit)"
+              if [ -n "$bad" ]; then
+                echo "shard: output relay contains a non-file artefact" >&2
+                find -P /shard-output /shard-publish -xdev -depth -mindepth 1 -delete
+                exit 1
+              fi
+              bad="$(find -P /shard-output /shard-publish -xdev -type f \
+                ! -links 1 -print -quit)"
+              if [ -n "$bad" ]; then
+                echo "shard: output relay contains a multiply-linked artefact" >&2
+                find -P /shard-output /shard-publish -xdev -depth -mindepth 1 -delete
+                exit 1
+              fi
+              # The first read-only verifier has authenticated every byte and the reviewing container
+              # is gone. Preserve executable bits while making those same files readable after they
+              # return to the runner owner/group for the authenticated relay reads below.
+              find -P /shard-output /shard-publish -xdev -mindepth 1 -type d \
+                -exec chmod g+rx -- {} +
+              find -P /shard-output /shard-publish -xdev -mindepth 1 -type f \
+                -exec chmod g+r -- {} +
+              output_uid="$(stat -c "%u" -- /shard-output)"
+              output_gid="$(stat -c "%g" -- /shard-output)"
+              publish_uid="$(stat -c "%u" -- /shard-publish)"
+              publish_gid="$(stat -c "%g" -- /shard-publish)"
+              for owner in "$output_uid" "$output_gid" "$publish_uid" "$publish_gid"; do
+                case "$owner" in ""|*[!0-9]*) exit 1 ;; esac
+              done
+              chown -R --no-dereference -- "$output_uid:$output_gid" /shard-output
+              chown -R --no-dereference -- "$publish_uid:$publish_gid" /shard-publish
+            '; then
+          ownership_status=1
+        fi
+        if [[ "$ownership_status" == 0 ]]; then
+          if ! bad_owner="$(find -P "$host_out" "$publication_root" -xdev \
+              \( ! -uid "$host_uid" -o ! -gid "$host_gid" \) -print -quit)"; then
+            echo "shard: runner ownership of the output relay could not be verified" >&2
+            ownership_status=1
+          elif [[ -n "$bad_owner" ]]; then
+            echo "shard: output relay ownership did not return to the runner: $bad_owner" >&2
+            ownership_status=1
+          elif ! unreadable="$(find -P "$host_out" "$publication_root" -xdev \
+              \( -type d ! -perm -u=rx -o -type f ! -perm -u=r \) -print -quit)"; then
+            echo "shard: runner readability of the output relay could not be verified" >&2
+            ownership_status=1
+          elif [[ -n "$unreadable" ]]; then
+            echo "shard: output relay is not readable by the runner: $unreadable" >&2
+            ownership_status=1
+          fi
+        fi
+        if [[ "$ownership_status" != 0 ]]; then
+          shard_status=2
+        fi
+        relay_status=0
+        if [[ "$ownership_status" == 0 ]]; then
+          if [[ -n "$output_relay" ]]; then
+            if ! verify_handoff output >> "$GITHUB_OUTPUT"; then
+              echo "shard: authenticated outputs could not reach $GITHUB_OUTPUT" >&2
+              relay_status=1
+            fi
+          fi
+          if [[ -n "$summary_relay" ]]; then
+            if ! verify_handoff summary >> "$GITHUB_STEP_SUMMARY"; then
+              echo "shard: authenticated summary could not reach $GITHUB_STEP_SUMMARY" >&2
+              relay_status=1
+            fi
+          fi
+        fi
+        unset handoff_key
+        if [[ "$relay_status" != 0 ]]; then
+          shard_status=2
+        fi
+        exit "$shard_status"

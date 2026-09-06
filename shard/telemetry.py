@@ -114,8 +114,9 @@ def _safe_args(key: str) -> dict:
     is for — which tools ran, with how many arguments, how big — without putting any of it in a file
     the customer may forward to a third-party observability stack.
 
-    A customer who wants the values has them: the full journal ships behind the verbose flag, in the
-    same directory. This is the artefact that is safe by default, not the only artefact.
+    A customer who needs the values can retain the full journal on a direct CLI run with
+    ``shard diff --journal-path <private-path>``. It never enters ``--out-dir``. This is the artefact
+    that is safe by default, not the only artefact.
     """
     _, _, raw = (key or "").partition(":")
     if not raw:
@@ -254,6 +255,16 @@ def _llm_usage(events: list[dict], gaps: list[str]) -> dict:
             llm["output_per_request"] = round(out_tokens / len(reqs), 1)
         if isinstance(out_tokens, int) and secs and sum(secs) > 0:
             llm["output_per_second"] = round(out_tokens / sum(secs), 1)
+        token_gaps = sum(r.get("tokens_reported") is False for r in reqs)
+        cost_gaps = sum(r.get("cost_reported") is False for r in reqs)
+        if token_gaps:
+            llm["token_unreported_requests"] = token_gaps
+            gaps.append(f"token usage was not reported for {token_gaps} model request(s) — token "
+                        "totals are a floor")
+        if cost_gaps:
+            llm["cost_unreported_requests"] = cost_gaps
+            gaps.append(f"cost was not reported for {cost_gaps} model request(s) — dollar totals "
+                        "are a floor")
     else:
         gaps.append("no per-request token accounting in this journal (no `llm_request` events) — "
                     "the run's total is in the report's cost line, but it cannot be attributed to a step")
@@ -515,7 +526,8 @@ def render_log(source: Any) -> str:
 
     out += ["", "=" * 72,
             "Arguments and tool output are described, never quoted: this file is safe to forward.",
-            "For the full transcript, re-run with the verbose flag and read shard_journal.jsonl.", ""]
+            "Direct CLI only: retain a full transcript with "
+            "shard diff --journal-path <private-path>.", ""]
     return "\n".join(out)
 
 

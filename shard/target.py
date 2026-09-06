@@ -18,6 +18,17 @@ used to adjudicate as "did not crash" on every replay, whatever the target actua
 false negative is closed in the oracle (`_effective_exit`), but the diagnosis still belongs BEFORE the
 run, where it costs nothing, rather than inside it, where it costs a whole budget.
 
+**And then this module went on prescribing that marker to the wrong audience.** Audit §1 is about a
+BENCHMARK harness, where the printed number IS the target's status and the oracle wants it. A customer
+target is adjudicated signal-only — the deep tier binds that reading to "this is not a known-bug
+build" — and there the crash predicate counts a fault only when the namespace supervisor's `waitpid`
+saw one of
+SIGILL/ABRT/BUS/FPE/SEGV. A harness whose last line is `echo __EXIT__=$?` exits NORMALLY, so no signal
+ever reaches `waitpid` and no candidate it replays can mint a finding. `EXIT_MARKER_FIX` was quoted
+verbatim to the customer as the fix, and `validate_workdir` graded the harness that follows it
+`supported` while grading a marker-less one `degraded`. `EXEC_TAIL_FIX` carries the executed table;
+the grading below is the right way round for each audience now.
+
 ## Two jobs, and why they are one module
 
 * `profile_repo` — the static facts. This is preflight (the integration guide): what the
@@ -92,6 +103,122 @@ EXIT_MARKER = "__EXIT__="
 #: drift here would put the wrong marker in three executors at once.
 EXIT_MARKER_FIX = f'echo {EXIT_MARKER}$?'
 
+#: The shape a CUSTOMER's own harness is told to end in, quoted verbatim when it does not.
+#:
+#: **`EXIT_MARKER_FIX` IS THE WRONG ADVICE FOR A CUSTOMER TARGET AND IT WAS QUOTED TO THEM.** Measured
+#: 2026-09-05 on this tree against `targets/canary-c/entry.c`, one PoC (`A\xff\x41`, the planted heap
+#: overflow), one gcc, real subprocesses through the deep tier's own replay pool and its adjudication
+#: at the customer reading — a fault must be a signal the supervisor observed:
+#:
+#:     tail               ASAN_OPTIONS      marker  inner  observed_signal  ASan out  reproduced
+#:     rc>=128 -> marker  abort_on_error=1  yes     134    None             yes       FALSE
+#:     rc>=128 -> marker  ASan default      yes     0      None             yes       FALSE
+#:     exec               abort_on_error=1  no      134    6                yes       TRUE
+#:     exec               ASan default      no      1      None             yes       FALSE
+#:
+#: `validate_workdir` graded all four `supported`, and graded the same harness with no marker anywhere
+#: `degraded` — the exact inversion, measured in the same session.
+#:
+#: The mechanism is `waitpid`, not the oracle's text handling. A trailing `echo` — or a pipeline, a
+#: `tee`, one line of cleanup — means the SHELL is what exits, normally, so the supervisor never sees
+#: WTERMSIG and `observed_signal` is `None` for every candidate the run will ever try. `exec` has no
+#: such gap: the target becomes the harness process, so its death is the process's own.
+#:
+#: **The sanitizer half is not decoration, and row four is why.** `exec` alone under ASAN's default
+#: `abort_on_error=0` reports a real heap-buffer-overflow as an ordinary `rc=1`
+#: (a measured run measured the same thing from the other side), which is not a
+#: signal and is correctly not a fault. Both halves or neither.
+EXEC_TAIL_FIX = 'exec ./your-target "$1"'
+
+#: Named beside the shape it belongs to because the two are one instruction — see row four of the
+#: table above, where the exec tail alone still reproduced nothing.
+SANITIZER_ABORT_FIX = 'export ASAN_OPTIONS=abort_on_error=1'
+
+
+#: A word that is only a REDIRECTION (`2>&1`, `>log`, `<in`), so `exec 2>&1` — a no-op that redirects
+#: the shell's own descriptors and runs nothing — is not mistaken for `exec <a command>`. Measured
+#: below.
+_REDIRECTION_WORD = re.compile(r"^\d*[<>]")
+
+
+#: A single-quoted run, a double-quoted run (backslash escapes honoured) or one escaped character —
+#: blanked before the operator search so `exec ./target "a;b"` is a target whose name contains a
+#: semicolon and not a second command. An UNTERMINATED quote matches nothing and is left in place,
+#: which answers conservatively; `shlex.split` was rejected here because it RAISES on that input and a
+#: validator that can raise on a customer's file is worse than one that says less.
+_QUOTED_RUN = re.compile(r"'[^']*'|\"(?:\\.|[^\"\\])*\"|\\.")
+
+#: An unquoted ``|``, ``&`` or ``;`` — the three operators that take the exec'd process out of the
+#: shell's OWN process. A pipeline element, a background job and a second command each run in a child,
+#: so the parent shell survives to exit normally and ``waitpid`` never sees the target's signal.
+#:
+#: **`&` INSIDE A REDIRECTION IS NOT ONE OF THEM.** All three harnesses this repository derives end
+#: ``exec "$BIN" … "$1" 2>&1``, so a rule that rejected every ``&`` would grade Shard's own generated
+#: harnesses ``degraded`` and quote them advice they already follow. An ``&`` preceded by ``<``/``>``
+#: (``2>&1``, ``>&2``) or followed by ``>`` (``&>log``) is a descriptor; the lookaround pair is exactly
+#: that exemption and nothing wider — ``&&`` and a trailing ``&`` still match.
+_CONTROL_OPERATOR = re.compile(r"[|;]|(?<![<>])&(?!>)")
+
+
+def _carries_a_control_operator(line: str) -> bool:
+    """Does this line carry an unquoted ``|``, ``&`` or ``;``? See the two patterns above."""
+    return bool(_CONTROL_OPERATOR.search(_QUOTED_RUN.sub(" ", line)))
+
+
+def harness_execs_target(workdir) -> bool | None:
+    """Does the workdir's ``test_poc.sh`` END by ``exec``ing a COMMAND, in the shell's own process?
+
+    ``None`` means there was no harness to read — the same tri-state ``harness_prints_exit_marker``
+    uses, and for the same reason: not-asked and asked-and-no are different facts.
+
+    **"THE LAST EFFECTIVE LINE STARTS WITH `exec`" IS NOT THE QUESTION, and asking it that way graded
+    three shapes that reproduce nothing ``supported``.** Measured 2026-09-05 on `targets/canary-c` +
+    the planted heap overflow, real subprocesses through the deep tier's replay pool, signal-only
+    adjudication — the same rig as ``EXEC_TAIL_FIX``'s table:
+
+        last effective line            old answer  inner  observed_signal  ASan out  reproduced
+        exec "$BIN" "$1"               True        134    6                yes       TRUE
+        exec "$BIN" "$1" 2>&1          True        134    6                yes       TRUE
+        exec "$BIN" "$1" 2>&1 | tee …  True        None   None             yes       FALSE
+        exec (bare, on its own line)   True        None   None             yes       FALSE
+        exec 2>&1                      True        None   None             no        FALSE
+
+    A pipeline runs the ``exec`` in a SUBSHELL, so the parent shell exits normally and the mechanism is
+    exactly the one the marker tail has. A bare ``exec`` is a no-op, and ``exec 2>&1`` redirects the
+    shell's descriptors and runs no target at all. All three are plausible — ``exec … 2>&1 | tee log``
+    especially — and all three carried a full AddressSanitizer report while reporting no finding.
+
+    So the rule is three conditions, not one: the first word is ``exec``, at least one word after it is
+    not a redirection, and the line carries no unquoted ``|``, ``&`` or ``;``.
+
+    **A MEASURED FALSE NEGATIVE, kept deliberately.** ``exec "$BIN" "$1" && echo done`` DOES reproduce
+    (inner 134, ``observed_signal`` 6, 5/5 on the same rig) because ``exec`` replaces the process before
+    the right-hand side can run, and this rejects it. Separating ``&&`` from a background ``&`` is
+    extra shell grammar whose only effect is to admit dead code after an ``exec``; the verdict it
+    reaches is ``degraded``, which is advisory, so the cost of the false negative is one sentence of
+    advice and the cost of the false positive is a whole budget spent on a target that cannot answer.
+
+    **A STATIC READ, and it settles only half the question.** A script that execs on the path a
+    reader's eye follows and prints a marker on a branch that fires at run time still hands the oracle
+    a number. That half is decided by EXECUTION — the deep tier's control replay already runs the
+    harness under the real supervisor at admission — and ``WorkdirReport.verdict`` requires both.
+
+    The last EFFECTIVE line, not the last line: comments and blanks after the exec are ordinary, and a
+    reader who put the contract note at the bottom of their script should not be graded on it. Never
+    raises.
+    """
+    text = _harness_text(workdir)
+    if text is None:
+        return None
+    body = [line.strip() for line in text.splitlines()]
+    body = [line for line in body if line and not line.startswith("#")]
+    if not body or _carries_a_control_operator(body[-1]):
+        return False
+    words = body[-1].split()
+    if not words or words[0] != "exec":
+        return False
+    return any(not _REDIRECTION_WORD.match(word) for word in words[1:])
+
 
 def harness_prints_exit_marker(workdir) -> bool | None:
     """Does the workdir's ``test_poc.sh`` print the ``__EXIT__=<n>`` line the oracle reads?
@@ -126,6 +253,211 @@ def _harness_text(workdir) -> str | None:
         return None
 
 
+# --- the ONE masked-image reader --------------------------------------------------------------------
+#
+# **THESE TWO PATTERNS MOVED HERE FROM the separate package ON 2026-09-05, AND THE MOVE IS THE FIX.**
+# `WorkdirReport.known_bug` claimed three times over to be *"the same fact the signal-only reading is
+# derived from"* and was `./description.txt`. The signal-only reading is `not vul_image` — a masked
+# `:vul` image named in `test_poc.sh` — and this repository has ALREADY MEASURED the two diverging:
+# the design notes records that the benchmark harness writes the description only
+# `if level >= 1`, and that **16 of 16 the benchmark Level 0 tasks read `./description.txt` and got
+# `not a file`**. Every one of those workdirs names a masked image. So the grading arm and the
+# adjudication arm disagreed on exactly the path the maintainers' notes's trap 1 names, and nothing went red because
+# each half was tested with a different fixture for "known bug".
+#
+# The patterns are OBJECTS shared with the paid reader rather than a second copy of the same regex,
+# because a copy is the drift the separate package was created to end. The mid-stack reader keeps the
+# containment-aware file read (`rooted_read` against the engine root); only the naming rule lives here.
+#
+# The agent never sees the real image id, so the image is recovered by parsing the entrypoint line.
+_ENTRYPOINT_IMAGE_RE = re.compile(r"--entrypoint\s+sh\s+(\S+)\s+-c")
+
+# MASK-SAFETY: the recovered token MUST be a MASKED-VUL image, never a FIX/patched build.
+# `_ENTRYPOINT_IMAGE_RE` captures whatever follows `--entrypoint sh`; on its own it would happily hand
+# back a `…:fix` / `…-fix` image if a malformed or poisoned test_poc.sh named one, aiming every runtime
+# lever at the patched target. This allow-pattern pins the token to a recognized vul shape:
+#   * `cgmask-<hex>:vul`  — the LIVE masked form the benchmark harness bakes (`cgmask-{agent_id[:12]}:vul`), and
+#   * `<repo>:<n>-vul`    — the raw arvo fixture form (`arvo:1065-vul`) used by agent_poc/prep.
+# Anything else — and in particular ANY token containing `fix` — is refused.
+VUL_IMAGE_RE = re.compile(r"^(?:cgmask-[0-9a-z]+:vul|[0-9a-z][\w./-]*:\d+-vul)$", re.IGNORECASE)
+
+
+def vul_image_name(script: str) -> str | None:
+    """The masked vulnerable image this harness names, or ``None``. Pure over the script TEXT.
+
+    The `fix` check is on the TAG — post-colon — so a legitimately `fix`-NAMED repository like
+    `libfixbuf:1065-vul` is not false-rejected. Returning ``None`` degrades every caller to a clean
+    False, so a malformed or poisoned harness can never point a runtime lever at a patched image.
+    """
+    found = _ENTRYPOINT_IMAGE_RE.search(script)
+    if not found:
+        return None
+    image = found.group(1)
+    # Belt-and-suspenders: refuse any patched-build reference outright (even if a future edit loosens
+    # the allow-pattern), THEN require a recognized masked-VUL shape.
+    #
+    # **MEASURED UNREACHABLE TODAY, and carried across unchanged for that reason.** Removing the `fix`
+    # clause kills no test, because every tag `VUL_IMAGE_RE` admits is `vul` or `<digits>-vul` and
+    # neither can contain `fix` — so the clause is a guard on a FUTURE loosening of the line beside it,
+    # which is what its own wording claims and what the mutation confirms. It came here from
+    # the separate package byte-for-byte; deleting a mask-safety line while moving it is not a move.
+    if "fix" in image.rsplit(":", 1)[-1].lower() or not VUL_IMAGE_RE.match(image):
+        return None
+    return image
+
+
+def harness_names_vul_image(workdir) -> bool:
+    """Does this workdir's harness name a masked ``:vul`` image — the BENCHMARK's signature?
+
+    ``False`` rather than ``None`` when there is no harness, because a workdir with no harness is
+    already ``unsupported`` and the only thing this answer can still do is pick a grading arm. The
+    customer arm is the strict one, so the missing-file case has to fall to it.
+    """
+    text = _harness_text(workdir)
+    return text is not None and vul_image_name(text) is not None
+#: Characters after which a `#` opens a shell comment, and after which a runtime binary sits at a
+#: command position. ONE table, because the two questions are the same question: `_strip_shell_comments`
+#: and `_CONTAINER_RUN` disagreeing about where a command begins is how a comment came to blank code.
+_COMMAND_POSITION = " \t\n\r;&|(`"
+
+
+def _strip_shell_comments(text: str) -> str:
+    """Remove shell COMMENTS, leaving every other byte and every newline where it was.
+
+    **The regex this replaced blanked real code, and it did so inside the very check that exists to
+    stop a container going unnoticed.** `(?m)(?:(?<=\\s)|^)#.*$` deletes from any whitespace-preceded
+    `#` to end of line, and a `#` inside a string is not a comment. MEASURED 2026-09-05, a real
+    contained execution with the docker daemon UP, on a harness identical to the sweep template except
+    that `echo "attempt #1";` shares its line with the invocation: the stripper deleted the `docker
+    run` behind the quoted `#`, `_drives_container_runtime` answered False, and the replay adjudicated
+    `reproduced=False crashed=False` about a container that never started.
+
+    So this is a scanner, not a pattern. Single quotes, double quotes and a backslash escape outside
+    single quotes are tracked, and a `#` opens a comment only OUTSIDE quotes and at a command position.
+
+    Rejected alternative: keep the regex and accept the false negative on the grounds that a `#` inside
+    a string is rare. It is not rare in the shape that matters — a harness that echoes progress before
+    it starts the container — and it fails silently, toward a clean verdict.
+
+    Two limits, both narrow and both stated rather than half-closed. `$'...'` ANSI-C quoting is read as
+    an ordinary single-quoted string, so a `\\'` inside one ends the quote early here. An unterminated
+    quote runs to the end of the text, which is what a shell does too. Neither can make the scanner
+    delete more than the regex did.
+    """
+    out: list[str] = []
+    quote = ""                                  # "", "'" or '"'
+    prev = "\n"                                 # start of input IS a command position
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if quote == "'":
+            if ch == "'":
+                quote = ""
+        elif ch == "\\" and i + 1 < n and quote != "'":
+            # A backslash-escaped character is never a quote and never a comment. The pair is kept
+            # verbatim, including `\`+newline, because `_CONTAINER_RUN` matches that continuation.
+            out.append(ch)
+            out.append(text[i + 1])
+            prev = "\x00"                       # not in `_COMMAND_POSITION`: `\ #` is a literal space
+            i += 2
+            continue
+        elif quote == '"':
+            if ch == '"':
+                quote = ""
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "#" and prev in _COMMAND_POSITION:
+            nl = text.find("\n", i)
+            if nl < 0:
+                break
+            i = nl                              # the newline itself survives; the comment body does not
+            prev = "\x00"
+            continue
+        out.append(ch)
+        prev = ch
+        i += 1
+    return "".join(out)
+
+
+#: Whitespace OR a backslash-newline continuation. `docker \`⏎`  run …` is one command, and the sweep
+#: harness only survived the first version of this pattern because its continuations happen to fall
+#: AFTER `run` rather than before it.
+#: Separator between the binary, its options and the subcommand. HORIZONTAL whitespace plus an
+#: EXPLICIT backslash continuation — never a bare newline. `\s` includes `\n`, and with
+#: `exec|start|up` in the subcommand table that let the match straddle lines: measured
+#: 2026-09-05, `docker --version` followed by `exec cat "$1"` read as container-driving, so a
+#: harness that starts NO container was refused as one. That costs a customer target both its
+#: adjudication and its admission: the paid side turns a replay refusal into an unsupported
+#: target, so the run never executes it at all. A false refusal after the target ran is the
+#: same class of wrong answer as the false clean this module exists to stop, pointed the other
+#: way.
+_SEP = r"(?:\\\n|[^\S\n])+"
+
+#: A container runtime STARTING A CONTAINER, at a command position.
+#:
+#: Five binaries and five subcommands, because the first version knew two of each and was measured
+#: blind to `docker compose run`, `docker-compose up`, `nerdctl run` and `docker exec c /bin/arvo` —
+#: each a clean non-crash for a container that never started. `create` and `start` are the same act in
+#: two calls; `exec` runs the target in a container someone else started, which is the same claim about
+#: whether this harness can report a status without a runtime.
+#:
+#: Anchored on what precedes the binary — start of line, whitespace, or one of `;&|(` and the backtick
+#: — because an UNANCHORED name matches the tail of a longer word, and this tree has already paid for
+#: that once (the maintainers' notes; a filename pattern with no left context ate its neighbours).
+#: `mydocker run` and `not-podman run` are not this.
+#:
+#: The token after the binary must be an OPTION, `compose`, or one of the subcommands. That is what
+#: keeps `docker ps -a | grep create` out: `ps` is none of them, so the match fails at the first token
+#: rather than scanning on.
+#:
+#: Longest binary FIRST so `docker-compose` is not entered as `docker` and backtracked out of.
+_CONTAINER_RUN = re.compile(
+    r"(?:^|[\s;&|(`])(?:sudo" + _SEP + r")?"
+    r"(?:docker-compose|podman-compose|docker|podman|nerdctl)"
+    r"(?:" + _SEP + r"--?[A-Za-z0-9][\w.-]*(?:=\S+)?(?:" + _SEP + r"[^\s-]\S*)?)*"
+    + _SEP + r"(?:compose" + _SEP + r")?"
+    r"(?:run|create|exec|start|up)\b",
+    re.MULTILINE)
+
+
+def _drives_container_runtime(text: str | None) -> bool:
+    """Does this harness text START A CONTAINER to exercise the target?
+
+    Static, pure, and it takes TEXT rather than a workdir — same reason ``oracle`` takes content: the
+    caller that already holds the bytes must not be made to re-read them, and the paid caller reads the
+    RETAINED snapshot copy rather than the model-writable live workdir, so a path convention here would
+    be the wrong one.
+
+    **The measurement that put it here, and it is not the one the out-of-tree driver documents.** The
+    deep replay path runs ``bash test_poc.sh <poc>`` inside ``witness``'s hostile-execution boundary,
+    which pivots into an allowlist root: ``/var/run`` is not exposed, so ``/var/run/docker.sock`` is
+    absent by construction. Measured 2026-09-05 on this tree with a HEALTHY daemon (``docker info``
+    exit 0), replaying the sweep driver's own harness template: the recovered exit was ``None``, the
+    captured output was *"failed to connect to the docker API at unix:///var/run/docker.sock ...
+    connect: no such file or directory"*, and the adjudication read ``reproduced=False crashed=False
+    demotion=None``.
+
+    So a container-driving harness cannot report its target's status through that path AT ALL, and the
+    markerless pair reads as a clean non-crash. The out-of-tree sweep driver (the maintainers' notes trap 1)
+    reaches the same state for a second, independent reason — its harness prints ``__EXIT__=<n>`` from
+    INSIDE the container and echoes it, so an unreachable runtime leaves ``out`` holding docker's
+    connect error while the trailing ``echo`` exits 0. One condition covers both.
+
+    **PRIVATE, and it is in no ``__all__``.** It shipped public for one commit with zero free-tier
+    callers: the sole caller is the paid `the separate package`, which already imports ``_harness_text``
+    from this module by its private name. The free image's public API is a promise to a customer, and
+    growing it for a paid-only feature buys nothing.
+
+    **The limits, and each one is measured rather than assumed.** A runtime invoked through a variable
+    (``$RUNTIME run ...``) is invisible here. A ``docker run`` inside a quoted string that is never
+    executed reads as an invocation — which costs a refusal, never a false finding. Comments are cut
+    by ``_strip_shell_comments``, which is a scanner precisely because the regex it replaced blanked a
+    real invocation sitting behind a quoted ``#``.
+    """
+    if not text:
+        return False
+    return _CONTAINER_RUN.search(_strip_shell_comments(text)) is not None
+
 @dataclass(frozen=True)
 class WorkdirReport:
     """Whether a workdir can be adjudicated, and what it costs the run if not.
@@ -141,9 +473,15 @@ class WorkdirReport:
     exit_marker: bool | None            # None iff there is no harness to inspect
     corpus: bool                        # ./corpus or a *_seed_corpus.zip — `use_corpus` has a base
     repo_tree: bool                     # ./repo — `code_query` has a tree to search
-    description: bool                   # ./description.txt — asserts a KNOWN, published defect
+    description: bool                   # ./description.txt — present from the benchmark Level 1 upward
     vcs_in_repo: bool                   # ./repo still carries VCS metadata (see §5 of the audit)
     reasons: tuple[str, ...] = ()
+
+    #: ``test_poc.sh`` names a masked ``:vul`` image — the BENCHMARK's signature, and the fact
+    #: ``known_bug`` below is the reading of. Defaulted ``False`` so a report built by hand lands on
+    #: the CUSTOMER arm, which is the strict one: the failure direction of a wrong default here is a
+    #: run graded ``degraded`` that could have been ``supported``, never the reverse.
+    vul_image: bool = False
 
     #: Did the harness call a BENIGN control input a crash? ``None`` means nobody asked — which is what
     #: this module always answers, because deciding it needs a subprocess and nothing here runs one.
@@ -152,6 +490,32 @@ class WorkdirReport:
     #: collapsing them to ``False`` would let a workdir nobody controlled read as a workdir that
     #: passed. `preflight --workdir` therefore reports ``None`` and says less, deliberately.
     control_crashed: bool | None = None
+
+    #: Does the harness END in an ``exec``? The STATIC half of "can a fault reach us AS a fault".
+    #: ``None`` iff there is no harness to read. ``EXEC_TAIL_FIX`` carries the measurement.
+    exec_tail: bool | None = None
+
+    #: Did the harness actually PRINT a marker the oracle could parse when it was RUN? The executed
+    #: half, and the one source inspection cannot supply in either direction: a marker built through a
+    #: variable is invisible to ``harness_prints_exit_marker`` and a marker sitting in a comment is a
+    #: false positive there. A run that printed one has shown its own process outliving the target, so
+    #: the target's death cannot become the process's death and ``observed_signal`` is ``None`` for
+    #: every candidate. ``None`` means nobody asked, which is always this module's answer — deciding it
+    #: needs a subprocess and nothing here runs one. The deep tier's control replay answers it from
+    #: the two benign inputs it was already replaying.
+    #:
+    #: **A `derived_harness` PROVENANCE FLAG WAS BUILT HERE AND REMOVED, and the reason is the
+    #: mechanism.** The argument for it was that the three harness kinds Shard generates print the
+    #: marker under a mapping of ours, applied outside the agent's reach, so their number IS the
+    #: target's status and they should be graded on the marker like a benchmark. That is a true
+    #: statement about FORGERY and the wrong question: the customer arm refuses a printed number
+    #: because printing one means the script outlived its target, so `waitpid` saw nothing — and that
+    #: is equally true of a script we wrote. Measured: with the flag in place, removing it from
+    #: ``acquire`` killed no test, because all three derived kinds (`libfuzzer_c`, `cargo_fuzz`,
+    #: `synthesized_c`) end in ``exec "$BIN" … "$1" 2>&1`` and
+    #: pass the customer rule on their own merits. Grading turns on ``known_bug`` alone — which since
+    #: 2026-09-05 IS the fact the signal-only reading is derived from, and was not before it.
+    marker_printed: bool | None = None
 
     @property
     def verdict(self) -> str:
@@ -175,23 +539,74 @@ class WorkdirReport:
         verdict it gives is unfalsifiable, so a run against it costs a whole budget and can only end in
         a false positive or a meaningless clean. The customer's fix is one line in their harness and
         the reason quotes it.
+
+        **THE MARKER RULE WAS BACKWARDS FOR THE CUSTOMER, and it stood because the two readings look
+        identical from here.** The split is the crash predicate's own. With ``signal_only`` OFF — a
+        known-bug benchmark build — every inner exit outside ``CRASH_OK`` is a crash and the printed
+        number is exactly the evidence wanted. With it ON — every customer — a fault must be a signal
+        the supervisor observed, and a number the harness chose to print is not one; the harness that
+        printed it exited normally, which is what stops the signal existing. ``known_bug`` reads the
+        MASKED IMAGE, which is the fact the deep tier derives ``signal_only`` from — see that property
+        for the 16-of-16 measurement that says why reading `description.txt` here put the two arms on
+        different facts. ``EXEC_TAIL_FIX`` holds the executed table: the marker-printing harness this
+        used to call ``supported`` reported a clean audit on a real ASan abort, and the marker-less one
+        it called ``degraded`` reproduced it.
+
+        **THE CUSTOMER ARM IS DEGRADED RATHER THAN UNSUPPORTED, AND THE REASON GIVEN FOR THAT UNTIL
+        2026-09-05 WAS MEASURABLY FALSE.** It read: *"a sanitizer that aborts still reaches the
+        supervisor from an ordinary non-exec harness whose target dies in the foreground of the last
+        command"*. Measured on `targets/canary-c` + the planted overflow, five replays each, the same
+        rig as ``EXEC_TAIL_FIX``'s table:
+
+            last effective line       inner  observed_signal  ASan out  reproduced
+            exec "$BIN" "$1"          134    6                yes       TRUE  (5/5)
+            "$BIN" "$1"               124    None             yes       FALSE (0/5)
+            "$BIN" "$1" then exit $?  124    None             yes       FALSE (0/5)
+
+        bash forks and waits, so the signal is the CHILD's and the supervisor never sees it — and the
+        run additionally lands on the timeout-kill path. There is no measured foreground case where a
+        non-exec harness delivers a signal.
+
+        What actually keeps this off ``unsupported`` is that the check is STATIC and has measured false
+        negatives of its own: ``exec "$BIN" "$1" && echo done`` reproduces 5/5 and is graded ``False``
+        (``harness_execs_target``), an ``exec`` inside a conditional or a sourced file is invisible
+        here, and refusing on a static read costs the customer a whole run. ``unsupported`` refuses;
+        the two things this module already refuses on — no harness, and a harness that calls a benign
+        input a crash — are both facts about the file itself, not inferences about its control flow.
         """
         if not self.harness or self.harness_empty:
             return "unsupported"
         if self.control_crashed:
             return "unsupported"
-        return "supported" if self.exit_marker else "degraded"
+        if self.known_bug:
+            return "supported" if self.exit_marker else "degraded"
+        # The customer's own harness, adjudicated signal-only. BOTH halves, because each covers what
+        # the other cannot see: the static read misses a marker printed through a variable, and one
+        # benign execution misses a marker printed only on a branch that input did not take.
+        return "supported" if self.exec_tail and self.marker_printed is not True else "degraded"
 
     @property
     def known_bug(self) -> bool:
         """Does this workdir assert that a defect is already known to be here?
 
-        The benchmark's framing and the customer's are opposites, and `_TargetCaps.known_bug` carries
-        the same claim from the other signal (a masked `:vul` image). Both must agree, because
-        the design notes records what asserting a known bug on a customer commit costs:
-        the agent is told the harness is trustworthy and is structurally forbidden from suspecting it.
+        **THE MASKED IMAGE, AND UNTIL 2026-09-05 THIS READ `./description.txt` INSTEAD.** The claim
+        made for that — that the description is the same fact the signal-only reading is derived from —
+        was false, and this repository had already measured the counterexample. The signal-only reading
+        is `not vul_image`; the benchmark harness writes `description.txt` only `if level >= 1`;
+        **16 of 16 the benchmark Level 0 tasks read that file and got `not a file`** (the design notes,
+        the Level 0 prompt entry). Every one of those workdirs carries a masked image, so every one of
+        them was graded on the CUSTOMER arm while being adjudicated on the BENCHMARK arm — and was told
+        to end its harness in an `exec`, which is meaningless advice for a `docker run … ; echo
+        __EXIT__=$?` entry line where the marker IS the channel the oracle reads.
+
+        The design notes records why the two framings must not be confused in the
+        other direction: asserting a known bug on a customer commit tells the agent the harness is
+        trustworthy and structurally forbids it from suspecting otherwise.
+
+        `description` stays on this report as its own field. It is a real fact about the workdir and it
+        selects a PROMPT; it does not select an adjudication reading.
         """
-        return self.description
+        return self.vul_image
 
 
 def validate_workdir(workdir) -> WorkdirReport:
@@ -199,10 +614,18 @@ def validate_workdir(workdir) -> WorkdirReport:
 
     Cheap, pure, and it never raises: an unreadable workdir is reported as ``unsupported``, which is the
     same answer an empty one gets and the correct one in both cases.
+
+    Which of the two contracts applies is decided by the MASKED ``:vul`` IMAGE and nothing else, because
+    that is the fact the deep tier's ``signal_only`` reading is derived from — see
+    ``WorkdirReport.known_bug`` for what reading ``description.txt`` here cost, and
+    ``WorkdirReport.marker_printed`` for the harness-provenance flag that was built here, measured, and
+    removed.
     """
     root = pathlib.Path(workdir)
     text = _harness_text(root)
     marker = None if text is None else EXIT_MARKER in text
+    vul_image = text is not None and vul_image_name(text) is not None
+    exec_tail = harness_execs_target(root)
     harness = text is not None
     # Whitespace-only, and NOTHING more clever than that. A placeholder somebody `touch`ed costs a
     # whole budget to discover at run time and nothing to catch here. The line is drawn at "has no
@@ -212,6 +635,7 @@ def validate_workdir(workdir) -> WorkdirReport:
     harness_empty = harness and not text.strip()
 
     repo_tree = _is_dir(root / "repo")
+    description = (root / "description.txt").is_file()
     reasons: list[str] = []
 
     if not harness:
@@ -222,11 +646,31 @@ def validate_workdir(workdir) -> WorkdirReport:
         reasons.append(
             f"{HARNESS_NAME} is empty: it cannot exercise the target, so every replay is clean and the "
             f"run would report 'audited' on a target it never tested")
-    elif not marker:
+    elif vul_image:
+        # THE BENCHMARK READING, UNCHANGED. A known-bug build is adjudicated with `signal_only` off, so
+        # every inner exit outside CRASH_OK is evidence and the marker is the channel that carries it.
+        # Same sentence the 770 measured tasks were validated against.
+        #
+        # SELECTED ON THE MASKED IMAGE, not on `description.txt`, since 2026-09-05: the description is
+        # absent from every the benchmark Level 0 workdir (16 of 16 measured) and the image is present at
+        # every level, so keying on the description put this arm and `signal_only` on different facts.
+        if not marker:
+            reasons.append(
+                f"{HARNESS_NAME} does not print {EXIT_MARKER}<n>: the oracle falls back to a sanitizer "
+                f"report or a fatal signal, which recovers most crashes but not a target that dies "
+                f"quietly. Add `{EXIT_MARKER_FIX}` as the last line, with nothing between it and the "
+                f"target")
+    elif not exec_tail:
+        # THE CUSTOMER READING. `EXEC_TAIL_FIX` carries the executed table this sentence stands on.
         reasons.append(
-            f"{HARNESS_NAME} does not print {EXIT_MARKER}<n>: the oracle falls back to a sanitizer "
-            f"report or a fatal signal, which recovers most crashes but not a target that dies quietly. "
-            f"Add `{EXIT_MARKER_FIX}` as the last line, with nothing between it and the target")
+            f"{HARNESS_NAME} does not end by exec'ing the target, so a fault cannot reach us AS a "
+            f"fault: the script exits normally, the supervisor never sees the signal, and the only "
+            f"channel left is a number the script printed — which a program that merely declined its "
+            f"input produces too. Measured on this repository's own canary, one PoC and one gcc: a "
+            f"tail of `{EXIT_MARKER_FIX}` reported NO finding on a run whose output carried a full "
+            f"AddressSanitizer report, and `{EXEC_TAIL_FIX}` reproduced it. End the harness with "
+            f"`{EXEC_TAIL_FIX}` and set `{SANITIZER_ABORT_FIX}` above it — the exec alone left the "
+            f"same crash reporting as an ordinary exit 1")
 
     vcs_in_repo = repo_tree and any(_is_dir(root / "repo" / d) for d in sorted(_VCS_DIRS))
     if vcs_in_repo:
@@ -242,9 +686,11 @@ def validate_workdir(workdir) -> WorkdirReport:
         exit_marker=marker,
         corpus=_is_dir(root / "corpus") or bool(_glob_one(root, "*_seed_corpus.zip")),
         repo_tree=repo_tree,
-        description=(root / "description.txt").is_file(),
+        description=description,
         vcs_in_repo=vcs_in_repo,
         reasons=tuple(reasons),
+        vul_image=vul_image,
+        exec_tail=exec_tail,
     )
 
 
@@ -1226,11 +1672,11 @@ def probe_runtimes(languages) -> dict:
 
 
 def free_tier_verdict(profile: TargetProfile, *, visibility: str = "") -> dict:
-    """Does this repository fit the free tier — the integration guide's price list, as a verdict.
+    """Does this repository fit the free tier — the shipped licence's two-door grant, as a verdict.
 
-    **The rule is public + simple.** Every row that bills is "deep, scheduled". So the honest answer
-    turns on two facts, and preflight can only see one of them locally: `visibility` comes from the
-    caller because a checkout does not know whether its origin is public, and GUESSING it would put a
+    Public repositories qualify without an organisation limit. Private repositories can also qualify,
+    but only while BOTH the group revenue and reviewed-repository contributor limits hold. Preflight
+    receives visibility; a checkout contains neither organisation fact. GUESSING either would put a
     licence claim on a guess.
 
     `unknown` is a first-class answer here rather than a default to "fits". A pricing instrument that
@@ -1238,27 +1684,37 @@ def free_tier_verdict(profile: TargetProfile, *, visibility: str = "") -> dict:
     """
     if visibility not in ("public", "private"):
         return {"verdict": "unknown",
-                "why": "repository visibility was not supplied, and it is half the rule — public "
-                       "plus simple mode is the free tier. Pass --visibility to get an answer.",
+                "why": "repository visibility was not supplied. Public repositories always fit; "
+                       "private repositories also require organisation facts this checkout cannot "
+                       "observe.",
                 "needs": []}
     if visibility == "public":
         return {"verdict": "fits",
-                "why": "public repository, pull-request mode: free, with no repository count against "
-                       "any band.",
+                "why": "public repository: free, with no organisation-size or repository-count "
+                       "limit.",
                 "needs": []}
-    needs = ["a licence — private repositories are not on the free tier"]
+    needs = ["eligibility confirmation — the private-repository grant applies while group annual "
+             "gross revenue is under USD $5M and no more than 10 individuals contribute to the "
+             "private repositories reviewed; otherwise a commercial licence"]
     if profile.memory_unsafe:
-        needs.append("a self-hosted or larger runner IF you want deep mode: sanitisers, a Docker "
-                     "socket and real CPU are beyond a standard hosted runner")
-    return {"verdict": "needs a licence", "why": "private repository", "needs": needs}
+        needs.append("sustained CPU if deep-mode fuzzing is required; ordinary construction uses "
+                     "the paid image's GCC/G++ toolchain and does not require a Docker socket")
+    return {"verdict": "unknown",
+            "why": "private repository — this checkout cannot determine the organisation facts "
+                   "that decide the small-organisation grant",
+            "needs": needs}
 
 
 __all__ = [
     "CALIBRATION", "COST_DRIVER", "ENTRY_CANDIDATES", "EXT_LANGUAGE", "HARNESS_NAME", "EXIT_MARKER",
-    "EXIT_MARKER_FIX", "LANGUAGE_RUNTIME", "PREPARED_ENTRY_CANDIDATES",
+    "EXIT_MARKER_FIX", "EXEC_TAIL_FIX", "SANITIZER_ABORT_FIX", "LANGUAGE_RUNTIME",
+    "PREPARED_ENTRY_CANDIDATES",
     "CargoFuzzTarget", "TargetProfile", "WorkdirReport",
-    "cargo_fuzz_targets", "demonstrability", "entry_template", "estimate_diff_cost",
+    # `_drives_container_runtime` is deliberately ABSENT: it has no free-tier caller, and the paid
+    # module that uses it already imports `_harness_text` from here by its private name.
+    "cargo_fuzz_targets", "demonstrability", "entry_template",
+    "estimate_diff_cost",
     "libfuzzer_targets",
-    "free_tier_verdict", "harness_prints_exit_marker", "probe_runtimes", "profile_repo",
-    "validate_workdir",
+    "free_tier_verdict", "harness_execs_target", "harness_prints_exit_marker", "probe_runtimes",
+    "profile_repo", "validate_workdir",
 ]

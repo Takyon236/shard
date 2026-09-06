@@ -1,7 +1,7 @@
 [project]
 name = "shard"
-version = "3.0.2"
-description = "Security analysis that runs in your CI and reports a finding only when it can attach a reproducing input."
+version = "4.0.2"
+description = "Security analysis in your CI: hypotheses stay informational, and demonstrated findings include a reproducing input."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }

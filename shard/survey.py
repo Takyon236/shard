@@ -521,8 +521,9 @@ def _blind_spots(survey: Survey, ranked, deep_reachable: bool, witness_reachable
                    f"was never reached rather than absent")
 
     if not deep_available:
-        out.append("deep capability is not present in this build, so nothing here can carry a "
-                   "reproducing input")
+        out.append("licensed deep-mode harness construction is not present in this build; free diff "
+                   "mode can still attach a reproducing input when a runnable witness entry point is "
+                   "declared")
     elif not deep_reachable:
         out.append("no harness kind applies, so no candidate can be raised to a reproducing input. "
                    "Declare a harness at .shard/test_poc.sh")

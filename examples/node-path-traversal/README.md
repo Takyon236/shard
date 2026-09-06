@@ -11,14 +11,17 @@ it. The code reads as though the join is the containment, and it never was.
 Needs `node` on your PATH. The action's container carries node 22; locally, any recent version.
 
 ```bash
+set -euo pipefail
 cd examples/node-path-traversal
 
 bash .shard/entry.sh /dev/null                          # silent, exit 0   <- the baseline
 bash .shard/entry.sh .shard/entry.sh.benign/ordinary.txt  # silent, exit 0
 bash .shard/entry.sh .shard/entry.sh.benign/missing.txt   # silent, exit 0
 
-printf '../secret.txt\n' > /tmp/attack.txt
-bash .shard/entry.sh /tmp/attack.txt                    # SHARD_NOTE_PATH_ESCAPED
+attack_input="$(mktemp)"
+printf '../secret.txt\n' > "$attack_input"
+bash .shard/entry.sh "$attack_input"                    # SHARD_NOTE_PATH_ESCAPED
+rm -f -- "$attack_input"
 ```
 
 ## The decision worth copying: watch the sentinel, not the success
@@ -41,8 +44,9 @@ convince yourself is sound is one you should not be gating a build on.
 ## Then point Shard at it
 
 ```bash
-shard survey --repo examples/node-path-traversal --out-dir /tmp/shard-out
-shard preflight --repo examples/node-path-traversal --witness-entry .shard/entry.sh
+set -euo pipefail
+shard survey --repo . --out-dir /tmp/shard-out
+shard preflight --repo . --witness-entry .shard/entry.sh
 ```
 
 **`survey` reports `candidates 0` here, and that is the expected result rather than a bug.** It is the
@@ -55,6 +59,6 @@ the same line. `survey` says as much in its own blind spots: *"those files WERE 
 marker table matched, so this is that table's limit rather than a clean bill of health."*
 
 This example exists to show the other half of the product working on exactly that case. The witness
-does not need a marker to have fired: `bash .shard/entry.sh /tmp/attack.txt` prints
+does not need a marker to have fired: running `.shard/entry.sh` on the attack input prints
 `SHARD_NOTE_PATH_ESCAPED` and the benign controls do not, so the defect is demonstrable even where the
 static table is silent.

@@ -146,7 +146,8 @@ LIMIT_STATEMENTS: dict[str, str] = {
 
 
 def build(findings, *, status: str, mode: str, target: str = "", run=None,
-          gate_reasons=(), scope_reasons=(), artefacts=None) -> dict:
+          gate_reasons=(), scope_reasons=(), artefacts=None,
+          bundle_names: dict[int, str] | None = None) -> dict:
     """The whole result of one scan, as one document.
 
     `findings` is the full set and is CAPPED here, by the same `report.cap` the SARIF uses, so the two
@@ -188,10 +189,12 @@ def build(findings, *, status: str, mode: str, target: str = "", run=None,
         },
         "gate": _gate(run, reproduced, gate_reasons, scope_reasons),
         "repository": _repository(run),
+        "inspection": getattr(run, "inspection", None),
         "run": _run(run),
         "limits": limits(ordered, status=status, run=run,
                          gate_reasons=gate_reasons, scope_reasons=scope_reasons, dropped=dropped),
-        "reproduced": [_finding(f, name) for f, name in named if f.gate_eligible],
+        "reproduced": [_finding(f, (bundle_names or {}).get(id(f), name))
+                       for f, name in named if f.gate_eligible],
         "hypotheses": [_finding(f, name) for f, name in named if not f.gate_eligible],
         "artefacts": dict(artefacts or {}),
     }

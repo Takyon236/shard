@@ -49,11 +49,10 @@ making.
 `run_entry` adds no new KIND of execution: it is `bash -- <entry> <input>` with `entry_env()`, in the
 checkout, which is byte-for-byte what `witness.adjudicate` already does post-loop. It adds instances.
 
-`run` DOES add a new kind — arbitrary argv — and the residual is named in `_run_shell` rather than
-buried. The library design: *"an agent whose context includes attacker-influenced text, holding
-a tool that can address a network, is a prompt-injection primitive"*, and this repository has already
-had that exact hole live once (the separate package's `harness_contract`, 2026-08-18). What is done about
-it here is real and partial, and both halves are recorded.
+`run` DOES add a new kind — arbitrary argv. The library design: *"an agent whose context
+includes attacker-influenced text, holding a tool that can address a network, is a prompt-injection
+primitive"*. It therefore runs only behind the same verified private PID, network, procfs and
+allowlisted-root boundary as adjudication; unavailable containment makes the tool refuse.
 """
 
 from __future__ import annotations
@@ -64,13 +63,16 @@ import hashlib
 import pathlib
 import subprocess
 import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 from . import memcap
 from .tools import OBS_WINDOW_CHARS, Tool, ToolContext, ToolResult, _file_index
-from .witness import (DEFAULT_TIMEOUT, FATAL_SIGNAL_CODES, NETWORK_ISOLATION, TIMEOUT_KILL_CODES,
-                      bounded_run,
-                      _normalise, entry_env, isolation_prefix, redact_secrets, resolve_entry)
+from .witness import (CONTAINMENT_REFUSAL, DEFAULT_TIMEOUT, FATAL_SIGNAL_CODES,
+                      TIMEOUT_KILL_CODES, _CONTAINMENT_ERROR, _contained_entry_env, _normalise,
+                      bounded_run, entry_env, isolation_prefix, network_isolated, redact_secrets,
+                      resolve_entry)
+from .witnessfs import SnapshotError, SourceSnapshot
 
 #: Seconds one `run` / `run_entry` call may take. DERIVED from the adjudicator's own timeout
 #: (`witness.DEFAULT_TIMEOUT`) rather than restating a number: this file claims `run_entry` is
@@ -167,9 +169,18 @@ class ExecState:
     #: "isolated" (a network namespace was entered), "unrestricted" (the kernel refused), or "unknown"
     #: (never probed). Reported, never assumed — see `network_mode`.
     network: str = "unknown"
+    #: `None` means unprobed, `()` means the complete hostile-execution boundary is unavailable.
+    #: PID-only containment is deliberately not a runnable state.
+    isolation: tuple[str, ...] | None = None
     #: Where the model may write. Outside the checkout, so the ordinary case leaves no trace in the
     #: tree the findings point at.
     scratch: str = ""
+    #: Exact environment-variable names the caller configured as inference credentials.
+    secret_env_names: tuple[str, ...] = ()
+    #: Credential-free, regular-file-only source captured before the model receives a shell. Tests and
+    #: direct callers may omit it; the execution seam then owns a one-call snapshot and still never
+    #: binds the live checkout.
+    source_snapshot: SourceSnapshot | None = None
     #: Every command line the shell tool ran, for the journal. The agent's own moves are evidence about
     #: the run and the artefact could not previously say whether it executed anything at all.
     log: list[str] = field(default_factory=list)
@@ -233,25 +244,16 @@ class ExecState:
 
 # ── network containment ─────────────────────────────────────────────────────────────────────────────
 
-#: The probe, and the prefix, kept together so they cannot drift apart — and since 2026-08-24 they live
-#: in `witness`, which is the module the ADJUDICATOR reads. Re-exported under the old name because this
-#: module's callers name it, and because a second literal `("unshare", "-n", "--")` is exactly the
-#: two-copies-of-one-value drift the maintainers' notes is about.
-_UNSHARE = NETWORK_ISOLATION
-
-
 def network_mode(state: ExecState, runner=None) -> str:
-    """Probe whether this container can enter a network namespace; cache it on the state.
+    """Probe the complete hostile-execution boundary and report whether it is available.
 
     **This is a real control where it works and an honest `unrestricted` where it does not**, which is
     the shape `containment.py` already argues for: confirming containment is the burden of proof, and
     ambiguity is failure — so ambiguity is REPORTED rather than resolved in our favour.
 
-    `unshare -n` needs `CAP_SYS_ADMIN`. Docker's default capability set does not include it, so on a
-    stock GitHub-hosted runner this is expected to return "unrestricted" and the residual in
-    `_run_shell` is the live one. It is probed rather than assumed because the answer depends on the
-    customer's runner configuration, not on ours, and a self-hosted runner with a wider capset gets the
-    stronger arm for free.
+    PID-only and empty prefixes are both reported as "unrestricted" and are both refused at every
+    execution seam. PID-only hides processes but retains network access; neither state satisfies the
+    boundary this field records.
 
     The probe itself is `witness.isolation_prefix`, so the answer the AGENT's tools get and the answer
     the ADJUDICATOR gets come from one implementation. They were two, and the second one did not
@@ -259,16 +261,53 @@ def network_mode(state: ExecState, runner=None) -> str:
     its own cache because `ExecState.network` is journalled — the word in the record has to be the word
     this run acted on.
     """
-    if state.network != "unknown":
-        return state.network
-    state.network = "isolated" if isolation_prefix(runner or subprocess.run) else "unrestricted"
+    if state.isolation is None:
+        state.isolation = isolation_prefix(runner or subprocess.run)
+    state.network = "isolated" if network_isolated(state.isolation) else "unrestricted"
     return state.network
 
 
 def _isolation(state: ExecState, runner) -> tuple[str, ...]:
-    """The argv prefix for one execution, routed through `network_mode` so the journal's word and the
-    argv agree. Two call sites — the shell and the entry point — and neither may have its own."""
-    return NETWORK_ISOLATION if network_mode(state, runner) == "isolated" else ()
+    """The probed argv prefix; callers accept only `network_isolated` results."""
+    network_mode(state, runner)
+    return state.isolation or ()
+
+
+@contextmanager
+def _source_view(state: ExecState, repo):
+    """Yield source without VCS credentials, special files or escaping links.
+
+    Production owns one snapshot for the whole model run. Keeping the fallback here is deliberate:
+    ``build_exec_tools`` is public, and a caller that did not pre-capture source must become slower,
+    never less contained.
+    """
+    owned = state.source_snapshot is None
+    snapshot = state.source_snapshot or SourceSnapshot.capture(repo)
+    try:
+        snapshot.verify_source()
+        yield snapshot.source
+    finally:
+        if owned:
+            snapshot.close()
+
+
+def _execution_scratch(state: ExecState, repo) -> pathlib.Path:
+    """Return the writable execution root, refusing an alias into the live checkout."""
+    scratch = pathlib.Path(state.scratch or tempfile.mkdtemp(prefix="shard-exec-"))
+    live = pathlib.Path(repo).resolve(strict=True)
+    resolved = scratch.resolve(strict=False)
+    if resolved == live or resolved in live.parents or live in resolved.parents:
+        raise SnapshotError("execution scratch overlaps the reviewed checkout")
+    scratch.mkdir(parents=True, exist_ok=True)
+    return scratch
+
+
+def _source_entry(source: pathlib.Path, entry: str) -> pathlib.Path:
+    """Resolve the declared entry inside captured source, or fail before execution."""
+    resolved = resolve_entry(source, entry)
+    if resolved is None or not resolved.is_file():
+        raise SnapshotError("the declared entry point is absent from safe source")
+    return resolved
 
 
 # ── tamper detection ────────────────────────────────────────────────────────────────────────────────
@@ -276,10 +315,9 @@ def _isolation(state: ExecState, runner) -> tuple[str, ...]:
 def scope_digest(repo, paths) -> str:
     """A digest over the files a finding may point at, taken before the loop and re-checked after.
 
-    **Prevention is not available and this does not pretend otherwise.** The container runs as root, so
-    read-only bits do not bind, and `unshare -n` (where it works at all) isolates the network rather
-    than the filesystem. The honest control is therefore DETECTION with a consequence: if the tree the
-    findings describe is not the tree that was reviewed, `run_simple` refuses to gate.
+    Hostile executions now receive the checkout through a read-only bind inside an allowlisted root.
+    This digest remains the independent detection layer: if another path or a containment regression
+    changes the tree the findings describe, `run_simple` refuses to gate.
 
     It mirrors `witness.entry_digest`, which has protected the entry point the same way since the loop
     could not touch it — the difference being that a shell CAN, so the surface has to widen to the
@@ -380,7 +418,10 @@ def _observation(rc, stdout: str, stderr: str, note: str, state: ExecState) -> T
     any artifact that carries them — so a `cat /proc/1/environ` through `run` would publish the key
     even on a run that never reached adjudication at all.
     """
-    out, err = _capped(redact_secrets(stdout), redact_secrets(stderr))
+    out, err = _capped(
+        redact_secrets(stdout, secret_env_names=state.secret_env_names),
+        redact_secrets(stderr, secret_env_names=state.secret_env_names),
+    )
     return ToolResult(True, data={
         "note": note,
         "exit_code": rc,
@@ -419,29 +460,46 @@ def _run_entry_point(ctx: ToolContext, state: ExecState, *, repo, entry: str, ru
     except ValueError as e:
         return ToolResult(False, error=str(e))
     try:
-        scratch = pathlib.Path(state.scratch or tempfile.mkdtemp(prefix="shard-exec-"))
-        scratch.mkdir(parents=True, exist_ok=True)
+        scratch = _execution_scratch(state, repo)
         input_path = scratch / "shard_probe_input"
         input_path.write_bytes(data)
-    except OSError as e:
+    except (OSError, SnapshotError) as e:
         return ToolResult(False, error=f"could not stage the payload: {e}")
 
+    prefix = _isolation(state, runner)
+    if not network_isolated(prefix):
+        return ToolResult(
+            False,
+            error=CONTAINMENT_REFUSAL + "this runner cannot create the private PID, mount, procfs "
+            "and network boundary, so the customer-authored entry point was not executed",
+        )
     state.entry_calls += 1
     # THE SAME PREFIX THE ADJUDICATOR USES, for the same reason the timeout and the environment are
     # the same: this function's whole worth is that what the agent observes is what the grader will
-    # observe, and a program with a network here and none there is a different program. `()` wherever
-    # the kernel refuses — see `witness.isolation_prefix`.
-    argv = [*_isolation(state, runner), "bash", "--", str(resolved), str(input_path)]
+    # observe. `()` is a refusal at both hostile-execution seams.
     try:
-        proc = runner(argv, cwd=str(repo), capture_output=True, text=True, errors="replace",
-                      timeout=DEFAULT_EXEC_TIMEOUT, env=entry_env())
+        with _source_view(state, repo) as source:
+            safe_entry = _source_entry(source, entry)
+            argv = [*prefix, "bash", "--", str(safe_entry), str(input_path)]
+            with tempfile.TemporaryDirectory(prefix="shard-entry-root-") as jail_root:
+                proc = runner(
+                    argv, cwd=str(source), capture_output=True, text=True, errors="replace",
+                    timeout=DEFAULT_EXEC_TIMEOUT,
+                    env=_contained_entry_env(source, jail_root=jail_root,
+                                             writable_paths=(input_path.parent,),
+                                             execution_cwd=source,
+                                             secret_env_names=state.secret_env_names),
+                )
     except subprocess.TimeoutExpired:
         return _observation(None, "", "",
                             f"the entry point did not finish within {DEFAULT_EXEC_TIMEOUT}s. A hang is "
                             f"not a demonstration — the runner will refuse it after this run too.",
                             state)
-    except (OSError, subprocess.SubprocessError) as e:
+    except (OSError, SnapshotError, subprocess.SubprocessError) as e:
         return ToolResult(False, error=f"could not execute the entry point: {type(e).__name__}: {e}")
+    stderr = redact_secrets(proc.stderr or "", secret_env_names=state.secret_env_names)
+    if proc.returncode == 125 and stderr.startswith(_CONTAINMENT_ERROR):
+        return ToolResult(False, error=stderr.strip())
 
     rc = proc.returncode
     # **NORMALISE BEFORE COMPARING, and this was a live bug in this function for its first hour.**
@@ -471,35 +529,13 @@ def _run_entry_point(ctx: ToolContext, state: ExecState, *, repo, entry: str, ru
 
 def _run_shell(ctx: ToolContext, state: ExecState, *, repo, runner,
                command: str, timeout: int = DEFAULT_EXEC_TIMEOUT) -> ToolResult:
-    """Run a shell command in the checkout. **The new perimeter, and its residual, stated here.**
+    """Run a model-authored command inside the complete hostile-execution boundary.
 
-    WHAT IS CONTROLLED:
-
-    * **Credentials.** `entry_env()` strips the whole `INPUT_*` namespace and every name that looks
-      like a secret, so the child cannot read `OPENROUTER_API_KEY` or `INPUT_GITHUB_TOKEN`. That hole
-      was live once — an entry point of `#!/bin/sh` + `env` put both verbatim into a report published
-      back to the pull request's author — and this tool would have re-opened it exactly.
-    * **The clock.** Bounded per call and clamped to `MAX_EXEC_TIMEOUT`; the model controls the
-      argument, so the ceiling is ours.
-    * **The count.** `ExecState.max_calls`, shared with `run_entry`.
-    * **The tree.** Writes are not PREVENTED (root ignores the write bit; there is no read-only mount
-      to reach for), so they are DETECTED: `scope_digest` is taken before the loop and re-checked
-      after, and `run_simple` refuses to gate a run that altered what it reviewed.
-    * **The network, WHERE THE KERNEL ALLOWS IT.** `network_mode` probes `unshare -n` once and the
-      command is wrapped when it works.
-
-    **THE RESIDUAL, and it is not small.** On a stock GitHub-hosted runner Docker grants no
-    `CAP_SYS_ADMIN`, so `unshare -n` fails and this tool has unrestricted egress. The agent's context
-    contains the pull request's diff, which on a fork PR is written by someone who does not otherwise
-    have the base repository's source. That is the library design's prompt-injection primitive
-    with a real asset behind it.
-
-    What makes it *acceptable rather than ignored*, and the customer is told the same thing in
-    `README.md` rather than discovering it: the container ALREADY executes an attacker-authored
-    `.shard/entry.sh` with network access on every gated run, so egress is not a capability this tool
-    introduces to the perimeter. What it introduces is egress under the MODEL's direction rather than
-    under the entry point's. The closing move is a network-denied runner or an egress proxy — a
-    deployment control, named in the docs, not something this process can assert about itself.
+    `entry_env` removes credentials and control-socket addresses; `MAX_EXEC_TIMEOUT` and `ExecState`
+    bound time and count. The private root exposes the checkout read-only, one writable scratch and
+    the runtime distribution, while omitting every other host path and pathname socket. Private PID,
+    procfs and network namespaces close process discovery, descendants and egress. There is no
+    PID-only or raw subprocess fallback: a kernel that refuses any part returns a containment refusal.
     """
     if refusal := state.spend():
         return ToolResult(False, error=refusal)
@@ -511,34 +547,50 @@ def _run_shell(ctx: ToolContext, state: ExecState, *, repo, runner,
     except (TypeError, ValueError):
         secs = DEFAULT_EXEC_TIMEOUT
 
+    prefix = _isolation(state, runner)
+    if not network_isolated(prefix):
+        return ToolResult(
+            False,
+            error=CONTAINMENT_REFUSAL + "this runner cannot create the private PID, mount, procfs "
+            "and network boundary, so the model-authored command was not executed",
+        )
     state.shell_calls += 1
     state.log.append(cmd)
-    argv = [*_isolation(state, runner), "bash", "-c", cmd]
-    env = entry_env()
-    # The scratch directory is ANNOUNCED rather than enforced by cwd. Setting cwd outside the checkout
-    # would prevent nothing (`cd` exists) and would break every relative path the other three tools
-    # speak, which are all repo-relative. Telling the model where it may write, and detecting it when
-    # it writes elsewhere, is the pair that actually holds.
-    env["SHARD_SCRATCH"] = state.scratch or tempfile.gettempdir()
-    env["SHARD_REPO"] = str(repo)
+    argv = [*prefix, "bash", "-c", cmd]
+    env = entry_env(secret_env_names=state.secret_env_names)
+    # Keep cwd in the checkout because every other tool speaks repo-relative paths. The private root
+    # makes that checkout read-only and exposes this scratch as the only durable writable host path.
     try:
-        proc = runner(argv, cwd=str(repo), capture_output=True, text=True, errors="replace",
-                      timeout=secs, env=env)
+        scratch = _execution_scratch(state, repo)
+    except (OSError, SnapshotError) as exc:
+        return ToolResult(False, error=f"could not prepare execution scratch: {exc}")
+    try:
+        with _source_view(state, repo) as source:
+            env["SHARD_SCRATCH"] = str(scratch)
+            env["SHARD_REPO"] = str(source)
+            with tempfile.TemporaryDirectory(prefix="shard-shell-root-") as jail_root:
+                env = _contained_entry_env(
+                    source, jail_root=jail_root, writable_paths=(scratch,), execution_cwd=source,
+                    base=env, secret_env_names=state.secret_env_names,
+                )
+                proc = runner(argv, cwd=str(source), capture_output=True, text=True, errors="replace",
+                              timeout=secs, env=env)
     except subprocess.TimeoutExpired:
         return _observation(None, "", "",
                             f"the command did not finish within {secs}s and was killed.", state)
-    except (OSError, subprocess.SubprocessError) as e:
+    except (OSError, SnapshotError, subprocess.SubprocessError) as e:
         return ToolResult(False, error=f"could not run the command: {type(e).__name__}: {e}")
+    stderr = redact_secrets(proc.stderr or "", secret_env_names=state.secret_env_names)
+    if proc.returncode == 125 and stderr.startswith(_CONTAINMENT_ERROR):
+        return ToolResult(False, error=stderr.strip())
     # THE MEMORY CEILING, reported as an OBSERVATION rather than a refusal — this tool's whole contract
     # is "you are told what happened, never whether it would count", and the run DID happen. What the
     # agent must not conclude is that its program is wrong: `memcap.refusal` says which of the two it
     # was. `run_entry` is deliberately NOT capped; see `shard/memcap.py` and the design notes A6.
     if capped := memcap.refusal(proc):
         return _observation(proc.returncode, proc.stdout or "", proc.stderr or "", capped, state)
-    note = f"exited {proc.returncode}."
-    if state.network == "unrestricted":
-        note += " (this container could not enter a network namespace; the command had network access)"
-    return _observation(proc.returncode, proc.stdout, proc.stderr, note, state)
+    return _observation(proc.returncode, proc.stdout, proc.stderr,
+                        f"exited {proc.returncode}.", state)
 
 
 def _outline(ctx: ToolContext, path: str) -> ToolResult:

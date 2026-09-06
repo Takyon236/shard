@@ -20,18 +20,183 @@ its own docstring instead, so the description leaves with the code rather than o
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import subprocess
 import threading
 import time
 import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Protocol
 
 from shard.diag import get_logger
 
 _log = get_logger(__name__)
+
+
+@dataclass(frozen=True)
+class _ProviderUsage:
+    input_tokens: int
+    output_tokens: int
+    cached_tokens: int
+    total_tokens: int
+    cost_usd: float
+    cache_write_tokens: int
+    unpriced: int
+    reported: bool
+    tokens_reported: bool
+
+
+class _UsageIntegrityError(ValueError):
+    """A streamed usage record contradicted another record in the same response."""
+
+
+class _StreamIntegrityError(ValueError):
+    """A streamed response crossed a bound or contradicted its own identity."""
+
+
+class _WallTimerStartError(RuntimeError):
+    """The deadline watchdog could not start, so no unbounded operation may begin."""
+
+
+# Internal parser state, deliberately outside the HTTP status space. A provider may legitimately
+# answer 422 when it rejects `tool_choice`; conflating that response with our integrity rejection
+# suppressed the known-unbilled attempt and disabled the loop's established unforced fallback.
+_USAGE_INTEGRITY_CODE = -1
+_STREAM_INTEGRITY_CODE = -2
+_TURN_CEILING_CODE = -3
+_PRE_WIRE_TRANSIENT_CODE = -4
+_POST_WIRE_TIMEOUT_CODE = -5
+_POST_WIRE_TRANSPORT_CODE = -6
+_MALFORMED_STREAM_CODE = -7
+_PRE_WIRE_CONFIG_CODE = -8
+_PRE_WIRE_TIMEOUT_CODE = -9
+_PRE_WIRE_CODES = (_PRE_WIRE_TRANSIENT_CODE, _PRE_WIRE_CONFIG_CODE, _PRE_WIRE_TIMEOUT_CODE)
+_NO_ABANDON_CODES = (_TURN_CEILING_CODE, *_PRE_WIRE_CODES)
+_TOOL_CHOICE_REJECTION_CODES = frozenset({400, 404, 422})
+
+# `getaddrinfo` has no cancellable timeout. A timed-out daemon may therefore remain inside libc,
+# but it may not make thread growth unbounded: the fixed admission stays occupied until that daemon
+# really exits. Calls beyond the measured concurrency ceiling fail before starting another thread.
+_MAX_DNS_THREADS = 4
+_DNS_THREAD_SLOTS = threading.BoundedSemaphore(_MAX_DNS_THREADS)
+
+
+def _tool_choice_rejection(code: int, error: str, tool_choice) -> bool:
+    """Whether one HTTP error explicitly rejected the forced-choice field itself."""
+    if tool_choice is None or code not in _TOOL_CHOICE_REJECTION_CODES:
+        return False
+    prefix = f"http {code}: "
+    if not error.casefold().startswith(prefix):
+        return False
+    detail = error[len(prefix):].strip()
+    try:
+        document = json.loads(detail)
+    except (json.JSONDecodeError, RecursionError, ValueError):
+        pass
+    else:
+        provider_error = document.get("error") if isinstance(document, dict) else None
+        if isinstance(provider_error, dict) and isinstance(provider_error.get("message"), str):
+            detail = provider_error["message"]
+        elif isinstance(provider_error, str):
+            detail = provider_error
+    normalized = re.sub(r"[_-]+", " ", detail.casefold()).strip()
+    normalized = normalized.removesuffix(".")
+    patterns = (
+        r"(?:the )?(?:provided )?tool choice(?: parameter| field)?(?: [:=] \S+)? "
+        r"(?:is |was )?(?:not supported|unsupported|invalid|not allowed|rejected)",
+        r"(?:invalid|unsupported|unrecognized) (?:value for )?(?:the )?(?:provided )?"
+        r"tool choice(?: parameter| field)?",
+        r"no endpoints? (?:were )?(?:found (?:that )?)?supports? (?:the )?(?:provided )?"
+        r"tool choice",
+    )
+    return any(re.fullmatch(pattern, normalized) for pattern in patterns)
+
+
+def _usage_integer(value, field_name: str) -> int:
+    """Accept only JSON numbers whose value is a finite, nonnegative integer."""
+    if value is None:
+        return 0
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field_name} is not an integer")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"{field_name} is not finite")
+    integer = int(value)
+    if value < 0 or value != integer:
+        raise ValueError(f"{field_name} is negative or fractional")
+    return integer
+
+
+def _optional_usage_integer(usage: dict, field_name: str) -> tuple[bool, int]:
+    """Whether a token field was present, and its validated integer value."""
+    value = usage.get(field_name)
+    return (False, 0) if value is None else (True, _usage_integer(value, field_name))
+
+
+def _provider_usage(usage) -> _ProviderUsage:
+    """Validate one provider usage record atomically before any counter can be changed."""
+    if usage is None:
+        usage = {}
+    if not isinstance(usage, dict):
+        raise ValueError("usage is not an object")
+    details = usage.get("prompt_tokens_details")
+    if details is None:
+        details = {}
+    if not isinstance(details, dict):
+        raise ValueError("prompt_tokens_details is not an object")
+    raw_cost = usage.get("cost")
+    if isinstance(raw_cost, bool) or (raw_cost is not None and not isinstance(raw_cost, (int, float))):
+        raise ValueError("cost is not a number")
+    try:
+        cost = float(raw_cost or 0.0)
+    except OverflowError as e:
+        raise ValueError("cost is not finite") from e
+    if not math.isfinite(cost) or cost < 0:
+        raise ValueError("cost is non-finite or negative")
+    input_reported, input_tokens = _optional_usage_integer(usage, "prompt_tokens")
+    output_reported, output_tokens = _optional_usage_integer(usage, "completion_tokens")
+    total_reported, total_tokens = _optional_usage_integer(usage, "total_tokens")
+    if not total_reported and input_reported and output_reported:
+        total_tokens = input_tokens + output_tokens
+        total_reported = True
+    if total_reported and total_tokens < input_tokens + output_tokens:
+        raise ValueError(
+            f"total_tokens {total_tokens} is less than prompt_tokens + completion_tokens "
+            f"({input_tokens + output_tokens})")
+    return _ProviderUsage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cached_tokens=_usage_integer(details.get("cached_tokens"), "cached_tokens"),
+        total_tokens=total_tokens,
+        cost_usd=cost,
+        cache_write_tokens=_usage_integer(details.get("cache_write_tokens"), "cache_write_tokens"),
+        unpriced=int(raw_cost is None),
+        reported=bool(usage),
+        tokens_reported=total_reported,
+    )
+
+
+def _provider_result_fields(usage: _ProviderUsage, served: str,
+                            identity_verdict: str) -> dict:
+    """Fields shared by completion and chat results for one provider response."""
+    return {
+        "cost_usd": usage.cost_usd,
+        "tokens": usage.total_tokens,
+        "unpriced_attempts": usage.unpriced,
+        "served_model": served,
+        "identity_verdict": identity_verdict,
+        "tokens_reported": usage.tokens_reported,
+        "cost_reported": not usage.unpriced,
+    }
+
+
+def _combined_reported(flags: list[bool | None]) -> bool | None:
+    """False if any attempt was unmeasured, true only when every attempt was measured."""
+    if any(flag is False for flag in flags):
+        return False
+    return True if flags and all(flag is True for flag in flags) else None
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -79,7 +244,12 @@ def _is_openrouter_endpoint(url: str) -> bool:
     string are somebody else's server, and what turns on this answer is whether a customer's declared
     model identifier is rewritten to a slug only OpenRouter resolves.
     """
-    host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    try:
+        host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    except (TypeError, ValueError):
+        # Endpoint validation belongs to the request result, where callers receive a controlled
+        # configuration failure. Alias selection must not make construction itself the uncaught path.
+        return False
     return host == "openrouter.ai" or host.endswith(".openrouter.ai")
 
 
@@ -272,6 +442,14 @@ class LLMResult:
     finish_reason: str = ""  # provider stop reason (e.g. "length" = truncated at max_tokens). Lets the
                              # loop tell a CUT-OFF JSON action from real prose so it can reprompt sharply
                              # instead of blindly re-truncating. Empty for backends that don't report it.
+    abandoned_attempts: int = 0  # attempts inside THIS completion whose stream ended before `usage`.
+                             # The provider served them, but their token count and price are unknowable.
+    unpriced_attempts: int = 0  # completed attempts whose response omitted `usage.cost`. A real 0.0
+                             # price is not unpriced; presence, not truthiness, decides this count.
+    served_model: str = ""     # what the response said answered; `model` remains the requested id
+    identity_verdict: str = "" # matched / missing / substituted / conflicting for provider responses
+    tokens_reported: bool | None = None  # None = backend exposes no completeness metadata
+    cost_reported: bool | None = None
 
 
 class LLMBackend(Protocol):
@@ -286,6 +464,41 @@ class ToolCall:
     id: str
     name: str
     arguments: dict          # parsed from the function-call arguments JSON (best-effort)
+
+
+def _parsed_tool_calls(message: dict) -> tuple[list[ToolCall], str]:
+    """Parse a complete native-call batch atomically, returning its stable error when malformed."""
+    calls = []
+    call_ids = set()
+    for raw in (message.get("tool_calls") or []):
+        if not isinstance(raw, dict):
+            raise _StreamIntegrityError("tool call is not an object")
+        call_type = raw.get("type", "function")
+        if call_type != "function":
+            raise _StreamIntegrityError(f"tool call carried unsupported type {call_type!r}")
+        call_id = raw.get("id")
+        if not isinstance(call_id, str) or not call_id:
+            raise _StreamIntegrityError("tool call has no nonempty id")
+        if call_id in call_ids:
+            raise _StreamIntegrityError(f"tool call id {call_id!r} is duplicated")
+        call_ids.add(call_id)
+        function = raw.get("function") or {}
+        try:
+            arguments = json.loads(function.get("arguments") or "{}")
+        except RecursionError as e:
+            raise _StreamIntegrityError(
+                "tool-call arguments exceeded the JSON nesting limit") from e
+        except json.JSONDecodeError:
+            return [], "malformed tool-call arguments"
+        except ValueError as e:
+            raise _StreamIntegrityError(
+                f"tool-call arguments exceeded the JSON value limit: {e}") from e
+        except TypeError:
+            return [], "malformed tool-call arguments"
+        if not isinstance(arguments, dict):
+            return [], "tool-call arguments were not an object"
+        calls.append(ToolCall(id=call_id, name=function.get("name") or "", arguments=arguments))
+    return calls, ""
 
 
 @dataclass
@@ -306,9 +519,8 @@ class ChatResult:
     #: project has measured` on a run of a model this project has no numbers for — because `model` was
     #: the only field there was and it is an echo of the request.
     #:
-    #: On `ChatResult` alone, not on `LLMResult`: `.chat` is the mandatory path (the maintainers' notes closes
-    #: native tool calling as required in code) and it is what the probe and the agent loop use. A
-    #: second copy on the ReAct result would be a field nothing reads.
+    #: Carried on both result types because discovery/remedy still use `.complete`; the mandatory
+    #: native agent path is not the only provider exchange that can silently substitute weights.
     served_model: str = ""
     finish_reason: str = ""  # provider stop reason (e.g. "length" = cut off at max_tokens). Lets the
                              # native loop tell a reasoning turn TRUNCATED before it emitted its tool call
@@ -326,6 +538,19 @@ class ChatResult:
                              # stream was aborted before any `usage` arrived. The provider still
                              # generated tokens and still charges for them, so this is the part of the
                              # turn's real cost that `cost_usd` above is KNOWN not to include.
+    unpriced_attempts: int = 0
+    identity_verdict: str = "" # matched / missing / substituted / conflicting for provider responses
+    tokens_reported: bool | None = None
+    cost_reported: bool | None = None
+    # Opt-in proof that THIS failure explicitly rejected the forced choice itself. A generic backend
+    # error, credential failure or policy refusal must never buy an unrelated second request.
+    forcing_retry_safe: bool = False
+    # Opt-in proof that THIS failure was a structurally empty successful provider response. Error
+    # prose is untrusted: a terminal 400 saying "messages must not be empty" must not buy another turn.
+    empty_retry_safe: bool = False
+    # Opt-in proof that THIS failure was a timeout raised by our transport. Provider response bodies
+    # can quote every stall phrase this client emits, so their text carries no retry authority.
+    stall_retry_safe: bool = False
 
 
 class ToolCallingBackend(Protocol):
@@ -446,6 +671,356 @@ def _sse_data(raw) -> str | None:
     return line[5:].strip()                                # past the "data:" prefix
 
 
+class _RejectRedirects(urllib.request.HTTPRedirectHandler):
+    """Turn every redirect into the original HTTP error instead of issuing a second request.
+
+    The request carries a customer-supplied bearer credential. urllib's default redirect handler
+    copies ordinary headers onto the redirected request, including ``Authorization``; a provider (or
+    a compromised proxy in front of it) could therefore send that credential to a different origin.
+    There is no useful redirect in this API contract: the customer configures the final endpoint and
+    an HTTP redirect is configuration drift that must be reported rather than followed.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: PLR0913
+        return None
+
+
+def _owned_http_connection(owner):
+    """Build the request-private HTTP connection class used by urllib's handler."""
+    import http.client
+
+    class OwnedHTTPConnection(http.client.HTTPConnection):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._shard_ready = False
+            self._create_connection = lambda address, timeout, source_address: (  # noqa: SLF001
+                _owned_create_connection(owner, address, timeout, source_address))
+            owner.own(self)
+
+        def connect(self):
+            owner.require_open()
+            super().connect()
+            owner.require_open()
+            self._shard_ready = True
+
+        def send(self, data):
+            if self.sock is None and self.auto_open:
+                self.connect()
+            if self.sock is not None and self._shard_ready:
+                owner.require_open()
+                owner.mark_sent()
+            return super().send(data)
+
+    return OwnedHTTPConnection
+
+
+def _owned_https_connection(owner):
+    """Build the request-private HTTPS connection class used by urllib's handler."""
+    import http.client
+
+    class OwnedHTTPSConnection(http.client.HTTPSConnection):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._shard_ready = False
+            self._create_connection = lambda address, timeout, source_address: (  # noqa: SLF001
+                _owned_create_connection(owner, address, timeout, source_address))
+            owner.own(self)
+
+        def connect(self):
+            owner.require_open()
+            super().connect()
+            owner.require_open()
+            self._shard_ready = True
+
+        def send(self, data):
+            if self.sock is None and self.auto_open:
+                self.connect()
+            if self.sock is not None and self._shard_ready:
+                owner.require_open()
+                owner.mark_sent()
+            return super().send(data)
+
+    return OwnedHTTPSConnection
+
+
+def _open_stream(req, timeout: float):
+    """Open one model stream without redirects and expose its connection to the wall owner.
+
+    ``OpenerDirector.open`` does not return until ``HTTPResponse.begin`` has parsed the complete
+    status and header block. A socket timeout bounds one idle ``recv``, not that whole operation, so
+    a peer can otherwise drip an unterminated header forever before the response-level watchdog has
+    anything it can close. The request-private owner is registered with the connection immediately
+    after construction, before ``request`` or ``getresponse`` can block.
+    """
+    owner = getattr(req, "_shard_wall_owner", None)
+    if owner is None:
+        return urllib.request.build_opener(_RejectRedirects()).open(req, timeout=timeout)
+    http_connection = _owned_http_connection(owner)
+    https_connection = _owned_https_connection(owner)
+
+    class _OwnedHTTPHandler(urllib.request.HTTPHandler):
+        def http_open(self, request):
+            return self.do_open(http_connection, request)
+
+    class _OwnedHTTPSHandler(urllib.request.HTTPSHandler):
+        def https_open(self, request):
+            return self.do_open(https_connection, request, context=self._context)
+
+    return urllib.request.build_opener(
+        _RejectRedirects(), _OwnedHTTPHandler(), _OwnedHTTPSHandler()).open(req, timeout=timeout)
+
+
+def _response_socket(response):
+    """Find urllib's socket through both HTTPResponse and HTTPError wrapper shapes."""
+    current = response
+    seen = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        raw = getattr(current, "raw", None)
+        sock = (getattr(raw, "_sock", None) or getattr(current, "_sock", None)
+                or getattr(current, "sock", None))
+        if sock is not None:
+            return sock
+        current = getattr(current, "fp", None)
+    return None
+
+
+class _WallResponseOwner:
+    """Close a connection during status/header acquisition or its later response stream."""
+
+    def __init__(self, remaining: float, message: str) -> None:
+        self._lock = threading.Lock()
+        self._targets = []
+        self._closed = False
+        self._sent = False
+        self._wake = threading.Event()
+        self._deadline = time.monotonic() + remaining
+        self._message = message
+
+    @staticmethod
+    def _close(target) -> None:
+        import socket
+
+        sock = _response_socket(target)
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        close = getattr(target, "close", None)
+        if callable(close):
+            try:
+                close()
+            except OSError:
+                pass
+
+    def own(self, target):
+        """Register an object the timer may close; reject objects arriving after expiry."""
+        if time.monotonic() >= self._deadline:
+            self.close()
+        with self._lock:
+            closed = self._closed
+            if not closed:
+                self._targets.append(target)
+        if closed:
+            self._close(target)
+            raise TimeoutError(self._message)
+        return target
+
+    def require_open(self) -> float:
+        """Return real wall time left, or stop work before it can open or write a socket."""
+        remaining = self._deadline - time.monotonic()
+        with self._lock:
+            closed = self._closed
+        if closed or remaining <= 0:
+            self.close()
+            raise TimeoutError(self._message)
+        return remaining
+
+    def timeout(self) -> TimeoutError:
+        return TimeoutError(self._message)
+
+    def mark_sent(self) -> None:
+        """Record that model-request bytes are about to leave an established connection."""
+        with self._lock:
+            if self._closed:
+                raise TimeoutError(self._message)
+            self._sent = True
+
+    @property
+    def sent(self) -> bool:
+        with self._lock:
+            return self._sent
+
+    def wake(self) -> None:
+        self._wake.set()
+
+    def wait(self) -> None:
+        self._wake.wait(self.require_open())
+        self.require_open()
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            targets = tuple(reversed(self._targets))
+            self._targets.clear()
+        self._wake.set()
+        for target in targets:
+            self._close(target)
+
+
+def _owned_getaddrinfo(owner, address):
+    """Resolve within fixed global admission and give a late result no socket authority."""
+    import queue
+    import socket
+
+    if not _DNS_THREAD_SLOTS.acquire(timeout=owner.require_open()):
+        raise owner.timeout()
+    resolved = queue.Queue(maxsize=1)
+
+    def resolve() -> None:
+        try:
+            try:
+                answer = socket.getaddrinfo(address[0], address[1], 0, socket.SOCK_STREAM)
+            except OSError as error:
+                answer = error
+            try:
+                resolved.put_nowait(answer)
+            except queue.Full:
+                pass
+        finally:
+            _DNS_THREAD_SLOTS.release()
+            owner.wake()
+
+    thread = threading.Thread(target=resolve, name="shard-model-dns", daemon=True)
+    try:
+        thread.start()
+    except (OSError, RuntimeError) as error:
+        _DNS_THREAD_SLOTS.release()
+        raise OSError(f"could not start bounded model DNS resolver: {error}") from error
+    try:
+        owner.wait()
+        answer = resolved.get_nowait()
+    except queue.Empty as error:  # only a close/resolve race can wake without one result
+        raise owner.timeout() from error
+    if isinstance(answer, OSError):
+        raise answer
+    return answer
+
+
+def _owned_create_connection(owner, address, timeout, source_address=None):
+    """Connect within the response owner's wall deadline.
+
+    ``socket.getaddrinfo`` has no cancellable timeout. Resolve on one daemon whose only authority is
+    to return addresses; if the deadline wins, the caller returns without creating a socket and the
+    late resolver result cannot send the request. Every created socket is owned before ``connect``.
+    """
+    import socket
+
+    failures = []
+    for family, socktype, proto, _canonname, socket_address in _owned_getaddrinfo(owner, address):
+        owner.require_open()
+        sock = None
+        try:
+            sock = owner.own(socket.socket(family, socktype, proto))
+            connect_timeout = owner.require_open()
+            if timeout is not None and timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+                connect_timeout = min(connect_timeout, float(timeout))
+            sock.settimeout(connect_timeout)
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(socket_address)
+            owner.require_open()
+            return sock
+        except OSError as error:
+            failures.append(error)
+            if sock is not None:
+                sock.close()
+    if not failures:
+        raise OSError("getaddrinfo returned no stream addresses")
+    raise failures[-1]
+
+
+def _call_before_wall_deadline(response, remaining: float, operation, message: str):
+    """Run one blocking response operation while an independent wall timer owns its socket.
+
+    A socket timeout is an idle timeout, not a wall deadline: a peer can send one byte just before
+    each recv expires and keep ``BufferedReader.readline`` inside one unterminated line forever.  The
+    timer shuts the socket down from another thread, so the caller regains control even when no line
+    has returned for the ordinary monotonic check to observe.
+    """
+    import socket
+
+    if remaining <= 0:
+        raise TimeoutError(message)
+    expired = threading.Event()
+
+    def abort() -> None:
+        expired.set()
+        sock = _response_socket(response)
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        close = getattr(response, "close", None)
+        if callable(close):
+            try:
+                close()
+            except OSError:
+                pass
+
+    timer = threading.Timer(remaining, abort)
+    timer.daemon = True
+    try:
+        timer.start()
+    except RuntimeError as e:
+        raise _WallTimerStartError(f"could not start model wall timer: {e}") from e
+    try:
+        result = operation()
+    except BaseException as e:
+        if expired.is_set():
+            raise TimeoutError(message) from e
+        raise
+    finally:
+        timer.cancel()
+    if expired.is_set():
+        raise TimeoutError(message)
+    return result
+
+
+def _bounded_sse_lines(resp, max_bytes: int, max_lines: int, before_read=None):
+    """Yield a stream without allocating or retaining an unbounded provider response."""
+    readline = getattr(resp, "readline", None)
+    iterator = None if callable(readline) else iter(resp)
+    total = 0
+    count = 0
+    while True:
+        if iterator is None:
+            if before_read is not None:
+                before_read()
+            raw = readline(max_bytes + 1)
+            if not raw:
+                break
+        else:
+            try:
+                raw = next(iterator)
+            except StopIteration:
+                break
+        count += 1
+        if count > max_lines:
+            raise _StreamIntegrityError(f"SSE response exceeded {max_lines} lines")
+        if isinstance(raw, str):
+            total += len(raw.encode("utf-8", "replace"))
+        elif isinstance(raw, (bytes, bytearray)):
+            total += len(raw)
+        else:
+            raise TypeError("SSE line is not bytes or text")
+        if total > max_bytes:
+            raise _StreamIntegrityError(f"SSE response exceeded {max_bytes} bytes")
+        yield raw
+
+
 class _StreamPace:
     """Watchdog for one SSE stream: the ABSOLUTE ceiling always, plus the CLIENT-SIDE PER-STREAM
     THROUGHPUT floor when ``min_tps`` is set. The rate origin is the FIRST OUTPUT TOKEN, NOT the
@@ -454,7 +1029,7 @@ class _StreamPace:
     false-aborted (it would measure e.g. 20s of window with only ~9s of actual streaming). A token-less
     stall BEFORE the first token is not this guard's job: it's already bounded by idle_timeout (no
     bytes) and the absolute ceiling. Tumbling window: O(1), no per-chunk buffer. Both aborts raise
-    ``TimeoutError``, which ``_post`` converts to the retryable 598."""
+    ``TimeoutError``, which ``_post`` converts to a retryable post-wire timeout."""
 
     def __init__(self, backend: OpenRouterBackend, deadline: float) -> None:
         self.backend = backend
@@ -473,7 +1048,7 @@ class _StreamPace:
         if self.tps_on and self.t_first is not None and (now - self.t_first) >= self.backend.tps_grace \
                 and (now - self.t_anchor) >= self.backend.tps_window:
             # Tokens streamed since the anchor / elapsed STREAMING time (TTFT excluded, anchored at the 1st
-            # token). Sub-floor → retryable 598 (relax/reroute in ~tps_window, not the 900s ceiling).
+            # token). Sub-floor → retryable post-wire timeout (reroute in ~tps_window, not 900s).
             tps = ((out_chars - self.chars_anchor) / self.backend._CHARS_PER_TOK) / (now - self.t_anchor)
             if tps < self.backend.min_tps:
                 raise TimeoutError(
@@ -503,35 +1078,127 @@ class _SseAssembly:
     refusal: str | None = None
     finish: str = ""
     native: str = ""
-    usage: dict = field(default_factory=dict)
+    usage: object = field(default_factory=dict)
+    _validated_usage: _ProviderUsage | None = field(default=None, repr=False)
+    _usage_seen: bool = field(default=False, repr=False)
     frags: dict[int, dict] = field(default_factory=dict)   # tool_call index -> {id, name, args:[fragments]}
     out_chars: int = 0
     #: The model the PROVIDER says answered, off the chunks' own `model` field. Every chunk carries it
     #: and this reassembly discarded all of them, which is why no artefact this product writes could
     #: name the weights that produced it — the fact was in the bytes we already parse.
     model: str = ""
+    response_id: str = ""
+    role: str = ""
+    _models: list[str] = field(default_factory=list, repr=False)
+    _model_error: str = field(default="", repr=False)
+    _choice_index: int | None = field(default=None, repr=False)
 
     def add(self, chunk: dict) -> None:
         """Fold one parsed chunk in: usage, then the first choice's delta and finish reasons."""
-        if chunk.get("usage"):
-            self.usage = chunk["usage"]                    # rides on the final chunk (include_usage)
-        # LAST NAMING CHUNK WINS, deliberately rather than incidentally: a route that re-decides
-        # mid-stream should be reported as what it FINISHED on, not what it opened with. `or
-        # self.model` is what makes that true — a later chunk that omits the field must not erase a
-        # name an earlier one gave.
-        self.model = str(chunk.get("model") or self.model)
-        choices = chunk.get("choices") or []
-        if not choices:
+        if not isinstance(chunk, dict):
+            raise TypeError("SSE chunk is not an object")
+        chunk_response_id = self._add_metadata(chunk)
+        choice = self._choice(chunk)
+        if choice is None:
             return
+        if not chunk_response_id:
+            raise _StreamIntegrityError("SSE choice carried no response id")
+        delta, finish, native = choice
+        if self.finish:
+            self._check_after_finish(delta, finish, native)
+            return
+        self._add_delta(delta)
+        if finish:
+            self.finish = finish
+        if native:
+            self.native = native
+
+    def _add_metadata(self, chunk: dict) -> str:
+        """Capture usage and the response-wide identities which may not change mid-stream."""
+        if chunk.get("usage") is not None:
+            try:
+                candidate = _provider_usage(chunk["usage"])
+            except ValueError as e:
+                raise _UsageIntegrityError(str(e)) from e
+            if self._usage_seen and candidate != self._validated_usage:
+                raise _UsageIntegrityError("conflicting SSE usage records")
+            self.usage = chunk["usage"]                    # rides on the final chunk (include_usage)
+            self._validated_usage = candidate
+            self._usage_seen = True
+        named = chunk.get("model")
+        if named is not None and not isinstance(named, str):
+            self._model_error = "carried a non-string SSE model identity"
+        elif named:
+            if named not in self._models:
+                self._models.append(named)
+            if len(self._models) > 1:
+                self._model_error = f"named conflicting SSE models: {self._models!r}"
+            if not self.model:
+                self.model = named
+        response_id = chunk.get("id")
+        if response_id is not None and not isinstance(response_id, str):
+            raise _StreamIntegrityError("SSE response id is not a string")
+        if response_id:
+            if self.response_id and response_id != self.response_id:
+                raise _StreamIntegrityError(
+                    f"SSE response id changed from {self.response_id!r} to {response_id!r}")
+            self.response_id = response_id
+        return response_id or ""
+
+    def _choice(self, chunk: dict) -> tuple[dict, str, str] | None:
+        """Return one structurally valid choice, or ``None`` for a usage-only chunk."""
+        choices = chunk.get("choices")
+        if choices is None:
+            choices = []
+        if not isinstance(choices, list):
+            raise TypeError("SSE choices is not a list")
+        if not choices:
+            return None
+        if len(choices) != 1:
+            raise _StreamIntegrityError("SSE chunk carried more than one choice")
         ch = choices[0]
-        self._add_delta(ch.get("delta") or {})
-        if ch.get("finish_reason"):
-            self.finish = ch["finish_reason"]
-        if ch.get("native_finish_reason"):
-            self.native = ch["native_finish_reason"]
+        if not isinstance(ch, dict):
+            raise TypeError("SSE choice is not an object")
+        index = ch.get("index", 0)
+        if isinstance(index, bool) or not isinstance(index, int):
+            raise _StreamIntegrityError("SSE choice index is not an integer")
+        if self._choice_index is None:
+            self._choice_index = index
+        elif index != self._choice_index:
+            raise _StreamIntegrityError(
+                f"SSE choice index changed from {self._choice_index} to {index}")
+        delta = ch.get("delta")
+        if delta is None:
+            delta = {}
+        if not isinstance(delta, dict):
+            raise TypeError("SSE choice delta is not an object")
+        finish = ch.get("finish_reason") or ""
+        native = ch.get("native_finish_reason") or ""
+        if not isinstance(finish, str) or not isinstance(native, str):
+            raise TypeError("SSE finish reason is not a string")
+        return delta, finish, native
+
+    def _check_after_finish(self, delta: dict, finish: str, native: str) -> None:
+        """A choice may not alter output or terminal fields after it declares completion."""
+        if delta:
+            raise TypeError("SSE choice carried a nonempty delta after finish_reason")
+        if finish and finish != self.finish:
+            raise TypeError("SSE choice changed finish_reason after completion")
+        if native and native != self.native:
+            raise TypeError("SSE choice changed native_finish_reason after completion")
 
     def _add_delta(self, delta: dict) -> None:
         """Append this delta's text fields and tool-call fragments, counting every output char."""
+        role = delta.get("role")
+        if role is not None and not isinstance(role, str):
+            raise _StreamIntegrityError("SSE delta role is not a string")
+        if role:
+            if role != "assistant":
+                raise _StreamIntegrityError(f"SSE delta carried unsupported role {role!r}")
+            if self.role and role != self.role:
+                raise _StreamIntegrityError(
+                    f"SSE delta role changed from {self.role!r} to {role!r}")
+            self.role = role
         if delta.get("content"):
             self.content.append(delta["content"])
             self.out_chars += len(delta["content"])        # feeds the min_tps guard (all output counts)
@@ -541,21 +1208,90 @@ class _SseAssembly:
         if delta.get("refusal"):
             self.refusal = (self.refusal or "") + delta["refusal"]
             self.out_chars += len(delta["refusal"])
-        for tc in (delta.get("tool_calls") or []):
+        tool_calls = delta.get("tool_calls")
+        if tool_calls is None:
+            tool_calls = []
+        if not isinstance(tool_calls, list):
+            raise TypeError("SSE tool_calls is not a list")
+        for tc in tool_calls:
             self._merge_tool_call(tc)
 
     def _merge_tool_call(self, tc: dict) -> None:
         """One fragment of one tool call, slotted by its stream ``index``: ``id`` and ``name`` land
         once; ``arguments`` fragments concatenate in arrival order."""
-        slot = self.frags.setdefault(tc.get("index", 0), {"id": None, "name": None, "args": []})
-        if tc.get("id"):
-            slot["id"] = tc["id"]
-        fn = tc.get("function") or {}
-        if fn.get("name"):
-            slot["name"] = fn["name"]
-        if fn.get("arguments"):
-            slot["args"].append(fn["arguments"])
-            self.out_chars += len(fn["arguments"])
+        index, slot = self._tool_call_slot(tc)
+        fn = tc.get("function")
+        if fn is None:
+            fn = {}
+        if not isinstance(fn, dict):
+            raise TypeError("SSE tool-call function is not an object")
+        name = fn.get("name")
+        if name is not None and not isinstance(name, str):
+            raise _StreamIntegrityError("SSE tool-call name is not a string")
+        if name:
+            if slot["name"] is not None and slot["name"] != name:
+                raise _StreamIntegrityError(
+                    f"SSE tool-call index {index} changed name from {slot['name']!r} to {name!r}")
+            slot["name"] = name
+        arguments = fn.get("arguments")
+        if arguments is not None and not isinstance(arguments, str):
+            raise TypeError("SSE tool-call arguments are not a string")
+        if arguments:
+            slot["args"].append(arguments)
+            self.out_chars += len(arguments)
+
+    def _tool_call_slot(self, tc: dict) -> tuple[int, dict]:
+        """Validate and retain the discriminators which identify one fragmented tool call."""
+        if not isinstance(tc, dict):
+            raise TypeError("SSE tool call is not an object")
+        index = tc.get("index", 0)
+        if isinstance(index, bool) or not isinstance(index, int):
+            raise _StreamIntegrityError("SSE tool-call index is not an integer")
+        slot = self.frags.setdefault(index, {"id": None, "type": None, "name": None, "args": []})
+        call_id = tc.get("id")
+        if call_id is not None and not isinstance(call_id, str):
+            raise _StreamIntegrityError("SSE tool-call id is not a string")
+        if call_id:
+            if slot["id"] is not None and slot["id"] != call_id:
+                raise _StreamIntegrityError(
+                    f"SSE tool-call index {index} changed id from {slot['id']!r} to {call_id!r}")
+            if any(other_index != index and other["id"] == call_id
+                   for other_index, other in self.frags.items()):
+                raise _StreamIntegrityError(f"SSE tool-call id {call_id!r} is duplicated")
+            slot["id"] = call_id
+        call_type = tc.get("type")
+        if call_type is not None and not isinstance(call_type, str):
+            raise _StreamIntegrityError("SSE tool-call type is not a string")
+        if call_type is not None:
+            if call_type != "function":
+                raise _StreamIntegrityError(
+                    f"SSE tool-call index {index} carried unsupported type {call_type!r}")
+            if slot["type"] is not None and slot["type"] != call_type:
+                raise _StreamIntegrityError(
+                    f"SSE tool-call index {index} changed type from {slot['type']!r} "
+                    f"to {call_type!r}")
+            slot["type"] = call_type
+        return index, slot
+
+    def _assembled_tool_calls(self) -> list[dict]:
+        """Build calls only after their IDs form a complete one-to-one correlation key."""
+        calls = []
+        call_ids = set()
+        for index in sorted(self.frags):
+            fragment = self.frags[index]
+            call_id = fragment["id"]
+            if not call_id:
+                raise _StreamIntegrityError(f"SSE tool-call index {index} has no nonempty id")
+            if call_id in call_ids:
+                raise _StreamIntegrityError(f"SSE tool-call id {call_id!r} is duplicated")
+            call_ids.add(call_id)
+            calls.append({
+                "id": call_id,
+                "type": fragment["type"] or "function",
+                "function": {"name": fragment["name"] or "",
+                             "arguments": "".join(fragment["args"])},
+            })
+        return calls
 
     def response(self) -> dict:
         """The finished non-streaming response — exactly the ``{choices: [{message, finish_reason,
@@ -565,16 +1301,13 @@ class _SseAssembly:
         # that strictly validates message roles (SiliconFlow/Kimi: HTTP 400 "Input tag '' ... does not match
         # 'system','user','assistant','tool'"; baidu/GLM under tool_choice=required: 422 "role invalid literal")
         # rejects a role-less assistant message. Omitting it silently broke every multi-turn tool call on those.
-        message: dict = {"role": "assistant", "content": "".join(self.content)}
+        message: dict = {"role": self.role or "assistant", "content": "".join(self.content)}
         if self.reasoning:
             message["reasoning"] = "".join(self.reasoning)
         if self.refusal is not None:
             message["refusal"] = self.refusal
         if self.frags:
-            message["tool_calls"] = [
-                {"id": f["id"] or f"call_{i}", "type": "function",
-                 "function": {"name": f["name"] or "", "arguments": "".join(f["args"])}}
-                for i, f in enumerate(self.frags[k] for k in sorted(self.frags))]
+            message["tool_calls"] = self._assembled_tool_calls()
         choice: dict = {"message": message, "finish_reason": self.finish}
         if self.native:
             choice["native_finish_reason"] = self.native
@@ -582,7 +1315,15 @@ class _SseAssembly:
         # with the fields it was written to show. `""` when no chunk named one, which is the same
         # thing a non-streaming response with no `model` key gives the parsers — they read it with
         # `.get`, so an absent key and an empty one are one case and only one of them needs a branch.
-        return {"choices": [choice], "usage": self.usage, "model": self.model}
+        response = {"choices": [choice], "usage": self.usage, "model": self.model}
+        if self.response_id:
+            response["id"] = self.response_id
+        if self._model_error:
+            # Keep reading after the conflict so a final, internally consistent usage record can be
+            # billed. The parser rejects this marker before it exposes any assembled tool call.
+            response["_model_identity_error"] = self._model_error
+            response["_model_identities"] = list(self._models)
+        return response
 
 
 class OpenRouterBackend:
@@ -603,23 +1344,34 @@ class OpenRouterBackend:
     NO new bytes), applied by urllib per-recv, so a completion that keeps emitting tokens never trips it
     however long it runs — only a real mid-stream stall (no bytes for idle_timeout) aborts. `absolute_timeout`
     (default 900s) is a final backstop against a pathological byte-every-89s slow-drip (still ≪ the 2h task
-    wall). A stall/abort is a RETRYABLE transient (code 598, in the retry set), and on any retry the provider
+    wall). A stall/abort is a RETRYABLE local transport result, and on any retry the provider
     routing is RELAXED (a hard pin becomes an order-preference with `allow_fallbacks=True`, quantization floor
     kept) so OpenRouter reroutes off the hung provider — first try keeps the exact fp8 pin, a hang opens the
     whole fp8 pool. The SSE stream is reassembled into the same non-streaming response shape the parsers
     already consume, so the completion/tool-calling/refusal/finish_reason logic is unchanged."""
 
     ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
-    # Retryable transient HTTP/transport codes, shared by complete() and chat() so both paths agree:
-    # 429 rate-limit, 5xx upstream, 598 = local read/connect TIMEOUT (the hang), 599 = empty/malformed body.
+    # Retryable transient HTTP/transport results, shared by complete() and chat() so both paths agree.
+    # Positive values are completed HTTP responses. Negative values are local outcomes, separated so a
+    # DNS failure cannot be billed as a request and a real HTTP 503 cannot be called an abandoned stream.
     # 520-524 = Cloudflare edge/origin errors (unknown-error / down / timeout / SSL / origin-timeout). Providers
     # fronted by Cloudflare (e.g. Z.AI first-party) emit these under sustained load — they are transient origin
     # blips, NOT terminal. Omitting them aborted whole tasks on a single blip (a 117-step run zeroed by one 520).
-    _RETRY_CODES = (429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 598, 599)
+    _RETRY_CODES = (429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 598, 599,
+                    _PRE_WIRE_TRANSIENT_CODE, _PRE_WIRE_TIMEOUT_CODE, _POST_WIRE_TIMEOUT_CODE,
+                    _POST_WIRE_TRANSPORT_CODE, _MALFORMED_STREAM_CODE)
 
     # Approx chars-per-output-token for the client-side `min_tps` guard. A coarse estimate is fine (the
     # guard only distinguishes a <10 tps drip from a 50+ tps healthy stream), never a billing figure.
     _CHARS_PER_TOK = 4.0
+
+    # 32,768 output tokens are normally about 128 KiB. Four MiB leaves 128 wire bytes per maximum
+    # output token, including SSE framing and usage, while refusing the multi-megabyte response a
+    # non-conforming endpoint can send despite `max_tokens`. Four lines per possible output token
+    # likewise preserves token-at-a-time streaming while bounding keepalive/chunk CPU.
+    _MAX_STREAM_BYTES = 4 * 1024 * 1024
+    _MAX_STREAM_LINES = 4 * 32768
+    _MAX_ERROR_BYTES = 4096
 
     def __init__(self, *, api_key: str | None = None, model_map: dict[str, str] | None = None,
                  base_url: str | None = None, max_tokens: int = 32768, retries: int = 4,
@@ -669,13 +1421,17 @@ class OpenRouterBackend:
                        # anything", and the two must not print as the same sentence to a customer
                        # reconciling a bill against the ceiling they set.
                        "priced_requests": 0,
+                       # Token totals can be absent independently of price. This count lets the
+                       # customer-facing artefact say when a total is only a floor.
+                       "token_reported_requests": 0,
                        # REQUESTS THE PROVIDER SERVED AND WE NEVER SAW THE END OF. A stream aborted by
                        # the idle guard, the throughput floor or the absolute ceiling produced tokens
-                       # the provider generated and bills for, and returns `(None, 598, …)` — no body,
+                       # the provider generated and bills for, and returns a post-wire local outcome — no body,
                        # no `usage`, nothing to accumulate. Counted here rather than left out, because
                        # a ledger that silently omits them reports a run as cheaper than the invoice
                        # will say it was, and the omission grows with exactly the provider trouble a
-                       # customer would want to see.
+                       # customer would want to see. These are a subset of `llm_requests`, not an
+                       # alternative counter: submission exports `llm_requests` as the request total.
                        "abandoned_requests": 0}
         # The absolute deadline of the turn in flight ON THIS THREAD. See `_turn_ceiling`.
         self._turn = threading.local()
@@ -696,7 +1452,7 @@ class OpenRouterBackend:
         self.idle_timeout = idle_timeout
         # ABSOLUTE CEILING — a final backstop measured across the WHOLE stream, so a pathological slow-drip
         # (a byte every 89s, never tripping idle_timeout) still can't run forever. Generous (default 900s,
-        # ≫ any legit turn but ≪ the 2h task wall); hitting it aborts as a retryable stall (598).
+        # ≫ any legit turn but ≪ the 2h task wall); hitting it aborts as a retryable post-wire stall.
         self.absolute_timeout = absolute_timeout
         self._monotonic = monotonic  # injectable wall-clock for the absolute ceiling (deterministic tests)
         # OpenRouter PROVIDER ROUTING: pin the upstream provider(s) that serve a model (e.g. AkashML
@@ -738,7 +1494,7 @@ class OpenRouterBackend:
         # fine (exactly the freeze — quick test calls returned in ~1s while the concurrent streaming/tool
         # requests stalled). `min_tps` measures the ACTUAL token rate of THIS stream over a tumbling window
         # (`tps_window`, after a `tps_grace` warmup that absorbs TTFT + ramp) and aborts a sub-floor stream as
-        # a retryable 598 → the retry relaxes routing and reroutes off the drip in ~tps_window seconds instead
+        # a retryable local timeout → reroute off the drip in ~tps_window seconds instead
         # of grinding to absolute_timeout (900s). None = off (default; existing runs unchanged). Token count
         # is approximate (chars / _CHARS_PER_TOK) — coarse is fine: a drip is <10 tps, a healthy GLM stream
         # 50-150+, so the estimate trivially separates them.
@@ -760,32 +1516,26 @@ class OpenRouterBackend:
     def _resolve(self, model: str) -> str:
         return self.model_map.get(model, model)  # tier alias → slug, else pass the slug through
 
-    def _accumulate_usage(self, usage: dict, gen_sec: float = 0.0) -> None:
+    def _accumulate_usage(self, usage: _ProviderUsage, gen_sec: float = 0.0) -> None:
         """Add one response's token usage to the per-task running total (the benchmark's cost schema). Called
         once per completed request (streaming or not); each call = one billed llm_request. Robust to a
         provider that omits fields (they default 0).
 
-        **THE REQUEST IS COUNTED EVEN WHEN THE PROVIDER REPORTS NO USAGE, and that is the whole point of
-        the early return moving.** It used to return before `llm_requests += 1`, so an endpoint that
-        omits `usage` — a self-hosted vLLM, which `cli.py` calls "the guaranteed EU-residency path" —
-        left the counter at 0 after N real billed requests. `_cost_line` reads that counter to decide
-        between "cost not reported by this endpoint" and "no inference", so a run that made 200 requests
-        rendered as **"0 tokens of 400,000, no inference"**: the report asserted the opposite of what
-        happened, and a customer reconciling it against their provider bill had nothing to reconcile
-        with. Counting the request is what makes the tri-state able to tell "we spent nothing" apart
-        from "we cannot see what we spent"."""
+        **THE REQUEST AND ITS LOCALLY MEASURED TIME ARE COUNTED EVEN WHEN THE PROVIDER REPORTS NO
+        USAGE.** It used to return before either field, so a self-hosted vLLM — which need not emit a
+        usage object — made real requests but rendered as "no inference" and erased every measured
+        generation second. Provider token and price fields remain conditional; the two facts observed
+        by this process do not depend on provider metadata."""
         with self._usage_lock:
             self._usage["llm_requests"] += 1
-        if not usage:
-            return
-        with self._usage_lock:
-            self._usage["input_tokens"] += int(usage.get("prompt_tokens", 0) or 0)
-            self._usage["output_tokens"] += int(usage.get("completion_tokens", 0) or 0)
-            _ptd = usage.get("prompt_tokens_details") or {}
-            self._usage["cached_tokens"] += int(_ptd.get("cached_tokens", 0) or 0)
-            self._usage["total_tokens"] += int(usage.get("total_tokens", 0) or 0)
-            # `llm_requests` is counted ABOVE, before the no-usage early return — see the docstring.
             self._usage["generation_sec"] += float(gen_sec or 0.0)
+            if not usage.reported:
+                return
+            self._usage["input_tokens"] += usage.input_tokens
+            self._usage["output_tokens"] += usage.output_tokens
+            self._usage["cached_tokens"] += usage.cached_tokens
+            self._usage["total_tokens"] += usage.total_tokens
+            # `llm_requests` and `generation_sec` are counted ABOVE — see the docstring.
             # B3 — the two fields the benchmark's cost schema asks for that we were discarding, both of which OpenRouter
             # already returns on every response:
             #   * `cost` is the REAL billed amount. Reporting it beats `est_usd_cost`'s price-times-tokens
@@ -795,14 +1545,38 @@ class OpenRouterBackend:
             # schema wants NON-cached input, and that subtraction belongs in the reporter (make_submission),
             # not here, so this dict keeps meaning exactly what the provider said. Getting that backwards is
             # what made the submission overstate input cost by 6.5x.
-            self._usage["cost_usd"] += float(usage.get("cost", 0.0) or 0.0)
-            self._usage["cache_write_tokens"] += int(_ptd.get("cache_write_tokens", 0) or 0)
+            self._usage["cost_usd"] += usage.cost_usd
+            self._usage["cache_write_tokens"] += usage.cache_write_tokens
+            if usage.tokens_reported:
+                self._usage["token_reported_requests"] += 1
             # PRESENCE, not amount: a response that omits `cost` is one this endpoint did not price, and
             # summing it as 0.0 silently understates the run. Counted here so a reporter can say "not
             # priced" instead of "$0.00" — the same class of decorative number as the ceiling that never
             # fired. `is not None` rather than truthiness: a genuine free-tier 0.0 IS a price.
-            if usage.get("cost") is not None:
+            if not usage.unpriced:
                 self._usage["priced_requests"] += 1
+
+    def _data_less_accounting(self, code: int, gen_sec: float) -> tuple[int, int]:
+        """Return ``(abandoned, unpriced)`` and book a completed HTTP response exactly once."""
+        if code > 0:
+            usage = _provider_usage(None)
+            self._accumulate_usage(usage, gen_sec)
+            return 0, usage.unpriced
+        if code in _NO_ABANDON_CODES:
+            return 0, 0
+        self._record_abandoned(gen_sec)
+        return 1, 0
+
+    def _record_abandoned(self, gen_sec: float) -> None:
+        """Book one post-wire attempt whose provider usage never became trustworthy."""
+        with self._usage_lock:
+            self._usage["llm_requests"] += 1
+            self._usage["generation_sec"] += float(gen_sec or 0.0)
+            self._usage["abandoned_requests"] += 1
+
+    def _account_abandoned(self, result) -> int:
+        """Return abandoned attempts already booked where their transport outcome was observed."""
+        return int(result.abandoned_attempts or 0)
 
     def _turn_ceiling(self):
         """A context manager stamping ONE absolute deadline for a whole retry ladder.
@@ -833,11 +1607,30 @@ class OpenRouterBackend:
 
         return _stamped()
 
-    def _turn_deadline(self) -> float:
+    def _turn_deadline(self, now: float | None = None) -> float:
         """When the turn in flight on THIS thread must be over. A fresh per-attempt ceiling when there
         is no turn — a direct `_post` caller keeps the behaviour this class always had."""
         deadline = getattr(self._turn, "deadline", None)
-        return self._monotonic() + self.absolute_timeout if deadline is None else deadline
+        if deadline is not None:
+            return deadline
+        return (self._monotonic() if now is None else now) + self.absolute_timeout
+
+    def _wait_for_retry(self, deadline: float, attempt: int, model: str, code: int,
+                        error: str) -> bool:
+        """Wait only when both the backoff and the next request fit inside this turn."""
+        delay = self.backoff * (2 ** attempt)
+        remaining = deadline - self._monotonic()
+        if remaining <= 0 or delay >= remaining:
+            return False
+        # This is the only diagnostic a provider stall/reroute emits: none of it reaches the run
+        # journal. Emit it before sleeping so a long backoff does not look like a silent worker hang.
+        route = "" if code in _PRE_WIRE_CODES else ", routing relaxed"
+        _log.warning("provider %s failed with %d (%s); retry %d/%d in %.1fs%s",
+                     model, code, error[:120], attempt + 1, self.retries, delay, route)
+        self._sleep(delay)
+        if self._monotonic() >= deadline:
+            return False
+        return True
 
     def usage_summary(self) -> dict:
         """Per-task token/request totals accumulated across every request this backend served (the solver
@@ -845,112 +1638,260 @@ class OpenRouterBackend:
         with self._usage_lock:
             return dict(self._usage)
 
-    def _post(self, payload: dict, timeout: int, relax: bool = False) -> tuple[dict | None, int, str]:
-        """POST a STREAMING chat-completions request and reassemble the SSE stream into the SAME
-        non-streaming response shape the parsers already consume (``{choices:[{message, finish_reason,
-        native_finish_reason}], usage}``) — so ``_once``/``_chat_once`` (and all the refusal/reasoning/
-        finish_reason logic) are unchanged. Returns ``(data, http_code, error)``: on success ``(data, 200,
-        "")``; on an HTTP error ``(None, code, detail)``; on an IDLE STALL or the absolute-ceiling backstop
-        ``(None, 598, detail)``; on a truncated/malformed stream ``(None, 599, detail)``; on any other
-        transport error ``(None, 503, detail)``.
-
-        Why stream: a NON-streaming read makes the socket timeout ≈ total generation time, so a large but
-        HEALTHY completion false-times-out. Streaming lets the socket timeout be the IDLE (inter-read) gap
-        (``idle_timeout``) — a completion that keeps emitting tokens never trips it however long it runs;
-        only a real mid-stream stall aborts. ``absolute_timeout`` backstops a pathological slow-drip. Both
-        aborts are retryable (598) and the retry (``relax=True``) opens provider routing to reroute off the
-        bad provider. The caller builds its own domain result so the completion and tool-calling paths stay
-        type-distinct (LLMResult vs ChatResult)."""
+    def _http_error(self, error, deadline: float, idle: float) -> tuple[None, int, str]:
+        """Read one bounded provider error without letting its body escape the turn deadline."""
         import http.client
-        import json as _json
         import socket
-        import urllib.error
+
+        ceiling_error = f"absolute error-body ceiling {self.absolute_timeout}s exceeded"
+        try:
+            raw = _call_before_wall_deadline(
+                error, deadline - self._monotonic(),
+                lambda: error.read(self._MAX_ERROR_BYTES + 1),
+                ceiling_error)
+            # The read can complete as the timer becomes runnable but before its callback is
+            # scheduled. The production clock closes that narrow race; the timer owns the blocking
+            # case where no Python instruction can make this check.
+            if self._monotonic() >= deadline:
+                raise TimeoutError(ceiling_error)
+        except (TimeoutError, socket.timeout) as body_error:
+            return None, error.code, (
+                f"http {error.code}: response body exceeded its bound: "
+                f"{type(body_error).__name__}: {body_error}")
+        except (http.client.HTTPException, OSError, _WallTimerStartError) as body_error:
+            # Status and headers completed, so this remains the provider's positive HTTP response even
+            # when its diagnostic body is truncated or framed illegally. Calling it abandoned would
+            # count one complete request twice; letting the body exception escape would lose it whole.
+            return None, error.code, (
+                f"http {error.code}: response body could not be read within its bound: "
+                f"{type(body_error).__name__}: {body_error}")
+        decoded = raw[:self._MAX_ERROR_BYTES].decode("utf-8", "replace")
+        detail = decoded[:300]
+        if len(raw) > self._MAX_ERROR_BYTES or len(decoded) > len(detail):
+            detail += " [response body truncated]"
+        return None, error.code, f"http {error.code}: {detail}"
+
+    def _read_stream_response(self, req, idle: float, deadline: float,
+                              owner: _WallResponseOwner, ceiling_error: str) -> dict:
+        """Own connect, headers and body under one timer while preserving per-read idle limits."""
+        previous_timeout = getattr(self._turn, "read_timeout", None)
+        self._turn.read_timeout = idle
+
+        def consume():
+            with _open_stream(req, timeout=idle) as response:
+                # A returned HTTPResponse proves the request crossed the wire even when a custom
+                # opener bypasses the owned connection classes used by production urllib.
+                owner.mark_sent()
+                owner.own(response)
+                return self._read_sse(response, deadline)
+
+        try:
+            return _call_before_wall_deadline(
+                owner, deadline - self._monotonic(), consume, ceiling_error)
+        finally:
+            self._turn.read_timeout = previous_timeout
+
+    def _stream_request(self, payload: dict, timeout: int, relax: bool, deadline: float):
+        """Serialize one streaming request and return its fresh pre-I/O ceiling."""
+        import json as _json
         import urllib.request
 
-        prov = self._provider_block(relax)
-        if prov:
-            payload["provider"] = prov
-        # STREAM so the socket timeout can be an IDLE gap, not the total-generation cap (the false-timeout
-        # fix). include_usage → the final SSE chunk carries usage.total_tokens.
+        if deadline - self._monotonic() <= 0:
+            return None, 0.0, 0.0
+        endpoint = urllib.parse.urlsplit(self.endpoint)
+        if endpoint.scheme not in ("http", "https") or not endpoint.hostname:
+            raise ValueError("model endpoint must be an absolute HTTP(S) URL")
+        if endpoint.username is not None or endpoint.password is not None:
+            raise ValueError("model endpoint must not contain credentials")
+        _port = endpoint.port  # access validates an explicitly supplied port before any socket work
+        provider = self._provider_block(relax)
+        if provider:
+            payload["provider"] = provider
         payload["stream"] = True
         payload["stream_options"] = {"include_usage": True}
-        # The per-recv socket timeout = the IDLE (no-new-bytes) gap. urllib applies it to EACH blocking read
-        # (connect + each recv), so a stream that keeps flowing never trips it; a stall beyond idle_timeout
-        # aborts fast. min(caller, idle_timeout): the loop threads in 600, we still cap the read-gap.
-        idle = min(int(timeout), self.idle_timeout)
-        req = urllib.request.Request(self.endpoint, data=_json.dumps(payload).encode("utf-8"),
-                                     method="POST", headers={
+        request_body = _json.dumps(payload).encode("utf-8")
+        remaining = deadline - self._monotonic()
+        if remaining <= 0:
+            return None, 0.0, remaining
+        idle = min(float(timeout), float(self.idle_timeout), remaining)
+        request = urllib.request.Request(self.endpoint, data=request_body, method="POST", headers={
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
             "HTTP-Referer": self.referer,
             "X-Title": self.title,
         })
+        return request, idle, remaining
+
+    @staticmethod
+    def _postwire_or_config(owner: _WallResponseOwner, error: Exception,
+                            post_code: int, post_detail: str) -> tuple[None, int, str]:
+        if not owner.sent:
+            return None, _PRE_WIRE_CONFIG_CODE, (
+                f"invalid provider request: {type(error).__name__}: {error}")
+        return None, post_code, post_detail
+
+    @staticmethod
+    def _url_error_result(error, owner: _WallResponseOwner,
+                          idle: float) -> tuple[None, int, str]:
+        import socket
+
+        if isinstance(error.reason, (TimeoutError, socket.timeout)):
+            code = _POST_WIRE_TIMEOUT_CODE if owner.sent else _PRE_WIRE_TIMEOUT_CODE
+            return None, code, f"idle/stall timeout after {idle:g}s: {error.reason}"
+        code = _POST_WIRE_TRANSPORT_CODE if owner.sent else _PRE_WIRE_TRANSIENT_CODE
+        return None, code, f"{type(error).__name__}: {error}"
+
+    @staticmethod
+    def _http_parser_result(error, owner: _WallResponseOwner) -> tuple[None, int, str]:
+        """Separate local request defects from a proxy's failed pre-wire negotiation."""
+        import http.client
+
+        if not owner.sent:
+            if isinstance(error, http.client.InvalidURL):
+                return None, _PRE_WIRE_CONFIG_CODE, (
+                    f"invalid provider request: {type(error).__name__}: {error}")
+            # HTTPS proxy CONNECT is parsed before the model request exists. A malformed proxy
+            # response is therefore retryable without billing or relaxing provider routing; treating
+            # every pre-send parser error as local configuration made one bad proxy edge terminal.
+            return None, _PRE_WIRE_TRANSIENT_CODE, (
+                f"pre-wire HTTP negotiation failed: {type(error).__name__}: {error}")
+        return None, _MALFORMED_STREAM_CODE, (
+            f"malformed HTTP response: {type(error).__name__}: {error}")
+
+    def _post_open(self, req, idle: float, deadline: float, owner: _WallResponseOwner,
+                   ceiling_error: str) -> tuple[dict | None, int, str]:
+        """Open and parse one prepared request, translating only transport/parser failures."""
+        import http.client
+        import json as _json
+        import socket
+        import urllib.error
+
         try:
-            with urllib.request.urlopen(req, timeout=idle) as resp:
-                # ABSOLUTE ceiling: a final backstop measured across the whole stream so a byte-every-89s
-                # slow-drip can't run forever (still ≪ the task wall); hitting it aborts as a retryable stall.
-                #
-                # THE TURN'S CEILING WHERE THERE IS ONE, and this attempt's otherwise. `chat` and
-                # `complete` stamp a deadline for the whole retry ladder — see `_turn_ceiling` — so a
-                # five-rung ladder cannot spend five times the absolute ceiling on one step. Falling
-                # back to a fresh one keeps this method's own contract intact for a direct caller.
-                return self._read_sse(resp, self._turn_deadline()), 200, ""
+            # Ownership starts before connect/status/header work. urllib exposes a response only after
+            # parsing its headers, so a response-level timer would leave that whole phase unbounded.
+            data = self._read_stream_response(req, idle, deadline, owner, ceiling_error)
+            return data, 200, ""
         except urllib.error.HTTPError as e:
-            return None, e.code, f"http {e.code}: {e.read().decode('utf-8', 'replace')[:300]}"
+            try:
+                return self._http_error(e, deadline, idle)
+            finally:
+                try:
+                    e.close()
+                except OSError:
+                    pass
         except (TimeoutError, socket.timeout) as e:
-            # The STALL: an idle gap (no bytes for idle_timeout) or the absolute-ceiling backstop. 598 is in
-            # the retry set, and the retry relaxes provider routing so we reroute off the stalled provider.
-            return None, 598, f"idle/stall timeout after {idle}s: {type(e).__name__}: {e}"
+            code = _POST_WIRE_TIMEOUT_CODE if owner.sent else _PRE_WIRE_TIMEOUT_CODE
+            return None, code, f"idle/stall timeout after {idle:g}s: {type(e).__name__}: {e}"
         except urllib.error.URLError as e:
-            # A connect-phase timeout can arrive wrapped in URLError — still route it down the 598 path.
-            if isinstance(e.reason, (TimeoutError, socket.timeout)):
-                return None, 598, f"idle/stall timeout after {idle}s: {e.reason}"
-            return None, 503, f"{type(e).__name__}: {e}"
-        except (_json.JSONDecodeError, http.client.IncompleteRead, TypeError) as e:
-            # A truncated/malformed stream (connection dropped mid-SSE, a non-JSON chunk) must NOT raise —
-            # an uncaught error here propagated all the way up and killed the whole task as an errored MISS.
-            # Convert it to the same retryable 599 the empty-completion path uses, so the backoff handles it.
-            #
-            # `TypeError` is the WELL-FORMED-JSON, WRONG-TYPE case, and it was the one class this arm
-            # promised to cover and did not. A provider streaming `"content": 42` or `"arguments": 7`
-            # parses fine and then reaches `len(...)` and `"".join(...)` in the reassembler. **The
-            # customer supplies inference on every tier**, so a self-hosted vLLM or a proxy that
-            # serialises a number where the spec says string is a configuration we neither control nor
-            # can test against — and it killed a paid run outright while every other malformed-stream
-            # case retried. Coercing instead was rejected: it would silently turn a bool into the text
-            # "True" inside the model's own output, which is a fabricated answer rather than a refused
-            # one. A non-conforming chunk IS a transport fault, so it gets the transport's answer.
-            return None, 599, f"malformed stream: {type(e).__name__}: {e}"
+            return self._url_error_result(e, owner, idle)
+        except _UsageIntegrityError as e:
+            return None, _USAGE_INTEGRITY_CODE, f"invalid provider usage: {e}"
+        except _StreamIntegrityError as e:
+            return None, _STREAM_INTEGRITY_CODE, f"invalid provider stream: {e}"
+        except RecursionError as e:
+            return None, _STREAM_INTEGRITY_CODE, f"invalid provider stream: JSON nesting limit: {e}"
+        except _WallTimerStartError as e:
+            code = _POST_WIRE_TRANSPORT_CODE if owner.sent else _PRE_WIRE_TRANSIENT_CODE
+            return None, code, f"{type(e).__name__}: {e}"
+        except (_json.JSONDecodeError, http.client.IncompleteRead, EOFError, TypeError) as e:
+            return self._postwire_or_config(
+                owner, e, _MALFORMED_STREAM_CODE,
+                f"malformed stream: {type(e).__name__}: {e}")
+        except ValueError as e:
+            return self._postwire_or_config(
+                owner, e, _STREAM_INTEGRITY_CODE,
+                f"invalid provider stream: JSON value limit: {e}")
+        except http.client.HTTPException as e:
+            return self._http_parser_result(e, owner)
         except OSError as e:
-            # Any other transport error (connection reset/abort, DNS, broken pipe) — transient, retryable.
-            # Belt-and-braces: a single hung/broken request must NEVER propagate and kill the task.
-            return None, 503, f"{type(e).__name__}: {e}"
+            code = _POST_WIRE_TRANSPORT_CODE if owner.sent else _PRE_WIRE_TRANSIENT_CODE
+            return None, code, f"{type(e).__name__}: {e}"
+
+    def _post(self, payload: dict, timeout: int, relax: bool = False) -> tuple[dict | None, int, str]:
+        """POST a STREAMING chat-completions request and reassemble the SSE stream into the SAME
+        non-streaming response shape the parsers already consume (``{choices:[{message, finish_reason,
+        native_finish_reason}], usage}``) — so ``_once``/``_chat_once`` (and all the refusal/reasoning/
+        finish_reason logic) are unchanged. Returns ``(data, code, error)``: positive codes are completed
+        HTTP responses; negative codes are local outcomes that distinguish pre-wire failures, post-wire
+        timeouts, other post-wire transport loss, malformed streams, and integrity rejection.
+
+        Why stream: a NON-streaming read makes the socket timeout ≈ total generation time, so a large but
+        HEALTHY completion false-times-out. Streaming lets the socket timeout be the IDLE (inter-read) gap
+        (``idle_timeout``) — a completion that keeps emitting tokens never trips it however long it runs;
+        only a real mid-stream stall aborts. ``absolute_timeout`` backstops a pathological slow-drip. Both
+        aborts are retryable and the retry (``relax=True``) opens provider routing to reroute off the
+        bad provider. The caller builds its own domain result so the completion and tool-calling paths stay
+        type-distinct (LLMResult vs ChatResult)."""
+        import http.client
+        now = self._monotonic()
+        deadline = self._turn_deadline(now)
+        # STREAM so the socket timeout can be an IDLE gap, not the total-generation cap (the false-timeout
+        # fix). include_usage → the final SSE chunk carries usage.total_tokens.
+        # The per-recv socket timeout = the IDLE (no-new-bytes) gap. urllib applies it to EACH blocking read
+        # (connect + each recv), so a stream that keeps flowing never trips it; a stall beyond idle_timeout
+        # aborts fast. The remaining TURN time is the third bound: a connect or blocking read cannot
+        # outlive the ceiling merely because no response bytes arrived for `_read_sse` to examine.
+        try:
+            req, idle, remaining = self._stream_request(payload, timeout, relax, deadline)
+        except (RecursionError, TypeError, ValueError, http.client.HTTPException) as e:
+            # URL/header/request JSON construction happened before a socket could be opened. A bad
+            # endpoint, control-bearing credential or unserialisable local payload is configuration,
+            # not a provider attempt and not a transient reason to reroute or buy another request.
+            return None, _PRE_WIRE_CONFIG_CODE, f"invalid provider request: {type(e).__name__}: {e}"
+        if req is None:
+            return None, _TURN_CEILING_CODE, (
+                f"turn ceiling {self.absolute_timeout}s reached before provider request")
+        ceiling_error = f"absolute stream ceiling {self.absolute_timeout}s exceeded"
+        owner = _WallResponseOwner(remaining, ceiling_error)
+        req._shard_wall_owner = owner
+        # THE TURN'S CEILING WHERE THERE IS ONE, and this attempt's otherwise. `chat` and `complete`
+        # stamp a deadline for the whole ladder, so retries cannot multiply this bound.
+        return self._post_open(req, idle, deadline, owner, ceiling_error)
 
     def _read_sse(self, resp, deadline: float) -> dict:
         """Consume an OpenRouter SSE stream and reassemble it into the NON-streaming response shape the
         callers already parse — ``_sse_data`` peels the framing, ``_SseAssembly`` accumulates the
-        message, ``_StreamPace`` polices the pace. ``data: [DONE]`` terminates; SSE comment/keepalive
-        lines and unparseable chunks are skipped (tolerated). A completion that keeps streaming never
-        stalls; a slow-drip past ``deadline`` raises ``TimeoutError`` (the absolute ceiling), caught as
-        a retryable 598 by ``_post``."""
+        message, ``_StreamPace`` polices the pace. ``data: [DONE]`` or an explicit
+        ``finish_reason`` proves completion; SSE comment/keepalive lines are skipped. A malformed
+        ``data:`` value or clean EOF before either terminal signal is a retryable malformed stream,
+        never a partial answer. A completion that keeps streaming never stalls; a slow-drip past
+        ``deadline`` raises ``TimeoutError`` (the absolute ceiling), caught as a retryable local timeout by
+        ``_post``."""
         import json as _json
 
         assembly = _SseAssembly()
         pace = _StreamPace(self, deadline)
-        for raw in resp:
+        done = False
+
+        def refresh_read_timeout():
+            remaining = deadline - self._monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"absolute stream ceiling {self.absolute_timeout}s exceeded")
+            configured = getattr(self._turn, "read_timeout", None)
+            limit = min(float(self.idle_timeout if configured is None else configured), remaining)
+            sock = getattr(getattr(getattr(resp, "fp", None), "raw", None), "_sock", None)
+            if sock is not None:
+                sock.settimeout(limit)
+
+        lines = _bounded_sse_lines(resp, self._MAX_STREAM_BYTES, self._MAX_STREAM_LINES,
+                                   refresh_read_timeout)
+        for raw in lines:
             now = self._monotonic()                        # ONE clock read per line, shared by both checks
             pace.tick(now, assembly.out_chars)
             body = _sse_data(raw)
             if body is None:
                 continue                                   # blank separator / SSE comment / non-data field
             if body == "[DONE]":
+                done = True
                 break
-            try:
-                chunk = _json.loads(body)
-            except _json.JSONDecodeError:
-                continue                                   # tolerate a corrupt keepalive / padding line
+            chunk = _json.loads(body)                      # malformed data is not framing noise
             assembly.add(chunk)
             pace.mark_output(now, assembly.out_chars)      # the 1st output token starts the rate clock
+        pace.tick(self._monotonic(), assembly.out_chars)    # EOF/read completion may itself cross the ceiling
+        if not done and not assembly.finish:
+            # Clean socket EOF is not proof that the provider finished the turn. Before this check a
+            # valid-looking tool call followed by a closed connection was returned as executable.
+            raise EOFError("SSE ended before [DONE] or finish_reason")
         return assembly.response()
 
     def _once(self, system: str, user: str, model: str, timeout: int,
@@ -967,7 +1908,11 @@ class OpenRouterBackend:
         data, code, err = self._post(payload, timeout, relax)
         _gen_sec = time.monotonic() - _gen_t0
         if data is None:
-            return LLMResult("", 0.0, model, False, err, tokens=0), code
+            abandoned, unpriced = self._data_less_accounting(code, _gen_sec)
+            return LLMResult("", 0.0, model, False, err, tokens=0,
+                             abandoned_attempts=abandoned,
+                             unpriced_attempts=unpriced,
+                             tokens_reported=False, cost_reported=False), code
         # OpenAI-compatible shape. A reasoning model (e.g. GLM-5.2) can return empty `content` — fall
         # back to `reasoning`. Bind `choice` first so finish_reason/native/refusal are reachable.
         choice = (data.get("choices") or [{}])[0]
@@ -975,64 +1920,116 @@ class OpenRouterBackend:
         finish = choice.get("finish_reason") or ""
         native = choice.get("native_finish_reason") or ""
         refusal = msg.get("refusal")
-        _usage = data.get("usage") or {}
-        tokens = int(_usage.get("total_tokens", 0) or 0)
-        self._accumulate_usage(_usage, _gen_sec)
+        served, identity, identity_detail = _response_model_identity(data, model)
+        try:
+            usage = _provider_usage(data.get("usage"))
+        except ValueError as e:
+            self._record_abandoned(_gen_sec)
+            return LLMResult("", 0.0, model, False, f"invalid provider usage: {e}",
+                             abandoned_attempts=1, served_model=served,
+                             identity_verdict=identity, tokens_reported=False,
+                             cost_reported=False), _USAGE_INTEGRITY_CODE
+        self._accumulate_usage(usage, _gen_sec)
+        fields = _provider_result_fields(usage, served, identity)
+        identity_error = identity_detail or _model_identity_error(model, served, identity)
+        if identity_error:
+            return LLMResult(text="", model=model, ok=False, error=identity_error,
+                             **fields), 409
         # A refusal is NEVER a success: detect it BEFORE it can be laundered into `text` (the mistake
         # that made a structured refusal look ok=True), and return terminal 403 (∉ retry set →
         # complete() returns at once instead of grinding the ~30s backoff ladder) with the refusal
         # text surfaced in `error`. Mirrors _chat_once so the two paths agree.
         text = msg.get("content") or msg.get("reasoning") or ""
-        if not text and (refusal or finish == "content_filter" or native == "refusal"):
+        if refusal or finish == "content_filter" or native == "refusal":
             err = f"model refused the prompt (finish={finish or native})"
-            return LLMResult("", 0.0, model, False, f"{err}: {refusal}" if refusal else err,
-                             tokens=tokens, finish_reason=finish), 403
+            return LLMResult(text="", model=model, ok=False,
+                             error=f"{err}: {refusal}" if refusal else err,
+                             finish_reason=finish, **fields), 403
         if not text:
             # Empty content + no refusal signal → a TRANSIENT glitch (AkashML/GLM does this
             # intermittently) — retry via 599. finish_reason rides along so the loop can tell a
             # max_tokens TRUNCATION ("length") from a genuinely empty turn.
-            return LLMResult("", 0.0, model, False, f"empty response: {str(data)[:200]}",
-                             tokens=tokens, finish_reason=finish), 599
-        return LLMResult(text, 0.0, model, True, "", tokens=tokens, finish_reason=finish), 200
+            return LLMResult(text="", model=model, ok=False,
+                             error=f"empty response: {str(data)[:200]}",
+                             finish_reason=finish, **fields), 599
+        return LLMResult(text=text, model=model, ok=True, finish_reason=finish, **fields), 200
 
     def complete(self, system: str, user: str, *, model: str = "sonnet", timeout: int = 600) -> "LLMResult":
         resolved = self._resolve(model)
         if not self.api_key:
             return LLMResult("", 0.0, resolved, False, "no OPENROUTER_API_KEY")
         last = LLMResult("", 0.0, resolved, False, "no attempt")
+        # One completion may make several provider requests. The response which survives the ladder
+        # must carry the whole invoice, because discovery debits this object against the run governor.
+        # `_accumulate_usage` already keeps the backend-wide copy; these totals are the per-call copy.
+        made, spent_usd, spent_tokens, abandoned, unpriced = 0, 0.0, 0, 0, 0
+        token_flags: list[bool | None] = []
+        cost_flags: list[bool | None] = []
+        retry_window_closed = False
         # ONE CEILING FOR THE LADDER, not one per rung. `chat` carries the reasoning; this path gets the
         # same treatment because it makes the same requests against the same provider.
         with self._turn_ceiling() as deadline:
             for attempt in range(self.retries + 1):
                 # After the FIRST failure, RELAX provider routing (relax=attempt>0) so a hung/429
                 # provider reroutes to a healthy one — the first try keeps the exact fp8 pin.
-                last, code = self._once(system, user, resolved, timeout, relax=attempt > 0)
-                if last.ok or code not in self._RETRY_CODES:  # 598 = hang, 599 = empty completion
-                    return last      # success, or a permanent error (4xx other than 429)
-                # AN ATTEMPT WITH NO USAGE AT ALL IS ONE THE PROVIDER STILL SERVED. See
-                # `_usage["abandoned_requests"]` — the stream was aborted before any `usage` arrived,
-                # so the tokens it generated are billed and invisible to every ledger we keep.
-                if not last.tokens and not last.cost_usd:
-                    with self._usage_lock:
-                        self._usage["abandoned_requests"] += 1
+                candidate, code = self._once(system, user, resolved, timeout, relax=made > 0)
+                if code == _TURN_CEILING_CODE:
+                    # `_post` checked the shared deadline immediately before opening the wire. This
+                    # is not an attempt: folding its synthetic zeroes over an earlier reported
+                    # response changed a fully measured bill into an unmeasured one.
+                    if made:
+                        last = replace(last, error=f"{last.error} ({candidate.error})")
+                    else:
+                        last = candidate
+                    retry_window_closed = True
+                    break
+                last = candidate
+                if code not in _PRE_WIRE_CODES:
+                    made += 1
+                    spent_usd += float(last.cost_usd or 0.0)
+                    spent_tokens += int(last.tokens or 0)
+                    unpriced += int(last.unpriced_attempts or 0)
+                    token_flags.append(last.tokens_reported)
+                    cost_flags.append(last.cost_reported)
+                    # A stream can end before usage while still being billable. The shared helper keeps
+                    # completion and native-chat accounting on one rule.
+                    abandoned += self._account_abandoned(last)
+                if last.ok or code not in self._RETRY_CODES:  # success or permanent 4xx
+                    tokens_reported = _combined_reported(token_flags)
+                    cost_reported = _combined_reported(cost_flags)
+                    return self._completion_bill(last, made, spent_usd, spent_tokens,
+                                                 abandoned, unpriced,
+                                                 tokens_reported, cost_reported)
                 if attempt >= self.retries:
                     break
-                if self._monotonic() >= deadline:
-                    _log.error("provider %s: turn ceiling %ds reached after %d attempt(s); "
-                               "not retrying", resolved, self.absolute_timeout, attempt + 1)
+                if not self._wait_for_retry(deadline, attempt, resolved, code, last.error or ""):
+                    last = replace(last, error=f"{last.error} (turn ceiling {self.absolute_timeout}s "
+                                               f"leaves no retry window after {attempt + 1} attempt(s))")
+                    retry_window_closed = True
+                    _log.error("provider %s: turn ceiling %ds leaves no retry window after %d "
+                               "attempt(s)", resolved, self.absolute_timeout, attempt + 1)
                     break
-                # ADAPT-G: the single most useful diagnostic line this package can emit. A sweep that
-                # slows to a crawl is almost always transport — a stalled provider being rerouted (598),
-                # a rate limit (429), or empty completions (599) — and none of that reaches the journal,
-                # so without this the only symptom is a task taking 17x its median with no explanation.
-                _log.warning("provider %s failed with %d (%s); retry %d/%d in %.1fs, routing relaxed",
-                             resolved, code, (last.error or "")[:120], attempt + 1, self.retries,
-                             self.backoff * (2 ** attempt))
-                self._sleep(self.backoff * (2 ** attempt))
-        if not last.ok:
+        if not last.ok and not retry_window_closed:
             _log.error("provider %s exhausted %d retries; last code %d (%s)",
                        resolved, self.retries, code, (last.error or "")[:200])
-        return last
+        return self._completion_bill(last, made, spent_usd, spent_tokens, abandoned, unpriced,
+                                     _combined_reported(token_flags),
+                                     _combined_reported(cost_flags))
+
+    @staticmethod
+    def _completion_bill(result: LLMResult, made: int, spent_usd: float, spent_tokens: int,
+                         abandoned: int, unpriced: int, tokens_reported: bool | None,
+                         cost_reported: bool | None) -> LLMResult:
+        """Return one completion carrying every attempt it caused, preserving one-attempt identity."""
+        if (made <= 1 and result.abandoned_attempts == abandoned
+                and result.tokens_reported is tokens_reported
+                and result.cost_reported is cost_reported):
+            return result
+        return replace(result, cost_usd=spent_usd, tokens=spent_tokens,
+                       abandoned_attempts=abandoned,
+                       unpriced_attempts=unpriced,
+                       tokens_reported=tokens_reported,
+                       cost_reported=cost_reported)
 
     def _provider_block(self, relax: bool = False) -> dict | None:
         """The OpenRouter `provider` routing block: quantization floor + sort/pin. Shared by complete()
@@ -1070,8 +2067,6 @@ class OpenRouterBackend:
 
     def _chat_once(self, messages: list, tools: list, model: str, timeout: int,
                    relax: bool = False, tool_choice=None) -> tuple["ChatResult", int]:
-        import json as _json
-
         payload: dict = {"model": model, "messages": messages, "max_tokens": self.max_tokens,
                          "temperature": self.temperature}
         if self.seed is not None:
@@ -1087,51 +2082,77 @@ class OpenRouterBackend:
         data, code, err = self._post(payload, timeout, relax)
         _gen_sec = time.monotonic() - _gen_t0
         if data is None:
-            return ChatResult(ok=False, error=err, model=model), code
+            abandoned, unpriced = self._data_less_accounting(code, _gen_sec)
+            return ChatResult(ok=False, error=err, model=model,
+                              abandoned_attempts=abandoned,
+                              unpriced_attempts=unpriced,
+                              tokens_reported=False, cost_reported=False,
+                              stall_retry_safe=code in (
+                                  _PRE_WIRE_TIMEOUT_CODE, _POST_WIRE_TIMEOUT_CODE),
+                              forcing_retry_safe=_tool_choice_rejection(
+                                  code, err, tool_choice)), code
         choice = (data.get("choices") or [{}])[0]
         msg = choice.get("message", {}) or {}
         # WHAT ACTUALLY ANSWERED. Read on every path that has a body, including the two that fail,
         # because a route that substitutes does it on the refusal and the empty turn as well.
-        served = str(data.get("model") or "")
-        _usage = data.get("usage") or {}
-        tokens = int(_usage.get("total_tokens", 0) or 0)
+        served, identity, identity_detail = _response_model_identity(data, model)
         # The provider's own billed amount for THIS request, carried out on every return path that has a
         # response — including the refusal and the empty-turn glitch below. Both were already charged for
         # (opus-4.8's refusal burned 9,003 prompt tokens before refusing), so a meter that skipped them
         # would under-report exactly the turns a customer most wants to see on the bill.
-        cost = float(_usage.get("cost", 0.0) or 0.0)
-        self._accumulate_usage(_usage, _gen_sec)
-        calls = []
-        for tc in (msg.get("tool_calls") or []):
-            fn = tc.get("function") or {}
-            try:
-                args = _json.loads(fn.get("arguments") or "{}")
-            except (_json.JSONDecodeError, TypeError):
-                args = {}
-            if not isinstance(args, dict):
-                args = {}
-            calls.append(ToolCall(id=tc.get("id") or f"call_{len(calls)}", name=fn.get("name") or "", arguments=args))
-        # Detect a SAFETY REFUSAL *before* folding it into text. A structured refusal
-        # ({content:null, refusal:"..."}) must not be laundered into a success ChatResult — that
-        # returns ok=True and makes the terminal-403 branch dead for exactly that case. Retrying a
-        # refusal is pure waste (opus-4.8 content_filters the exploit-PoC prompt); GLM/Bedrock signal
-        # it via finish_reason instead. Terminal when there are no tool_calls and any refusal signal.
+        try:
+            usage = _provider_usage(data.get("usage"))
+        except ValueError as e:
+            self._record_abandoned(_gen_sec)
+            return ChatResult(ok=False, error=f"invalid provider usage: {e}", model=model,
+                              served_model=served, identity_verdict=identity,
+                              abandoned_attempts=1, tokens_reported=False,
+                              cost_reported=False, forcing_retry_safe=False), _USAGE_INTEGRITY_CODE
+        self._accumulate_usage(usage, _gen_sec)
+        fields = _provider_result_fields(usage, served, identity)
+        identity_error = identity_detail or _model_identity_error(model, served, identity)
+        if identity_error:
+            return ChatResult(ok=False, error=identity_error, model=model,
+                              forcing_retry_safe=False, **fields), 409
         refusal = msg.get("refusal")
         finish = choice.get("finish_reason") or ""
         native = choice.get("native_finish_reason") or ""
-        if not calls and (refusal or finish == "content_filter" or native == "refusal"):
-            return ChatResult(ok=False, error=f"model refused the prompt (finish={finish or native})",
-                              model=model, served_model=served, tokens=tokens, cost_usd=cost,
-                              finish_reason=finish), 403  # 403 ∉ retry set → terminal
         text = msg.get("content") or msg.get("reasoning") or ""            # refusal dropped from success text
+
+        # A provider's safety verdict dominates every payload field beside it. Some gateways preserve
+        # a partially generated native call while replacing the turn's finish signal with
+        # `content_filter`/`refusal`; parsing and returning that call turned a refusal into a side
+        # effect in ToolCallingLoop. Keep neither the call nor its assistant protocol message.
+        if refusal or finish == "content_filter" or native == "refusal":
+            return ChatResult(ok=False, error=f"model refused the prompt (finish={finish or native})",
+                              model=model, finish_reason=finish, tool_calls=[], raw_message={},
+                              forcing_retry_safe=False, **fields), 403
+
+        # A max-token response is not a completed native call even when its current prefix happens to
+        # be valid JSON. Measured adversarially: ``{"path":"victim"}`` arrived before the provider
+        # stopped with ``finish_reason=length`` and the loop executed it as a complete write tool. Drop
+        # the entire call structure here; the loop owns the bounded continuation and must never expose
+        # an incomplete call to any other ``chat`` consumer in the meantime.
+        if finish == "length":
+            return ChatResult(text=text, tool_calls=[], raw_message={}, ok=True, model=model,
+                              finish_reason=finish, **fields), 200
+
+        try:
+            calls, call_error = _parsed_tool_calls(msg)
+        except _StreamIntegrityError as e:
+            return (ChatResult(ok=False, error=f"invalid provider stream: {e}", model=model,
+                               finish_reason=finish, forcing_retry_safe=False, **fields),
+                    _STREAM_INTEGRITY_CODE)
+        if call_error:
+            return ChatResult(ok=False, error=call_error, model=model,
+                              finish_reason=finish, **fields), 599
         if not text and not calls:
             # empty content + no tool calls + no refusal signal → a transient glitch (retry via 599).
             # finish_reason rides along so the loop can tell a max_tokens TRUNCATION ("length") apart.
             return ChatResult(ok=False, error=f"empty response: {str(data)[:200]}", model=model,
-                              served_model=served, tokens=tokens, cost_usd=cost,
-                              finish_reason=finish), 599
+                              finish_reason=finish, empty_retry_safe=True, **fields), 599
         return ChatResult(text=text, tool_calls=calls, raw_message=msg, ok=True, model=model,
-                          served_model=served, tokens=tokens, cost_usd=cost, finish_reason=finish), 200
+                          finish_reason=finish, **fields), 200
 
     def chat(self, messages: list, tools: list, *, model: str = "sonnet", timeout: int = 600,
              tool_choice=None) -> ChatResult:
@@ -1149,7 +2170,7 @@ class OpenRouterBackend:
         * a **refusal** (403) and an **empty completion** (599) both arrive with a body and a `usage`
           block. `opus-4.8` burned 9,003 prompt tokens refusing, which `_chat_once` already reads onto
           the result — and this loop then dropped the result on the floor.
-        * a **stall or malformed stream** (598/599 with no body) has no `usage` at all: the provider
+        * a **stall or malformed stream** (a negative local outcome with no body) has no `usage` at all: the provider
           generated tokens and we never saw the end of them. That cost is unknowable from here, so it
           is COUNTED instead, on the result as `abandoned_attempts` and on the backend's own ledger as
           `abandoned_requests`.
@@ -1176,45 +2197,63 @@ class OpenRouterBackend:
         # only the discards and adding `last` back at the end double-counts the final attempt on the
         # paths that fall out of the loop rather than returning from inside it — which is one of the
         # two ways this arithmetic can be wrong, and the harder one to see.
-        made, spent_usd, spent_tokens, abandoned = 0, 0.0, 0, 0
+        made, spent_usd, spent_tokens, abandoned, unpriced = 0, 0.0, 0, 0, 0
+        token_flags: list[bool | None] = []
+        cost_flags: list[bool | None] = []
         with self._turn_ceiling() as deadline:
             for attempt in range(self.retries + 1):
-                # relax=attempt>0: reroute off a hung/429 provider on retry (first keeps the fp8 pin).
-                last, code = self._chat_once(messages, tools, resolved, timeout, relax=attempt > 0,
-                                             tool_choice=tool_choice)
-                made += 1
-                spent_usd += float(last.cost_usd or 0.0)
-                spent_tokens += int(last.tokens or 0)
-                # A FAILED attempt carrying neither a price nor a token count never reached a `usage`
-                # block at all — the stream aborted. The provider served it; we cannot price it.
-                if not last.ok and not last.cost_usd and not last.tokens:
-                    abandoned += 1
-                    with self._usage_lock:
-                        self._usage["abandoned_requests"] += 1
+                # A local DNS/connect failure did not reach a provider and therefore cannot justify
+                # relaxing its routing policy on the next local try.
+                candidate, code = self._chat_once(
+                    messages, tools, resolved, timeout, relax=made > 0,
+                    tool_choice=tool_choice)
+                if code == _TURN_CEILING_CODE:
+                    # A deadline race after the retry check opened no wire and therefore contributes
+                    # no zero-valued request to the bill or completeness flags.
+                    if made:
+                        last = replace(last, error=f"{last.error} ({candidate.error})")
+                    else:
+                        last = candidate
+                    break
+                last = candidate
+                if code not in _PRE_WIRE_CODES:
+                    made += 1
+                    spent_usd += float(last.cost_usd or 0.0)
+                    spent_tokens += int(last.tokens or 0)
+                    unpriced += int(last.unpriced_attempts or 0)
+                    token_flags.append(last.tokens_reported)
+                    cost_flags.append(last.cost_reported)
+                    # A stream can end before usage while still being billable. The shared helper keeps
+                    # completion and native-chat accounting on one rule.
+                    abandoned += self._account_abandoned(last)
                 if last.ok or code not in self._RETRY_CODES or attempt >= self.retries:
                     break
                 # A ladder that outlives the turn's own ceiling buys nothing: the next attempt shares
                 # the deadline and would be cut off before it could produce anything.
-                if self._monotonic() >= deadline:
+                if not self._wait_for_retry(deadline, attempt, resolved, code, last.error or ""):
                     last = replace(last, error=f"{last.error} (turn ceiling {self.absolute_timeout}s "
-                                               f"reached after {attempt + 1} attempt(s))")
+                                               f"leaves no retry window after {attempt + 1} attempt(s))")
                     break
-                self._sleep(self.backoff * (2 ** attempt))
-        return self._billed(last, made, spent_usd, spent_tokens, abandoned)
+        return self._billed(last, made, spent_usd, spent_tokens, abandoned, unpriced,
+                            _combined_reported(token_flags), _combined_reported(cost_flags))
 
     @staticmethod
     def _billed(result: ChatResult, made: int, spent_usd: float, spent_tokens: int,
-                abandoned: int) -> ChatResult:
+                abandoned: int, unpriced: int, tokens_reported: bool | None,
+                cost_reported: bool | None) -> ChatResult:
         """The turn's result carrying the turn's whole bill. See `chat`.
 
         Returned UNCHANGED when the turn made one attempt, which is every ordinary turn: the totals
         are then the surviving attempt's own numbers by construction, and rebuilding the object would
         only create a second way for them to disagree.
         """
-        if made <= 1:
+        if (made <= 1 and result.abandoned_attempts == abandoned
+                and result.tokens_reported is tokens_reported
+                and result.cost_reported is cost_reported):
             return result
         return replace(result, cost_usd=spent_usd, tokens=spent_tokens,
-                       abandoned_attempts=result.abandoned_attempts + abandoned)
+                       abandoned_attempts=abandoned, unpriced_attempts=unpriced,
+                       tokens_reported=tokens_reported, cost_reported=cost_reported)
 
 
 @dataclass
@@ -1254,7 +2293,8 @@ class ScriptedChatBackend:
         if isinstance(turn, ChatResult):                      # verbatim (carries finish_reason etc.)
             return turn
         if turn is None:                                      # scripted empty-response glitch
-            return ChatResult(ok=False, error="empty response: simulated glitch", model=model, tokens=1)
+            return ChatResult(ok=False, error="empty response: simulated glitch", model=model, tokens=1,
+                              empty_retry_safe=True)
         if isinstance(turn, str):
             return ChatResult(text=turn, tool_calls=[], raw_message={"role": "assistant", "content": turn},
                               ok=True, model=model, tokens=1)
@@ -1383,6 +2423,69 @@ PROBE_TOOL = [{
 VALIDATED, COMPATIBLE, UNSUPPORTED = "validated", "compatible", "unsupported"
 
 
+def _model_identity_parts(identity: str) -> tuple[str, str]:
+    parts = (identity or "").rsplit("/", 1)
+    return (parts[0], parts[1]) if len(parts) == 2 else ("", parts[0])
+
+
+def _explicit_vendor_mismatch(left: str, right: str) -> bool:
+    left_vendor, _ = _model_identity_parts(left)
+    right_vendor, _ = _model_identity_parts(right)
+    return bool(left_vendor and right_vendor and left_vendor != right_vendor)
+
+
+def _same_model_identity(left: str, right: str) -> bool:
+    """Whether two model identifiers name the same vendor/model or a numeric snapshot pin."""
+    _, left_leaf = _model_identity_parts(left)
+    _, right_leaf = _model_identity_parts(right)
+    if not left_leaf or not right_leaf:
+        return False
+    # A bare alias may resolve to a qualified provider id. Two explicit, different vendors cannot be
+    # erased to their leaves: `z-ai/glm-5.2` and `acme/glm-5.2` name different serving authorities.
+    if _explicit_vendor_mismatch(left, right):
+        return False
+    if right_leaf == left_leaf:
+        return True
+    prefix = left_leaf + "-"
+    if not right_leaf.startswith(prefix):
+        return False
+    # The two snapshot forms observed on supported routes: GLM's MMDD pin and OpenAI's ISO date.
+    # An arbitrary suffix is not a pin: ``gpt-4o-mini`` and ``llama-3-guard`` are different weights,
+    # and accepting every hyphen suffix made the endpoint probe certify both as the requested model.
+    suffix = right_leaf[len(prefix):]
+    return bool(re.fullmatch(r"(?:\d{4}|\d{4}-\d{2}-\d{2})", suffix))
+
+
+def _model_identity_verdict(requested: str, served: str) -> str:
+    """One stable audit token for the per-response identity check."""
+    if not served:
+        return "missing"
+    return "matched" if _same_model_identity(requested, served) else "substituted"
+
+
+def _response_model_identity(data: dict, requested: str) -> tuple[str, str, str]:
+    """Served id, audit verdict and conflict detail from one assembled provider response."""
+    conflict = data.get("_model_identity_error")
+    if conflict:
+        identities = data.get("_model_identities")
+        served = " | ".join(identities) if isinstance(identities, list) else ""
+        return served, "conflicting", str(conflict)
+    served = data.get("model") if isinstance(data.get("model"), str) else ""
+    return served, _model_identity_verdict(requested, served), ""
+
+
+def _model_identity_error(requested: str, served: str, verdict: str) -> str:
+    """The terminal error for a response whose serving weights cannot be verified."""
+    if verdict == "matched":
+        return ""
+    if verdict == "missing":
+        return (f"provider response did not identify the model that answered; requested "
+                f"{requested!r} cannot be verified")
+    if verdict == "conflicting":
+        return f"provider response named conflicting model identities: {served or 'invalid value'}"
+    return f"provider served {served!r}, not the requested model {requested!r}"
+
+
 def _substituted(observed: dict) -> bool:
     """Did the endpoint answer with a model other than the one it was asked for.
 
@@ -1392,39 +2495,21 @@ def _substituted(observed: dict) -> bool:
     this product has: the request succeeds, the tool call comes back, and the artefacts name the
     identifier the customer typed.
 
-    **THE RULE IS "a prefix ENDING AT A SEPARATOR", not string equality, and the cost of each is
+    **THE RULE IS AN EXACT LEAF OR A RECOGNISED NUMERIC SNAPSHOT, not string equality, and the cost of each is
     measured rather than assumed.** Pinning a dated snapshot is a normal, honest thing for a provider
     to do — `gpt-4o` answered by `gpt-4o-2024-08-06`, `glm-5.2` answered by `glm-5.2-0929` — and
     equality would report every one of those as a substitution, which would train a reader to ignore
-    the row. A bare `startswith` is the opposite mistake: `glm-5` answered by `glm-5.3` would pass it,
-    and that IS a substitution (the raw wire returns `glm-5.3` for `glm-5`). Requiring the boundary
-    keeps the snapshot quiet and catches the version bump, because `glm-5.` is not `glm-5-`.
+    the row. A broad separator prefix is the opposite mistake: it certifies `gpt-4o-mini` and
+    `llama-3-guard` as the base model. Only the measured MMDD and ISO-date suffixes are accepted;
+    unknown variants are refused as substitutions rather than guessed equivalent.
 
-    **DECLARED LIMIT:** a provider that separates a genuinely different model with `-` — `llama-3` and
-    `llama-3-guard` are not the same weights — reads as a pin here. Naming the substitution is the
-    goal; deciding which renamings are the same weights would need a table of every provider's
-    conventions, and a wrong entry in that table is a confident false accusation about the one fact
-    the customer cannot check any other way.
-
-    Compares the LEAF after `/` on both sides, because an alias map resolves `glm-5.2` to
-    `z-ai/glm-5.2` on OpenRouter and the vendor prefix is not a substitution.
+    Compares the LEAF after `/` only when one side is genuinely bare, because an alias map resolves
+    `glm-5.2` to `z-ai/glm-5.2` on OpenRouter. Two explicit, different vendor prefixes remain distinct.
     """
-    asked = (observed.get("requested") or "").split("/")[-1]
-    served = (observed.get("model") or "").split("/")[-1]
+    asked = observed.get("requested") or ""
+    served = observed.get("model") or ""
     # An empty half is the provider naming nothing — unobserved, which is not the same as disagreeing.
-    return bool(asked and served) and not (
-        served == asked or served.startswith((asked + "-", asked + ":")))
-
-
-def _substitution_note(observed: dict) -> str:
-    """The sentence that says it out loud, or `""`. Appended to `why` on BOTH verdicts, because a
-    substitution onto the measured model is as much a surprise as one away from it: the customer
-    configured an identifier and the endpoint ran another."""
-    if not observed.get("substituted"):
-        return ""
-    return (f" **This endpoint served `{observed['model']}`, not the `{observed['requested']}` this "
-            f"probe asked for** — the response said so and the request did not fail, so a run here "
-            f"reports on weights you did not choose. Ask your provider which identifiers it routes.")
+    return bool(asked and served) and not _same_model_identity(asked, served)
 
 
 def probe_endpoint(backend, *, model: str = "", validated_model: str = "",
@@ -1446,18 +2531,20 @@ def probe_endpoint(backend, *, model: str = "", validated_model: str = "",
 
         validated    the round trip worked AND the model is one this project has measured
         compatible   the round trip worked; the model is not one we have numbers for
-        unsupported  no tool call came back, or the request failed
+        unsupported  no tool call came back, the request failed, or the served identity disagreed
 
-    **`compatible` is not a warning.** the design notes closes "the customer always supplies
-    inference", so running an unmeasured model is a supported choice; what the customer is owed is
-    knowing which of the two they are in. Deciding that for them by refusing would be operating their
-    endpoint policy for them.
+    **`compatible` is not a warning.** It means the requested and served identities agree but this
+    project has no measurements for that model. Missing, conflicting and substituted identities are
+    unsupported: this probe may classify unfamiliar weights, but it may not silently run different or
+    unverified weights than the customer configured.
 
-    Costs one request — a few hundred tokens. Never raises: a probe that throws is `unsupported` with
-    the exception as its reason, because every failure here has the same answer for the customer.
+    Costs one model turn — a few hundred tokens when transport succeeds. The backend can retry
+    transient HTTP failures, and abandoned attempts may still be billable. Never raises: a probe that
+    throws is `unsupported` with the exception as its reason, because every failure here has the same
+    answer for the customer.
     """
     observed: dict = {"tool_calls": 0, "model": "", "requested": "", "substituted": False,
-                      "error": ""}
+                      "identity_verdict": "", "error": ""}
     try:
         result = backend.chat(
             [{"role": "user", "content": "Call shard_probe with any note to confirm this endpoint "
@@ -1474,7 +2561,10 @@ def probe_endpoint(backend, *, model: str = "", validated_model: str = "",
     # nothing, which is a different fact from "it served what we asked" and now reads as one.
     observed["requested"] = getattr(result, "model", "") or model
     observed["model"] = getattr(result, "served_model", "") or ""
-    observed["substituted"] = _substituted(observed)
+    observed["identity_verdict"] = (
+        getattr(result, "identity_verdict", "")
+        or _model_identity_verdict(observed["requested"], observed["model"]))
+    observed["substituted"] = observed["identity_verdict"] == "substituted"
     observed["tool_calls"] = len(getattr(result, "tool_calls", ()) or ())
     if not getattr(result, "ok", False):
         return {"verdict": UNSUPPORTED,
@@ -1486,23 +2576,29 @@ def probe_endpoint(backend, *, model: str = "", validated_model: str = "",
                        "tool calling. Shard's solver requires it — a review here would find nothing "
                        "and look like a clean repository.",
                 "observed": observed}
+    identity_error = _model_identity_error(observed["requested"], observed["model"],
+                                           observed["identity_verdict"])
+    if identity_error:
+        return {"verdict": UNSUPPORTED,
+                "why": f"native tool calling cannot be accepted: {identity_error}",
+                "observed": observed}
 
     # `validated_model` is PASSED IN rather than imported. `DEFAULT_MODEL` lives in `shard/cli.py`
     # and this module sits below it; reaching upward for it would invert the layering to save one
     # argument, and which model this project has measured is a fact the CLI already owns.
     #
-    # **THE VERDICT IS ABOUT WHAT ANSWERED, NOT WHAT WAS ASKED FOR**, and the fallback is what makes
-    # that safe: an endpoint that names no model in its body leaves us with the request, which is the
-    # only thing this probe could ever say before today.
-    measured = (observed["model"] or observed["requested"] or "").split("/")[-1] \
+    # **THE VERDICT IS ABOUT WHAT ANSWERED, NOT WHAT WAS ASKED FOR.** The request is retained to explain
+    # an unverified result, but it cannot certify itself when the response names no served model.
+    measured_id = observed["model"] or observed["requested"] or ""
+    vendor_mismatch = _explicit_vendor_mismatch(observed["requested"], observed["model"])
+    measured = (measured_id if vendor_mismatch else measured_id.split("/")[-1]) \
         or "the endpoint's default"
-    note = _substitution_note(observed)
-    if validated_model and measured.startswith(validated_model.split("/")[-1]):
+    if validated_model and not vendor_mismatch and _same_model_identity(validated_model, measured_id):
         return {"verdict": VALIDATED,
                 "why": f"native tool calling works and {measured} is the configuration this project "
-                       f"has measured.{note}", "observed": observed}
+                       "has measured.", "observed": observed}
     return {"verdict": COMPATIBLE,
             "why": f"native tool calling works. {measured} is not a model this project has numbers "
                    f"for, which is a supported choice and not a warning — you supply the "
-                   f"inference.{note}",
+                   "inference.",
             "observed": observed}

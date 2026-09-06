@@ -80,11 +80,12 @@ MARKER_ON_BOOM = ('#!/bin/sh\nif grep -q BOOM "$1" 2>/dev/null; then\n'
                     reason="needs bash")
 def test_a_process_killed_by_a_signal_IS_a_demonstration(tmp_path):
     """SIGSEGV, produced by one specific input. Nothing here is interpretation: the process died on a
-    signal, and it did so on the agent's payload and not on the control."""
+    signal, and it did so on the agent's payload and not on the control. The containment supervisor
+    reports a child's signal with the shell convention, ``128 + signal``."""
     w = _adjudicate(tmp_path, CRASH_ON_BOOM, "fatal_signal", payload=b"BOOM")
     assert w.demonstrated is True
     assert w.refusal == "", w.refusal
-    assert w.exit_code == -11
+    assert w.exit_code == 139
 
 
 def test_an_ORDINARY_FAILURE_is_not_a_fatal_signal(tmp_path):

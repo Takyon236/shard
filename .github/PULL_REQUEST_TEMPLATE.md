@@ -22,9 +22,9 @@ was wrong: what input, what Shard did, what it should have done.
 <!--
 This is the section that matters most in this project, so it is worth a moment.
 
-Shard's whole claim is that it reports a finding only when it can attach an input
-that reproduces it, and we hold changes to the same standard. Paste the thing you
-ran and what it printed.
+Shard separates informational hypotheses from demonstrated findings; only a demonstrated finding
+carries an input that reproduces it. We hold changes to the same evidence standard. Paste the thing
+you ran and what it printed.
 
   - a fixed bug        -> the failing case, before and after
   - a performance claim -> the two numbers and how you measured them

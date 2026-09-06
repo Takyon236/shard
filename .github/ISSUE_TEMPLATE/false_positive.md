@@ -9,11 +9,10 @@ assignees: ''
 <!--
 This is one of the most useful reports you can send, and it is not a complaint.
 
-Shard is built to report a finding only when it can attach an input that
-reproduces it. When that goes wrong, the interesting question is which half
-failed: the reproduction did not really reproduce, or it did and the thing it
-reproduced is not a defect. Those have completely different fixes, and the
-evidence below is what tells them apart.
+Shard separates informational hypotheses from demonstrated findings, which carry an input that
+reproduces the observation. When a demonstrated finding is wrong, the interesting question is which
+half failed: the reproduction did not really reproduce, or it did and the thing it reproduced is not
+a defect. Those have completely different fixes, and the evidence below is what tells them apart.
 -->
 
 ## The finding
@@ -50,11 +49,12 @@ The report says. This is the single most important field in the whole issue.
 - [ ] Gate-eligible (Shard says it reproduced this)
 - [ ] Not gate-eligible (reported as a hypothesis)
 
-## The reproduction bundle
+## The finding bundle
 
 <!--
-If the finding was gate-eligible it came with a bundle: the input, the command,
-and the output that was observed. If you can share it, attach it or paste
+If Shard wrote a bundle, its `metadata.json` says whether the witness reproduced
+the finding. A gate-eligible finding must have `reproduced: true`; a refused
+candidate bundle may say false. If you can share it, attach it or paste
 `metadata.json` and `output.txt`.
 
 ONLY IF YOU MAY. Do not paste code, crash data or credentials you do not have the
@@ -65,6 +65,6 @@ its own, and we would rather have that than put you in a difficult position.
 ## Environment
 
 - Shard version / ref:
-- Mode (`survey`, `diff`, `preflight`):
+- Action mode (`survey` or `diff`), or CLI command (`preflight`):
 - Model endpoint and model:
 - Language and, if relevant, the build system:

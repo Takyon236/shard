@@ -165,19 +165,21 @@ def _print_price(payload: dict) -> None:
     # THE MONEY, in the shell output and not only in the JSON. The integration guide makes this
     # the pricing instrument, and a number a human never sees is not one.
     cost = payload["cost"]
-    print(f"your cost    ${cost['usd_low']:.2f}–${cost['usd_high']:.2f} a pull-request run, on YOUR "
-          f"inference bill")
+    print(f"your cost    ${cost['usd_low']:.2f}–${cost['usd_high']:.2f} observed priced lower bound per "
+          f"pull-request run, on YOUR inference bill")
     print(f"             ${cost['per_month_at_100_runs']['low']:.0f}–"
-          f"${cost['per_month_at_100_runs']['high']:.0f}/month at 100 runs. "
+          f"${cost['per_month_at_100_runs']['high']:.0f}/month is the same lower-bound extrapolation "
+          f"at 100 runs. "
           f"This repository resembles {cost['resembles']}")
-    print(f"             band is wide on purpose: {cost['basis']}")
-    # THE TOKENS, BESIDE THE DOLLARS, because the dollars are a floor and the tokens are the half that
-    # has been re-measured since the product could execute. `target.CALIBRATION_TOKENS_ONLY` carries
-    # the runs; the point of printing it is that a customer on an endpoint that reports no price —
-    # a self-hosted vLLM, a subscription — can size a run at all, which they could not before.
+    # THE TOKENS, BESIDE THE DOLLARS. The full dated basis stays in the JSON and customer reference;
+    # printing those two paragraphs here made the first no-key onboarding command read like a release
+    # note. Keep the facts a customer needs to set a ceiling: the observed bounds, the measured scale of
+    # the understatement, and the mode this sample does not cover.
     print(f"             {cost['tokens_low']:,}–{cost['tokens_high']:,} tokens a run. "
-          f"{cost['tokens_basis']}")
-    print(f"             what drives it: {cost['driver']}")
+          f"Later unpriced runs used a median {cost['tokens_median_ratio']}x the tokens; no dollar "
+          f"conversion is valid")
+    print("             Pull-request runs only; excludes initial scans. Start report-only and calibrate "
+          "from your endpoint")
     free = payload["free_tier"]
     print(f"free tier    {free['verdict']} — {free['why']}")
     for need in free["needs"]:
@@ -231,13 +233,18 @@ def _cost_line(tokens: float, cost: dict) -> str:
     # an endpoint that omits `usage` gives us no measurement at all, and printing 0 asserts one. Worse,
     # `--max-tokens` cannot bind against a count that never arrives, so the line stating the ceiling was
     # exactly the line a customer would have used to notice it was inert.
-    if not tokens and cost["requests"]:
+    token_reported = cost.get("token_reported_requests")
+    if token_reported is None:
+        token_reported = cost["requests"] if tokens else 0
+    if not token_reported and cost["requests"]:
         parts = ["token count not reported by this endpoint"
                  + (f" (ceiling {cost['tokens_ceiling']:,.0f} could not be enforced)"
                     if cost["tokens_ceiling"] else "")]
     else:
         parts = [f"{tokens:,.0f} tokens" + (f" of {cost['tokens_ceiling']:,.0f}"
                                             if cost["tokens_ceiling"] else " (no token ceiling)")]
+        if token_reported < cost["requests"]:
+            parts.append(f"token counts on {token_reported} of {cost['requests']} requests — a floor")
     if cost["usd"] is None:
         parts.append("cost not reported by this endpoint" if cost["requests"]
                      else "no inference")

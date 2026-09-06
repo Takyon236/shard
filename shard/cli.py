@@ -40,11 +40,11 @@ and reporting it as a security finding would be a false positive of the most ann
 
 
 import argparse
+import hashlib
 import json
 import os
 import pathlib
 import sys
-import tempfile
 
 
 #: **THE OPTIONAL CAPABILITY PACKAGE, named ONCE.** `""` in a build that does not carry it.
@@ -256,6 +256,9 @@ def _cmd_survey(args) -> int:
                         deep_available=deep_available, languages=set(profile.languages))
 
     payload = to_payload(scan, assessment)
+    payload["mode"] = "survey"
+    payload["status"] = "done"
+    payload["findings"] = 0
     # THE SLUG WHEN WE HAVE ONE, exactly as `_cmd_diff` names its target. `str(repo)` inside the
     # action is `/github/workspace`, a path in OUR container: true of the mount, and unattributable.
     # Measured 2026-08-13 on a real scan of urllib3 — the artefact this writes said
@@ -273,12 +276,11 @@ def _cmd_survey(args) -> int:
     summary = summarise(scan, assessment)
 
     if args.out_dir:
+        from shard.artefactfs import atomic_write, trusted_directory
         from shard.report import _report_id, build_survey_markdown
 
         out = pathlib.Path(args.out_dir)
-        out.mkdir(parents=True, exist_ok=True)
-        (out / "shard-survey.json").write_text(json.dumps(payload, indent=2, sort_keys=True),
-                                               encoding="utf-8")
+        survey_bytes = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
         # **THE HUMAN ARTEFACT, STILL OPEN row 19.** Survey is the mode a customer meets first and it
         # wrote JSON and nothing else; the summary below reached a step log that GitHub deletes with
         # the runner. `shard-report.md` and not `shard-survey.md` deliberately — `action.yml` declares
@@ -293,15 +295,23 @@ def _cmd_survey(args) -> int:
         # row read `truncated` alone, so a scan that stopped part-way through ten files printed
         # `trust | complete scan` eight lines above its own blind spot saying every count was a floor
         # for them. Measured on `facebook/zstd` and `libgit2`, both 2026-09-02. See `_survey_trust`.
-        report.write_text(build_survey_markdown(summary, target=args.slug or str(repo),
-                                                truncated=scan.truncated,
-                                                partial_files=scan.files_read_in_part,
-                                                report_ident=_report_id(),
-                                                ranked=assessment.ranked,
-                                                witness_entry=args.witness_entry or ""),
-                          encoding="utf-8")
+        report_bytes = build_survey_markdown(
+            summary, target=args.slug or str(repo), truncated=scan.truncated,
+            partial_files=scan.files_read_in_part, report_ident=_report_id(),
+            ranked=assessment.ranked, witness_entry=args.witness_entry or "",
+        ).encode("utf-8")
+        with trusted_directory(out, create=True) as (_trusted_out, out_fd):
+            atomic_write(out_fd, "shard-survey.json", survey_bytes)
+            atomic_write(out_fd, report.name, report_bytes)
         payload["written"] = str(out / "shard-survey.json")
-        payload["artefacts"] = {"survey": str(out / "shard-survey.json"), "report": str(report)}
+        payload["artefacts"] = {
+            "survey": str(out / "shard-survey.json"),
+            "report": str(report),
+            "sha256": {
+                "survey": hashlib.sha256(survey_bytes).hexdigest(),
+                "report": hashlib.sha256(report_bytes).hexdigest(),
+            },
+        }
 
     if args.json:
         print(json.dumps(payload, indent=2, sort_keys=True))
@@ -309,20 +319,6 @@ def _cmd_survey(args) -> int:
         print(f"repository   {args.slug or repo}")
         print(summary)
     return EXIT_OK
-
-
-def _scratch_dir(out_dir: str | None) -> pathlib.Path:
-    """Somewhere we may write. `out_dir` when the caller named one, otherwise a temp directory.
-
-    The one thing this must never return is the current working directory: on a CI runner that IS the
-    repository under review, and the decision that we never write there is what makes the state-repo
-    design coherent in the first place.
-    """
-    if out_dir:
-        path = pathlib.Path(out_dir)
-        path.mkdir(parents=True, exist_ok=True)
-        return path
-    return pathlib.Path(tempfile.mkdtemp(prefix="shard-run-"))
 
 
 def _machine_payload() -> dict | None:
@@ -380,7 +376,8 @@ def _mode_verdict(profile, kinds: list[str], deep_available: bool) -> dict:
                            f"{shown}{f', and {more} more' if more > 0 else ''}\n"
                            f"it needs an entry point that takes ONE argument, an input file, and "
                            f"exercises that code. Declare it at .shard/test_poc.sh\n"
-                           f"start from: shard preflight --repo . --entry-template > .shard/entry.sh"),
+                           f"start from: mkdir -p .shard && shard preflight --repo . "
+                           f"--entry-template > .shard/test_poc.sh"),
                 "native_sources": list(profile.native_sources),
             }
         return {"available": True, "verdict": "unsupported",
@@ -458,6 +455,12 @@ def _report_payload(report) -> dict:
             # Tri-state, and it reaches the payload as one. `null` means the control replay was never
             # run — which is always the answer from `preflight`, since deciding it needs a subprocess.
             "control_crashed": report.control_crashed,
+            # THE TWO FACTS `verdict` NOW TURNS ON for a customer's own harness: can a fault reach us
+            # AS a fault, statically and then as measured. A payload carrying the verdict and not what
+            # decided it leaves a customer reading `degraded` with no field to check it against.
+            # `exec_tail` is null iff there is no harness; `marker_printed` is null when nobody ran
+            # one, which is always the answer from preflight.
+            "exec_tail": report.exec_tail, "marker_printed": report.marker_printed,
             "reasons": list(report.reasons)}
 
 

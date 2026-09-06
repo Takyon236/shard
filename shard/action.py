@@ -65,12 +65,15 @@ import os
 import pathlib
 import re
 
+from shard.actionresult import payload_error as _payload_error
+from shard.actionhandoff import ActionHandoff as _ActionHandoff
+from shard.actionsnapshot import ingest_artefacts as _ingest_artefacts
 # THE CONTRACT, not the entry point. This module is a CALLER of the CLI and used to import `shard.cli`
 # just to learn what a 1 means — from inside a function body, because importing the entry point at
 # module scope to read two integers is the wrong shape and a previous session left a comment saying so
 # rather than a fix. `shard/gate.py` is the contract on its own, it pulls in nothing, and reading it
 # here at module scope is now honest.
-from shard.gate import EXIT_GATED, EXIT_OK, exit_code
+from shard.gate import EXIT_CONFIG, EXIT_GATED, EXIT_OK, exit_code
 
 #: The three modes `action.yml` offers, and they are the subcommand names on purpose: a mapping
 #: table between two vocabularies is a thing that drifts, and there is nothing to gain from one here.
@@ -87,7 +90,7 @@ INPUTS = (
 #: Inputs this module acts on ITSELF instead of forwarding. Held as a set rather than as a check
 #: inside the identity test, so that adding a second one is a one-line change in the place a reader
 #: looks, and so the test's exclusion list cannot drift from the reason for it.
-NOT_A_FLAG = frozenset({"github_token", "id_token"})
+NOT_A_FLAG = frozenset({'github_token'})
 
 #: Declared on the product surface and read by NOTHING — stated here rather than silently dropped,
 #: because an input that quietly does nothing is exactly what this module exists to fix. The value is
@@ -155,6 +158,7 @@ MODE_REFUSES: dict[str, dict[str, tuple[str, str]]] = {
 _GATE_KEY = {"diff": "gate_eligible", "deep": "reproduced"}
 
 DEFAULT_OUT_DIR = "shard-out"
+_ACTION_MODEL_KEY_ENV = "SHARD_ACTION_MODEL_API_KEY"
 
 
 class ActionInputError(Exception):
@@ -210,7 +214,7 @@ def workdir_for(env) -> str:
     return str(pathlib.Path(root) / "shard-workdir")
 
 
-def argv_for(env) -> list[str]:
+def argv_for(env, *, contained: bool = False) -> list[str]:
     """The `python -m shard ...` command line this action's inputs describe. Pure, so it is testable.
 
     `--json` is always appended: the outputs are read off the payload it prints, and the payload is
@@ -254,7 +258,9 @@ def argv_for(env) -> list[str]:
 
     _opt(argv, "--model", _input(env, "model"))
     _opt(argv, "--model-endpoint", _input(env, "model_endpoint"))
-    _opt(argv, "--api-key-env", _input(env, "api_key_env"))
+    requested_key_env = _input(env, "api_key_env")
+    _opt(argv, "--api-key-env",
+         _ACTION_MODEL_KEY_ENV if contained and requested_key_env else requested_key_env)
     _ceilings(env, argv)
     # BESIDE THE CEILINGS because that is where the CLI declares it (`_budget_args`): the profile names
     # what an UNSET --max-tokens means, and on deep it also answers --max-findings. Both metered modes
@@ -342,9 +348,9 @@ def render_outputs(outputs: dict[str, str], *, echo=print) -> str:
     review found something and you asked me to stop the build for it". A malformed path output would
     have made a demonstrated finding indistinguishable from a broken invocation.
 
-    Only the five path outputs can carry a newline — `status` is one of five literal words and the two
-    counts are integers — so dropping per value keeps every output a workflow branches on. Dropping
-    the whole block is `_emit`'s old shape, where one unencodable character cost a finished run.
+    `_run` rejects control text in the whole producer payload before this function is reached. This
+    per-value refusal remains for direct callers, so no future call site can turn one value into a
+    second GitHub output line by bypassing that boundary.
     """
     lines, refused = [], []
     for name, value in outputs.items():
@@ -361,7 +367,7 @@ def render_outputs(outputs: dict[str, str], *, echo=print) -> str:
     return "".join(f"{line}\n" for line in lines)
 
 
-def run(env=None, *, invoke=None, echo=print, opener=None) -> int:
+def run(env=None, *, invoke=None, echo=print, opener=None, handoff_stream=None) -> int:
     """Read the environment, run the CLI, write the outputs, deliver them. Returns the CLI's exit code.
 
     `invoke` is injected by the tests for the same reason `run_simple` takes a `loop_factory`: the
@@ -370,33 +376,51 @@ def run(env=None, *, invoke=None, echo=print, opener=None) -> int:
     deterministic with no network, and a delivery step reached only through `urllib` at module scope
     would be untestable exactly where being wrong is most expensive.
     """
+    env = os.environ if env is None else env
+    try:
+        handoff = _ActionHandoff.begin(env, stream=handoff_stream)
+    except (OSError, ValueError) as error:
+        raise ActionInputError(f"authenticated runner handoff failed: {error}") from error
+
     from shard.cli import main
 
-    env = os.environ if env is None else env
-    invoke = invoke or main
-    argv = argv_for(env)
-
-    # ---- THE RUN NAMES ITSELF, FROM ITS OWN ARGUMENTS ------------------------------------------------
-    #
-    # **A step's LABEL cannot come from in here, and that is a platform fact rather than a choice.**
-    # GitHub resolves `name:` before this container starts, so a `uses:` step without one renders as
-    # `Run ./` — and an internal CI workflow showed FOUR steps labelled `Run ./` in one job and THREE
-    # labelled `Run ./vendor/shard` in another, each asserting something different. Run 32079827043's
-    # own step list is the evidence.
-    #
-    # What the container can do is refuse to be anonymous in the channels it owns. This heading is
-    # DERIVED from `argv` — the arguments this invocation actually received — so it cannot drift from
-    # what ran and nobody has to remember to write it. `::group::` makes it the collapsible title around
-    # this run's output, so several invocations in one job read as several named sections however their
-    # steps happen to be labelled.
-    echo(f"::group::{describe(argv, env)}")
     try:
-        return _run(argv, env, invoke=invoke, echo=echo, opener=opener)
+        invoke = invoke or main
+        # The composite launcher copies a caller-selected secret VALUE into one fixed carrier. The
+        # selected source name remains INPUT_API_KEY_ENV data and must never become a container env
+        # selector: PYTHONPATH or LD_PRELOAD would run checkout code before this trusted entrypoint.
+        argv = argv_for(env, contained=handoff is not None)
+
+        # ---- THE RUN NAMES ITSELF, FROM ITS OWN ARGUMENTS --------------------------------------------
+        #
+        # **A step's LABEL cannot come from in here, and that is a platform fact rather than a choice.**
+        # GitHub resolves `name:` before this container starts, so a `uses:` step without one renders as
+        # `Run ./` — and an internal CI workflow showed FOUR steps labelled `Run ./` in one job and THREE
+        # labelled `Run ./vendor/shard` in another, each asserting something different. Run
+        # 32079827043's own step list is the evidence.
+        #
+        # What the container can do is refuse to be anonymous in the channels it owns. This heading is
+        # DERIVED from `argv` — the arguments this invocation actually received — so it cannot drift
+        # from what ran and nobody has to remember to write it. `::group::` makes it the collapsible
+        # title around this run's output, so several invocations in one job read as several named
+        # sections however their steps happen to be labelled.
+        echo(f"::group::{describe(argv, env)}")
+        try:
+            code = _run(argv, env, invoke=invoke, echo=echo, opener=opener, handoff=handoff)
+            if handoff is not None:
+                invalid = handoff.seal()
+                if invalid:
+                    echo(f"shard: {invalid}; no outputs can cross the container boundary")
+                    return EXIT_CONFIG
+            return code
+        finally:
+            # In a `finally` so the heading closes on a raise too. An unclosed `::group::` swallows every
+            # later line in the job into a collapsed block, which would make a crash HARDER to read than
+            # no grouping at all.
+            echo("::endgroup::")
     finally:
-        # In a `finally` so the heading closes on a raise too. An unclosed `::group::` swallows every
-        # later line in the job into a collapsed block, which would make a crash HARDER to read than
-        # no grouping at all.
-        echo("::endgroup::")
+        if handoff is not None:
+            handoff.discard()
 
 
 def describe(argv: list[str], env=None) -> str:
@@ -475,18 +499,68 @@ def _describes_itself(code: int, payload: dict, env, *, echo=print) -> bool:
     """
     status = str(payload.get("status") or "")
     fail_on = _input(env, "fail_on") or "none"
+    delivery = (payload.get("artefacts") or {}).get("delivery") or {}
+    # Bundle delivery happens after adjudication, and its EXIT_CONFIG is independent of the finding
+    # gate. The validated payload is the proof: status=error, a required failure, and delivery.ok=false.
+    # Recognising it through fail_on made the same completed run self-describing under `reproduced` and
+    # outputless under `none`, even though clidiff/clipaid deliberately return 2 in both cases.
+    delivery_failed = (code == EXIT_CONFIG and status == "error" and delivery.get("ok") is False
+                       and bool(delivery.get("failed_required")))
     refused_by_gate = code != EXIT_OK and code == exit_code(False, fail_on, status=status)
-    if code not in (EXIT_OK, EXIT_GATED) and not refused_by_gate:
+    if code not in (EXIT_OK, EXIT_GATED) and not refused_by_gate and not delivery_failed:
         echo("shard: the run did not complete; no outputs were written")
         return False
-    if refused_by_gate:
+    if delivery_failed:
+        echo("shard: the review completed, but a required reproduction bundle could not be delivered. "
+             "The outputs below describe the delivery failure; no missing reproduction can gate.")
+    elif refused_by_gate:
         echo(f"shard: the review ended `{status}` and `fail_on: {fail_on}` was set, so this step "
              f"reports a configuration failure rather than a pass — a review that did not happen "
              f"cannot clear a gate. The outputs below describe the run.")
     return True
 
 
-def _run(argv, env, *, invoke, echo, opener) -> int:
+def _write_command_files(env, payload: dict, outputs: dict[str, str], validated: dict[str, bytes],
+                         handoff: _ActionHandoff | None, *, echo) -> bool:
+    """Write GitHub's command files; return whether every expected append completed."""
+    complete = True
+    path = env.get("GITHUB_OUTPUT")
+    if path:
+        # The write is guarded because by this point the ANALYSIS IS DONE and the customer has already
+        # paid for it. Unguarded, an unwritable $GITHUB_OUTPUT — a read-only mount, a permissions quirk
+        # on a self-hosted runner — raised `PermissionError` out of `run`, which `cli.py` reports as
+        # "shard: internal error" with exit 2, discarding a completed review and its findings over a
+        # log file. Measured 2026-08-10 in the shipped image. A direct invocation preserves its gate
+        # decision; an authenticated launcher must instead reject an incomplete relay below.
+        rendered = render_outputs(outputs, echo=echo)
+        try:
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(rendered)
+            if handoff is not None:
+                handoff.append_relay("output", rendered.encode("utf-8"))
+        except OSError as error:
+            complete = False
+            echo(f"shard: $GITHUB_OUTPUT could not be written ({error.__class__.__name__}: {error}); "
+                 f"the findings are unaffected, but a later step reading these outputs will see "
+                 f"nothing")
+    else:
+        # Not an error: `docker run` of this image by hand is a supported way to see what the action
+        # does, and there is no output file there.
+        echo("shard: no $GITHUB_OUTPUT; outputs were computed and not written")
+
+    summary_appends: list[bytes] = []
+    report = ((payload.get("artefacts") or {}).get("report") or "").strip()
+    summary_expected = bool(env.get("GITHUB_STEP_SUMMARY") and report)
+    summary_written = write_step_summary(
+        env, payload, validated=validated, echo=echo, handoff_appends=summary_appends)
+    if summary_expected and not summary_written:
+        complete = False
+    if handoff is not None and summary_appends:
+        handoff.append_relay("summary", summary_appends[0])
+    return complete
+
+
+def _run(argv, env, *, invoke, echo, opener, handoff: _ActionHandoff | None = None) -> int:
     """The body of `run`, split out so the heading above wraps every exit from it, raises included."""
     # `argv[0]` IS THE MODE — `argv_for` builds `[mode, "--repo", …]` — and it is read here rather
     # than from `INPUT_MODE` because it is what actually ran. `describe` derives its heading the same
@@ -527,6 +601,22 @@ def _run(argv, env, *, invoke, echo, opener) -> int:
         echo("shard: the run produced no machine-readable payload; no outputs were written")
         return code
 
+    invalid = _payload_error(argv[0], payload)
+    if invalid:
+        echo(f"shard: the run produced an incomplete machine-readable payload ({invalid}); "
+             "no outputs or delivery actions were written")
+        return EXIT_CONFIG
+
+    invalid, validated, payload, handoff_files = _ingest_artefacts(
+        argv[0], payload, argv[argv.index("--out-dir") + 1],
+        env.get("SHARD_ACTION_SNAPSHOT_ROOT") or env.get("RUNNER_TEMP") or "/tmp")
+    if invalid:
+        echo(f"shard: the run's machine-readable payload claimed an invalid output artefact ({invalid}); "
+             "no outputs or delivery actions were written")
+        return EXIT_CONFIG
+    if handoff is not None:
+        handoff.bind_snapshot(handoff_files)
+
     if not _describes_itself(code, payload, env, echo=echo):
         return code
 
@@ -548,30 +638,14 @@ def _run(argv, env, *, invoke, echo, opener) -> int:
              f"run: {', '.join(sorted(failed))}. The findings themselves are unaffected — what is "
              f"missing is where they were written to.")
 
-    outputs = outputs_for(argv[0], payload)
-    path = env.get("GITHUB_OUTPUT")
-    if path:
-        # The write is guarded because by this point the ANALYSIS IS DONE and the customer has already
-        # paid for it. Unguarded, an unwritable $GITHUB_OUTPUT — a read-only mount, a permissions quirk
-        # on a self-hosted runner — raised `PermissionError` out of `run`, which `cli.py` reports as
-        # "shard: internal error" with exit 2, discarding a completed review and its findings over a
-        # log file. Measured 2026-08-10 in the shipped image. `code` is still returned, so the gate
-        # decision the customer asked for survives the failure to announce it.
-        try:
-            with open(path, "a", encoding="utf-8") as handle:
-                handle.write(render_outputs(outputs, echo=echo))
-        except OSError as e:
-            echo(f"shard: $GITHUB_OUTPUT could not be written ({e.__class__.__name__}: {e}); the "
-                 f"findings and the exit status are unaffected, but a later step reading these "
-                 f"outputs will see nothing")
-    else:
-        # Not an error: `docker run` of this image by hand is a supported way to see what the action
-        # does, and there is no output file there.
-        echo("shard: no $GITHUB_OUTPUT; outputs were computed and not written")
-
-    write_step_summary(env, payload, echo=echo)
-    upload_sarif(env, payload, opener=opener, echo=echo)
-    comment_on_pull_request(env, payload, opener=opener, echo=echo)
+    relay_complete = _write_command_files(
+        env, payload, outputs_for(argv[0], payload), validated, handoff, echo=echo)
+    upload_sarif(env, payload, validated=validated, opener=opener, echo=echo)
+    comment_on_pull_request(env, payload, validated=validated, opener=opener, echo=echo)
+    if handoff is not None and not relay_complete:
+        echo("shard: the authenticated command-file handoff is incomplete; delivery was attempted "
+             "but no successful review status can cross the container boundary")
+        return EXIT_CONFIG
     return code
 
 
@@ -581,7 +655,13 @@ def _run(argv, env, *, invoke, echo, opener) -> int:
 COMMENT_MARKER = "<!-- shard:report -->"
 
 
-def comment_on_pull_request(env, payload: dict, *, opener=None, echo=print) -> bool:
+def _delivery_bytes(path: str, key: str, validated: dict[str, bytes] | None) -> bytes:
+    """Return the validation-bound bytes, or read the path for a direct helper caller."""
+    return validated[key] if validated is not None else pathlib.Path(path).read_bytes()
+
+
+def comment_on_pull_request(env, payload: dict, *, validated: dict[str, bytes] | None = None,
+                            opener=None, echo=print) -> bool:
     """Post the report as a pull-request comment, editing our own rather than adding one.
 
     **an internal audit, item 3.** `action.yml`'s own output description says
@@ -651,7 +731,8 @@ def comment_on_pull_request(env, payload: dict, *, opener=None, echo=print) -> b
             existing = json.loads(response.read().decode())
         mine = [c for c in existing if COMMENT_MARKER in (c.get("body") or "")]
 
-        body = json.dumps({"body": f"{COMMENT_MARKER}\n{pathlib.Path(report).read_text('utf-8')}"})
+        body = json.dumps({"body": f"{COMMENT_MARKER}\n"
+                                  f"{_delivery_bytes(report, 'report', validated).decode('utf-8')}"})
         if mine:
             url, verb = f"{issues}/comments/{mine[-1]['id']}", "PATCH"
         else:
@@ -689,7 +770,8 @@ def _pull_request_number(env) -> int | None:
 SARIF_CATEGORY = "shard"
 
 
-def upload_sarif(env, payload: dict, *, opener=None, echo=print) -> bool:
+def upload_sarif(env, payload: dict, *, validated: dict[str, bytes] | None = None,
+                 opener=None, echo=print) -> bool:
     """POST the SARIF to code scanning. Returns whether it was accepted.
 
     **an internal audit, and the integration guide's whole argument.** That
@@ -751,7 +833,8 @@ def upload_sarif(env, payload: dict, *, opener=None, echo=print) -> bool:
         body = json.dumps({
             "commit_sha": sha,
             "ref": ref,
-            "sarif": base64.b64encode(gzip.compress(pathlib.Path(sarif).read_bytes())).decode(),
+            "sarif": base64.b64encode(gzip.compress(
+                _delivery_bytes(sarif, "sarif", validated))).decode(),
             # Named so a second security tool's alerts and ours never collide, and so re-running
             # Shard REPLACES its own previous results rather than duplicating them.
             "tool_name": SARIF_CATEGORY,
@@ -782,7 +865,8 @@ def upload_sarif(env, payload: dict, *, opener=None, echo=print) -> bool:
     return True
 
 
-def write_step_summary(env, payload: dict, *, echo=print) -> bool:
+def write_step_summary(env, payload: dict, *, validated: dict[str, bytes] | None = None,
+                       echo=print, handoff_appends: list[bytes] | None = None) -> bool:
     """Put the report in the Actions UI. Returns whether anything was written.
 
     **an internal audit, and it is the cheapest row in that document.** The product
@@ -799,8 +883,8 @@ def write_step_summary(env, payload: dict, *, echo=print) -> bool:
     the customer keeps.
 
     Never raises. The analysis is finished and paid for by the time this runs, so an unwritable
-    summary file must cost a log line and never a finding — the rule `$GITHUB_OUTPUT` above already
-    follows, for the defect measured in the shipped image on 2026-08-10.
+    summary file must never cost a finding. Direct invocation preserves the review's exit status;
+    the authenticated launcher rejects the incomplete relay after delivery has been attempted.
     """
     path = env.get("GITHUB_STEP_SUMMARY")
     if not path:
@@ -812,13 +896,15 @@ def write_step_summary(env, payload: dict, *, echo=print) -> bool:
         echo("shard: no report artefact, so nothing was written to $GITHUB_STEP_SUMMARY")
         return False
     try:
-        text = pathlib.Path(report).read_text(encoding="utf-8")
+        text = _delivery_bytes(report, "report", validated).decode("utf-8")
+        rendered = text if text.endswith("\n") else text + "\n"
         with open(path, "a", encoding="utf-8") as handle:
-            handle.write(text if text.endswith("\n") else text + "\n")
-    except OSError as e:
+            handle.write(rendered)
+        if handoff_appends is not None:
+            handoff_appends.append(rendered.encode("utf-8"))
+    except (OSError, UnicodeError, KeyError) as e:
         echo(f"shard: $GITHUB_STEP_SUMMARY could not be written ({e.__class__.__name__}: {e}); the "
-             f"findings and the exit status are unaffected, but this run will not be legible in the "
-             f"Actions UI")
+             f"findings are unaffected, but this run will not be legible in the Actions UI")
         return False
     return True
 

@@ -220,7 +220,7 @@ def _spend(backend, governor) -> dict:
     usage = getattr(backend, "usage_summary", None)
     usage = usage() if callable(usage) else {}
     priced = int(usage.get("priced_requests", 0) or 0)
-    return {
+    spend = {
         "usd": round(float(usage.get("cost_usd", 0.0) or 0.0), 6) if priced else None,
         "usd_ceiling": governor.budget.usd,
         "tokens_ceiling": governor.budget.tokens,
@@ -240,3 +240,6 @@ def _spend(backend, governor) -> dict:
         "seconds": round(governor.spent("wall_seconds"), 1),
         "seconds_ceiling": governor.budget.wall_seconds,
     }
+    if "token_reported_requests" in usage:
+        spend["token_reported_requests"] = int(usage.get("token_reported_requests", 0) or 0)
+    return spend

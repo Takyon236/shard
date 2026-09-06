@@ -55,7 +55,7 @@ jobs:
       # No API key, no network. If a test here needs either, it is the test that
       # is wrong — see CONTRIBUTING.md.
       - name: Tests
-        run: python -m pytest -q
+        run: python -m pytest
 
       - name: Lint
         run: python -m ruff check shard/
@@ -108,5 +108,5 @@ jobs:
           mkdir -p ws && printf 'def f(x):\n    return eval(x)\n' > ws/app.py
           docker run --rm \
             -v "$PWD/ws:/github/workspace" -w /github/workspace \
-            -e INPUT_MODE=survey -e INPUT_OUT-DIR=/tmp/out \
+            -e INPUT_MODE=survey -e INPUT_OUT_DIR=/tmp/out \
             shard:ci action

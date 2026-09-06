@@ -15,14 +15,17 @@ Needs `php` on your PATH. The action's container carries `php-cli`; if your mach
 this example is the one that will skip.
 
 ```bash
+set -euo pipefail
 cd examples/php-template-include
 
 bash .shard/entry.sh /dev/null                            # silent, exit 0   <- the baseline
 bash .shard/entry.sh .shard/entry.sh.benign/ordinary.txt  # silent, exit 0
 bash .shard/entry.sh .shard/entry.sh.benign/missing.txt   # silent, exit 0
 
-printf '../secrets\n' > /tmp/attack.txt
-bash .shard/entry.sh /tmp/attack.txt                      # SHARD_TEMPLATE_ESCAPED_ROOT
+attack_input="$(mktemp)"
+printf '../secrets\n' > "$attack_input"
+bash .shard/entry.sh "$attack_input"                      # SHARD_TEMPLATE_ESCAPED_ROOT
+rm -f -- "$attack_input"
 ```
 
 ## The decision worth copying: a sentinel that runs
@@ -44,6 +47,7 @@ reporting before it renders. A template name that does not resolve is the render
 ## Then point Shard at it
 
 ```bash
-shard survey --repo examples/php-template-include --out-dir /tmp/shard-out
-shard preflight --repo examples/php-template-include --witness-entry .shard/entry.sh
+set -euo pipefail
+shard survey --repo . --out-dir /tmp/shard-out
+shard preflight --repo . --witness-entry .shard/entry.sh
 ```

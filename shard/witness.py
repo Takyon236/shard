@@ -208,11 +208,20 @@ mode ships.
 from __future__ import annotations
 
 import hashlib
+import os
 import pathlib
 import re
+import signal
+import stat
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
+
+from shard.witnessfs import SnapshotError, SourceSnapshot, original_paths
+
+SOURCE_ISOLATION_REFUSAL = "witness source isolation failed: "
+CONTAINMENT_REFUSAL = "witness execution containment failed: "
 
 #: Fatal FAULT signals, as a shell reports them (128 + N): ILL, ABRT, BUS, FPE, SEGV. SIGKILL (137) and
 #: SIGTERM (143) are deliberately absent — those are how a timeout kills a hang, and counting a hang as
@@ -230,8 +239,35 @@ _SECRET_ENV_SUFFIXES = ("_TOKEN", "_KEY", "_SECRET", "_PASSWORD", "_PASSWD", "_C
 _SECRET_ENV_NAMES = frozenset({"GITHUB_TOKEN", "GH_TOKEN", "AWS_SESSION_TOKEN", "AWS_SECRET_ACCESS_KEY",
                                "AWS_ACCESS_KEY_ID", "ANTHROPIC_AUTH_TOKEN"})
 
+# GitHub's command files are capabilities, not ordinary build configuration. Appending one line to
+# GITHUB_ENV or GITHUB_PATH changes the environment of every later workflow step; GITHUB_OUTPUT,
+# GITHUB_STATE and GITHUB_STEP_SUMMARY cross the process boundary too. The location names expose the
+# live checkout or shared runner directories to code that is supposed to see only a disposable trial.
+_COMMAND_FILE_ENV_NAMES = frozenset({
+    "GITHUB_ENV", "GITHUB_PATH", "GITHUB_OUTPUT", "GITHUB_STEP_SUMMARY", "GITHUB_STATE",
+})
+_LOCATION_ENV_NAMES = frozenset({
+    "GITHUB_WORKSPACE", "GITHUB_ACTION_PATH", "RUNNER_TEMP", "RUNNER_TOOL_CACHE", "RUNNER_WORKSPACE",
+    "SHARD_ACTION_SNAPSHOT_ROOT",
+})
+_CONTROL_SOCKET_ENV_NAMES = frozenset({
+    "CONTAINER_CONNECTION", "CONTAINER_HOST", "DBUS_SESSION_BUS_ADDRESS", "DOCKER_CONTEXT",
+    "DOCKER_HOST", "GNUPGHOME", "GPG_AGENT_INFO", "KUBECONFIG", "PODMAN_SOCKET",
+    "SSH_AUTH_SOCK", "SSH_AGENT_PID", "XDG_RUNTIME_DIR",
+})
+_ENTRY_CAPABILITY_ENV_NAMES = (
+    _COMMAND_FILE_ENV_NAMES | _LOCATION_ENV_NAMES | _CONTROL_SOCKET_ENV_NAMES
+)
 
-def entry_env(base=None) -> dict:
+
+def _secret_env_name(name: str, configured=()) -> bool:
+    upper = name.upper()
+    configured_names = {str(item).upper() for item in configured if item}
+    return (upper.startswith("INPUT_") or upper in _SECRET_ENV_NAMES or upper in configured_names
+            or any(upper.endswith(suffix) for suffix in _SECRET_ENV_SUFFIXES))
+
+
+def entry_env(base=None, *, secret_env_names=()) -> dict:
     """The environment the CUSTOMER'S entry point runs under, with our credentials removed.
 
     **THE ENTRY POINT IS ATTACKER-AUTHORED CONTENT ON A PULL REQUEST.** It is a file in the repository
@@ -244,20 +280,29 @@ def entry_env(base=None) -> dict:
     Measured before the fix: an entry point of `#!/bin/sh` + `env` put both `OPENROUTER_API_KEY` and
     `INPUT_GITHUB_TOKEN` verbatim into `Witness.evidence`.
 
-    Two rules, and the first is the one that matters most:
+    Five rules, and the first two are installation-specific rather than guesses:
 
     * **the whole `INPUT_*` namespace goes.** GitHub Actions exports every input of the running action
       that way, so it is exactly the set of values the CUSTOMER handed US — including `github_token`
       and whatever `api_key_env` names. Nothing in a customer's build has any business reading our
       inputs, which makes this the one rule with no legitimate loss.
+    * the exact environment name configured by ``api_key_env`` goes, even when it is an arbitrary
+      provider name such as ``NPM_AUTH`` that matches none of the generic credential spellings.
     * names that LOOK like credentials go, by suffix or by a short list of well-known ones.
+    * GitHub's five command files and its workspace/runner location capabilities go. A command-file
+      path is write authority over a later workflow step, not harmless metadata; the private root also
+      omits the underlying file, so guessing its path does not bypass this filter.
+    * host control-socket variables go, by name, socket suffix or a ``unix:`` value. A network
+      namespace does not isolate pathname AF_UNIX sockets; the private root is the primary control,
+      and withholding the address prevents accidental clients from finding a socket cheaply.
 
-    **This is a denylist, and a denylist is not airtight** — a job that exports `NPM_AUTH` under a name
-    matching nothing here still reaches the entry point. The airtight version is an allowlist, and it
-    is not what ships because the entry point is the customer's own build script: it may legitimately
-    need `CC`, `JAVA_HOME`, `LD_LIBRARY_PATH` or anything else their toolchain reads, and denying those
-    by default would break real targets to close a narrower hole than the two rules above already
-    close. Recorded as a deliberate trade rather than an oversight.
+    **This is a denylist, and a denylist is not airtight** — an arbitrary secret variable not selected
+    as ``api_key_env`` and matching none of the generic rules still reaches the entry point. The
+    airtight version is an allowlist, and it is not what ships because the entry point is the
+    customer's own build script: it may legitimately need `CC`, `JAVA_HOME`, `LD_LIBRARY_PATH` or
+    anything else their toolchain reads, and denying those by default would break real targets to
+    close a narrower hole than the credential rules above close. Recorded as a deliberate trade
+    rather than an oversight.
     """
     import os
 
@@ -265,9 +310,9 @@ def entry_env(base=None) -> dict:
     out = {}
     for name, value in source.items():
         upper = name.upper()
-        if upper.startswith("INPUT_") or upper in _SECRET_ENV_NAMES:
-            continue
-        if any(upper.endswith(suffix) for suffix in _SECRET_ENV_SUFFIXES):
+        socket_address = isinstance(value, str) and value.lower().startswith(("unix:", "unix://"))
+        if (_secret_env_name(name, secret_env_names) or upper in _ENTRY_CAPABILITY_ENV_NAMES
+                or upper.endswith(("_SOCK", "_SOCKET")) or socket_address):
             continue
         out[name] = value
     return out
@@ -279,20 +324,21 @@ def entry_env(base=None) -> dict:
 _REDACT_MIN_LEN = 8
 
 
-def secret_values(base=None) -> tuple[str, ...]:
+def secret_values(base=None, *, secret_env_names=()) -> tuple[str, ...]:
     """The literal strings that must never appear in anything we publish.
 
-    Exactly the values `entry_env` refuses to pass on, read back out of the SAME environment by the
-    SAME rule — so a name that becomes a secret there becomes one here in the same commit. Longest
-    first, so a value that contains another is replaced whole rather than left with a redacted hole
-    in the middle of it.
+    Exactly the values the credential half of `entry_env` refuses to pass on, read out of the SAME
+    environment by the SAME name rule. GitHub command and location capabilities are also removed from
+    the child but are paths rather than secrets; treating GITHUB_WORKSPACE as a secret would erase
+    ordinary source locations from every trace. Longest first, so a value containing another is
+    replaced whole rather than left with a redacted hole in the middle of it.
     """
     import os
 
     source = os.environ if base is None else base
-    kept = set(entry_env(source))
     values = {v for name, v in source.items()
-              if name not in kept and isinstance(v, str) and len(v) >= _REDACT_MIN_LEN}
+              if (_secret_env_name(name, secret_env_names) and isinstance(v, str)
+                  and len(v) >= _REDACT_MIN_LEN)}
     return tuple(sorted(values, key=len, reverse=True))
 
 
@@ -322,16 +368,15 @@ def _secret_spellings(value: str) -> tuple[str, ...]:
     return tuple(sorted(forms, key=len, reverse=True))
 
 
-def redact_secrets(text: str, base=None) -> str:
+def redact_secrets(text: str, base=None, *, secret_env_names=()) -> str:
     """Remove our credentials from output we are about to publish, by VALUE rather than by name.
 
-    **`entry_env` is not enough on its own, and the reason is the container's own privilege.** It
-    strips the credentials from the child's environment, but the child runs as root in the same
-    container as this process, so `/proc/1/environ` and `/proc/<our pid>/environ` still hold the
-    original block — a copy the kernel made at exec time, which no later mutation of `os.environ`
-    rewrites. Four lines of `.shard/entry.sh` recover `OPENROUTER_API_KEY` from there, and the
-    entry point's stdout is published back to whoever opened the pull request through
-    `Witness.evidence`, the markdown report, `bundles/*/output.txt` and the PR comment.
+    **`entry_env` was not enough on its own, because the container's procfs held the parent's original
+    environment.** Four lines of `.shard/entry.sh` could recover `OPENROUTER_API_KEY` from
+    `/proc/<our pid>/environ`, then publish it through `Witness.evidence`, the markdown report,
+    `bundles/*/output.txt` and the PR comment. Customer-authored executions now enter a private PID
+    namespace with a private procfs, and the namespace process receives only `entry_env`; the parent
+    and its original environment do not exist in that view. That process boundary is the closure.
 
     Egress is not the channel that matters here and closing it would not have helped: the value
     reaches its author by being PRINTED, not by being sent. So the control is at the last place the
@@ -356,30 +401,411 @@ def redact_secrets(text: str, base=None) -> str:
        credential, which turns a short secret into a filter that eats ordinary trace text — the very
        trade `_REDACT_MIN_LEN` exists to refuse.
 
-    So this raises the cost of exfiltration; it does not close the channel. The control that closes it
-    is not printing the credential into the container in the first place, and `entry_env` is that
-    control — this is the second line, for the copy the kernel made at exec time.
+    This substitution is defense in depth, not the closure: the private procfs removes the copied
+    parent environment and `entry_env` removes the child's copy. If customer code obtains the same
+    secret from another file or service, these residual transforms still describe the last-line
+    filter accurately.
     """
     if not text:
         return text
-    for value in secret_values(base):
+    for value in secret_values(base, secret_env_names=secret_env_names):
         for spelling in _secret_spellings(value):
             if spelling in text:
                 text = text.replace(spelling, "[redacted]")
     return text
 
 
-# ── network containment, for anything that executes customer-authored content ────────────────────────
+# ── process containment, for anything that executes customer-authored content ──────────────────────
 
-#: `--` stops `unshare` parsing further options, the same belt-and-braces applied to `bash` below.
-NETWORK_ISOLATION: tuple[str, ...] = ("unshare", "-n", "--")
+#: PID 1 must outlive the customer entry long enough to preserve its real exit status. `unshare`
+#: propagates ordinary exits but reports 0 when its namespace child dies by signal. This tiny init
+#: waits for the entry as PID 2, translates a signal to the shell's `128 + N`, then exits; Linux kills
+#: any double-forked processes still in the namespace at that boundary. It also makes the capability
+#: probe check `getpid() == 1` without inspecting procfs.
+_CONTAINMENT_PATHS_ENV = "_SHARD_CONTAINMENT_PATHS"
+_CONTAINMENT_ERROR = "shard containment setup failed: "
+
+_NAMESPACE_INIT = f"""\
+import ctypes
+import errno
+import json
+import os
+import sys
+
+ERROR = {_CONTAINMENT_ERROR!r}
+PATHS_ENV = {_CONTAINMENT_PATHS_ENV!r}
+
+def fail(message):
+    os.write(2, (ERROR + message + "\\n").encode("utf-8", "replace"))
+    raise SystemExit(125)
+
+if os.getpid() != 1 or len(sys.argv) < 2:
+    fail("namespace init did not become PID 1")
+
+try:
+    manifest = json.loads(os.environ.pop(PATHS_ENV, "{{}}"))
+    readonly = manifest.get("readonly", [])
+    writable = manifest.get("writable", [])
+    execution_cwd = manifest.get("execution_cwd")
+    jail_root = manifest.get("jail_root", "")
+    overlay = manifest.get("overlay")
+    bind_files = manifest.get("bind_files", [])
+    protected_relatives = manifest.get("protected_relatives", [])
+    if overlay is not None:
+        overlay_paths = [overlay.get(name, "") for name in
+                         ("lower", "target", "upper", "work", "storage")]
+        writable = writable + [overlay_paths[4]]
+    else:
+        overlay_paths = []
+    # Ancestors first, then descendants. Binding an ancestor after its child hides the child's mount
+    # and makes the later remount address an ordinary dentry (EINVAL). Both nesting directions occur:
+    # witness trials protect descendants of writable scratch, while run_entry writes a scratch child
+    # beneath a read-only checkout.
+    paths = sorted(set(writable + readonly), key=lambda path: (path.count(os.sep), path))
+    if (not isinstance(manifest, dict) or not isinstance(readonly, list)
+            or not isinstance(writable, list)
+            or not isinstance(bind_files, list)
+            or not all(isinstance(pair, list) and len(pair) == 2
+                       and all(isinstance(path, str) and path for path in pair)
+                       for pair in bind_files)
+            or not isinstance(protected_relatives, list)
+            or not all(isinstance(path, str) and path and not path.startswith("/")
+                       and ".." not in path.split("/") for path in protected_relatives)
+            or (overlay is not None and not isinstance(overlay, dict))
+            or (execution_cwd is not None and not isinstance(execution_cwd, str))
+            or not isinstance(jail_root, str) or not jail_root
+            or not all(isinstance(path, str) and path for path in paths + overlay_paths)):
+        fail("invalid protected-path manifest")
+    if any(path in ("/", "/home", "/root", "/run", "/tmp", "/var", "/var/run")
+           for path in paths):
+        fail("a declared execution root is too broad")
+except (TypeError, ValueError) as exc:
+    fail("invalid protected-path manifest: " + str(exc))
+
+libc = ctypes.CDLL(None, use_errno=True)
+libc.mount.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p,
+                       ctypes.c_ulong, ctypes.c_void_p]
+libc.mount.restype = ctypes.c_int
+MS_RDONLY = 1
+MS_REMOUNT = 32
+MS_BIND = 4096
+MS_REC = 16384
+
+class MountAttr(ctypes.Structure):
+    _fields_ = [("attr_set", ctypes.c_uint64), ("attr_clr", ctypes.c_uint64),
+                ("propagation", ctypes.c_uint64), ("userns_fd", ctypes.c_uint64)]
+try:
+    mount_setattr = libc.mount_setattr
+except AttributeError:
+    def mount_setattr(directory, path, flags, attr, size):
+        return libc.syscall(442, directory, path, flags, attr, size)
+mount_setattr.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint,
+                          ctypes.POINTER(MountAttr), ctypes.c_size_t]
+mount_setattr.restype = ctypes.c_int
+AT_FDCWD = -100
+AT_RECURSIVE = 0x8000
+MOUNT_ATTR_RDONLY = 1
+MOUNT_ATTR_NOSUID = 2
+MOUNT_ATTR_NODEV = 4
+
+if overlay is not None:
+    lower, target, upper, work, storage = overlay_paths
+    MS_NOSUID = 2
+    MS_NODEV = 4
+    MS_NOEXEC = 8
+    # The outer Action filesystem is itself overlayfs. Linux refuses an overlay whose upper/work
+    # directories sit on that same overlay (EINVAL), which made containment pass on the host and fail
+    # in the shipping image. Put the private upper on tmpfs first; after mounting the trial overlay, a
+    # second empty read-only tmpfs hides those bookkeeping paths from customer code without removing
+    # the mounted overlay's references to them.
+    if libc.mount(b"tmpfs", os.fsencode(storage), b"tmpfs", MS_NOSUID | MS_NODEV,
+                  ctypes.c_char_p(b"size=64m")) != 0:
+        fail("could not allocate private trial storage: errno " + str(ctypes.get_errno()))
+    try:
+        os.mkdir(upper, 0o700)
+        os.mkdir(work, 0o700)
+    except OSError as exc:
+        fail("could not prepare private trial storage: " + str(exc))
+    upper_fd = os.open(upper, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    options = "lowerdir=" + lower + ",upperdir=" + upper + ",workdir=" + work
+    if libc.mount(b"overlay", os.fsencode(target), b"overlay", 0,
+                  ctypes.c_char_p(os.fsencode(options))) != 0:
+        fail("could not mount a private writable trial: errno " + str(ctypes.get_errno()))
+    if libc.mount(b"tmpfs", os.fsencode(storage), b"tmpfs",
+                  MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC,
+                  ctypes.c_char_p(b"size=4096")) != 0:
+        fail("could not hide private trial storage: errno " + str(ctypes.get_errno()))
+
+# Bind retained evidence over its historical path only inside this namespace. The command therefore
+# sees the same argv and BASH_SOURCE/$0 layout as the customer contract, while a live-path rewrite
+# cannot change which bytes execute or which candidate bytes the harness opens.
+for source, target in bind_files:
+    if not os.path.exists(target):
+        try:
+            descriptor = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.close(descriptor)
+        except OSError as exc:
+            fail("could not create an immutable file target: " + str(exc))
+    if (not os.path.isabs(source) or not os.path.isabs(target)
+            or not os.path.isfile(source) or not os.path.isfile(target)):
+        fail("an immutable file binding disappeared before execution")
+    if libc.mount(os.fsencode(source), os.fsencode(target), None, MS_BIND, None) != 0:
+        fail("could not bind immutable evidence: errno " + str(ctypes.get_errno()))
+    if libc.mount(None, os.fsencode(target), None, MS_BIND | MS_REMOUNT | MS_RDONLY, None) != 0:
+        fail("could not make immutable evidence read-only: errno " + str(ctypes.get_errno()))
+
+# A read-only host root still exposes every path whose name an attacker knows. Build a new root from
+# an allowlist instead: runtimes, the explicitly declared read/write roots, a private procfs and the
+# minimum device files ordinary commands need. Nothing else is mounted, so an arbitrary host path is
+# absent rather than merely immutable. The caller owns ``jail_root`` and removes it after this mount
+# namespace exits; mounting tmpfs over it keeps all root construction out of the host filesystem.
+MS_NOSUID = 2
+MS_NODEV = 4
+MS_NOEXEC = 8
+if (not os.path.isabs(jail_root) or jail_root == "/" or not os.path.isdir(jail_root)
+        or os.path.islink(jail_root)):
+    fail("the private execution root is unavailable")
+if libc.mount(b"tmpfs", os.fsencode(jail_root), b"tmpfs", MS_NOSUID | MS_NODEV,
+              ctypes.c_char_p(b"size=128m")) != 0:
+    fail("could not allocate the private execution root: errno " + str(ctypes.get_errno()))
+new_root = os.path.join(jail_root, "root")
+try:
+    os.mkdir(new_root, 0o700)
+except OSError as exc:
+    fail("could not prepare the private execution root: " + str(exc))
+if libc.mount(os.fsencode(new_root), os.fsencode(new_root), None, MS_BIND, None) != 0:
+    fail("could not bind the private execution root: errno " + str(ctypes.get_errno()))
+
+def target_for(path, directory):
+    target = new_root + path
+    try:
+        os.makedirs(os.path.dirname(target), mode=0o755, exist_ok=True)
+        if directory:
+            os.makedirs(target, mode=0o755, exist_ok=True)
+        elif not os.path.exists(target):
+            descriptor = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.close(descriptor)
+    except OSError as exc:
+        fail("could not prepare an allowed path: " + str(exc))
+    return target
+
+def expose(path, readonly_path, harden=False):
+    if not os.path.isabs(path) or not os.path.exists(path):
+        fail("an allowed path disappeared before execution")
+    directory = os.path.isdir(path)
+    target = target_for(path, directory)
+    flags = MS_BIND | (MS_REC if directory else 0)
+    if libc.mount(os.fsencode(path), os.fsencode(target), None, flags, None) != 0:
+        fail("could not expose an allowed path: errno " + str(ctypes.get_errno()))
+    if readonly_path or harden:
+        attrs = (MOUNT_ATTR_RDONLY if readonly_path else 0)
+        if harden:
+            attrs |= MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV
+        attr = MountAttr(attrs, 0, 0, 0)
+        recursive = AT_RECURSIVE if directory else 0
+        if mount_setattr(AT_FDCWD, os.fsencode(target), recursive,
+                         ctypes.byref(attr), ctypes.sizeof(attr)) != 0:
+            fail("could not make an allowed path read-only: errno " + str(ctypes.get_errno()))
+
+# Keep command availability without carrying the host root into the namespace. These are executable
+# distribution roots, not customer or runner state. Debian's /bin and /lib are symlinks into /usr,
+# but binding the historical names preserves shebangs and dynamic-loader paths on both layouts.
+runtime_roots = [path for path in ("/usr", "/bin", "/lib", "/lib64", "/sbin")
+                 if os.path.exists(path)]
+runtime_roots += [path for path in ("/etc/alternatives", "/etc/ld.so.cache")
+                  if os.path.exists(path)]
+# Debian-family JDKs deliberately keep their runtime security policy outside /usr and link
+# ``$JAVA_HOME/conf`` into one versioned directory here. Omitting it leaves ``java`` executable but
+# breaks ObjectInputStream, XML parsing and other ordinary standard-library operations with
+# ``InternalError: Error loading java.security file``. Expose only the versioned distribution
+# configuration, never /etc itself or a symlink that could redirect this exception to host state.
+try:
+    java_configs = [
+        os.path.join("/etc", name) for name in os.listdir("/etc")
+        if (name.startswith("java-") and name.endswith("-openjdk")
+            and name[5:-8].isdigit()
+            and os.path.isdir(os.path.join("/etc", name))
+            and not os.path.islink(os.path.join("/etc", name)))
+    ]
+except OSError:
+    java_configs = []
+runtime_roots += java_configs
+for path in runtime_roots:
+    expose(path, True)
+
+# Parent mounts precede descendants. A writable trial may contain a retained read-only input, and a
+# read-only checkout may contain a disposable writable scratch child; the deeper binding decides.
+allowed = [(path, False) for path in writable]
+allowed += [(path, True) for path in readonly]
+if overlay is not None:
+    allowed.append((overlay_paths[1], False))
+allowed.sort(key=lambda item: (item[0].count(os.sep), item[0], item[1]))
+for path, readonly_path in allowed:
+    expose(path, readonly_path, True)
+
+# A fresh procfs is tied to this PID namespace. Only ordinary character devices are carried across;
+# /dev/shm, disks and host sockets are deliberately absent.
+proc_target = target_for("/proc", True)
+if libc.mount(b"proc", os.fsencode(proc_target), b"proc", MS_NOSUID | MS_NODEV | MS_NOEXEC,
+              None) != 0:
+    fail("could not mount the private procfs: errno " + str(ctypes.get_errno()))
+target_for("/dev", True)
+for device in ("/dev/null", "/dev/zero", "/dev/random", "/dev/urandom"):
+    if os.path.exists(device):
+        expose(device, False)
+try:
+    # Compilers and language runtimes expect a writable /tmp even when the declared workdir lives
+    # elsewhere. This directory belongs to the private tmpfs root; exposing the host's /tmp would
+    # recover cross-trial state and every pathname socket placed there.
+    os.makedirs(new_root + "/tmp", mode=0o1777, exist_ok=True)
+    os.chmod(new_root + "/tmp", 0o1777)
+    os.makedirs(new_root + "/etc", mode=0o755, exist_ok=True)
+    with open(new_root + "/etc/passwd", "w", encoding="utf-8") as stream:
+        stream.write("root:x:0:0:root:/root:/bin/sh\\n")
+    with open(new_root + "/etc/group", "w", encoding="utf-8") as stream:
+        stream.write("root:x:0:\\n")
+    for link, target in (("/dev/fd", "/proc/self/fd"), ("/dev/stdin", "/proc/self/fd/0"),
+                         ("/dev/stdout", "/proc/self/fd/1"), ("/dev/stderr", "/proc/self/fd/2")):
+        os.symlink(target, new_root + link)
+except OSError as exc:
+    fail("could not prepare private runtime files: " + str(exc))
+
+if execution_cwd is not None:
+    visible = writable + readonly + ([overlay_paths[1]] if overlay is not None else [])
+    if not any(execution_cwd == root or execution_cwd.startswith(root.rstrip("/") + "/")
+               for root in visible):
+        fail("the execution directory is outside the allowed roots")
+
+old_root = os.path.join(new_root, ".old-root")
+try:
+    os.mkdir(old_root, 0o700)
+except OSError as exc:
+    fail("could not prepare the old-root detachment: " + str(exc))
+try:
+    pivot_root = libc.pivot_root
+except AttributeError:
+    fail("pivot_root is unavailable on this runner")
+pivot_root.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+pivot_root.restype = ctypes.c_int
+if pivot_root(os.fsencode(new_root), os.fsencode(old_root)) != 0:
+    fail("could not pivot into the private execution root: errno " + str(ctypes.get_errno()))
+try:
+    os.chdir("/")
+except OSError as exc:
+    fail("could not enter the private execution root: " + str(exc))
+libc.umount2.argtypes = [ctypes.c_char_p, ctypes.c_int]
+libc.umount2.restype = ctypes.c_int
+MNT_DETACH = 2
+if libc.umount2(b"/.old-root", MNT_DETACH) != 0:
+    fail("could not detach the host root: errno " + str(ctypes.get_errno()))
+try:
+    os.rmdir("/.old-root")
+except OSError as exc:
+    fail("could not remove the detached host root: " + str(exc))
+if execution_cwd is not None:
+    try:
+        os.chdir(execution_cwd)
+    except OSError as exc:
+        fail("could not enter the contained working directory: " + str(exc))
+
+# Namespace root is needed only to construct the mounts. Customer code must not retain CAP_SYS_ADMIN:
+# it could otherwise unmount the read-only bind and reach the live checkout underneath it. NOROOT
+# prevents uid 0 from regaining capabilities on exec; the bounding and ambient sets close the other
+# routes, and no_new_privs makes the transition permanent for descendants.
+PR_SET_SECUREBITS = 28
+PR_CAPBSET_DROP = 24
+PR_SET_NO_NEW_PRIVS = 38
+PR_SET_DUMPABLE = 4
+PR_CAP_AMBIENT = 47
+PR_CAP_AMBIENT_CLEAR_ALL = 4
+SECURE_LOCKED = 1 | 2 | 4 | 8
+# PID 1 retains the overlay-verification descriptor until the hostile child exits. Making the trusted
+# init non-dumpable prevents that same-UID child reaching it through /proc/1/fd; exec restores the
+# ordinary dumpable state for the child itself.
+if libc.prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) != 0:
+    fail("could not protect the namespace init descriptors: errno " + str(ctypes.get_errno()))
+if libc.prctl(PR_SET_SECUREBITS, SECURE_LOCKED, 0, 0, 0) != 0:
+    fail("could not lock root capability semantics: errno " + str(ctypes.get_errno()))
+for capability in range(64):
+    if libc.prctl(PR_CAPBSET_DROP, capability, 0, 0, 0) != 0 and ctypes.get_errno() != errno.EINVAL:
+        fail("could not drop the capability bounding set: errno " + str(ctypes.get_errno()))
+libc.prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0)
+
+class CapHeader(ctypes.Structure):
+    _fields_ = [("version", ctypes.c_uint32), ("pid", ctypes.c_int)]
+class CapData(ctypes.Structure):
+    _fields_ = [("effective", ctypes.c_uint32), ("permitted", ctypes.c_uint32),
+                ("inheritable", ctypes.c_uint32)]
+header = CapHeader(0x20080522, 0)
+data = (CapData * 2)()
+if libc.capset(ctypes.byref(header), ctypes.byref(data)) != 0:
+    fail("could not clear process capabilities: errno " + str(ctypes.get_errno()))
+if libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
+    fail("could not set no_new_privs: errno " + str(ctypes.get_errno()))
+
+child = os.fork()
+if child == 0:
+    os.execvp(sys.argv[1], sys.argv[1:])
+_, status = os.waitpid(child, 0)
+if overlay is not None:
+    for relative in protected_relatives:
+        try:
+            os.stat(relative, dir_fd=upper_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            fail("could not verify private trial changes: " + str(exc))
+        fail("protected trial state changed while the entry point was running: witness execution "
+             "transiently changed pristine source: " + relative)
+if os.WIFEXITED(status):
+    code = os.WEXITSTATUS(status)
+    # 128+signal is reserved for a signal the supervisor observed through waitpid. A hostile shell can
+    # `exit 139`; remapping ordinary high exits makes that textually identical forgery distinguishable
+    # from an exec'd target that the kernel actually terminated with SIGSEGV.
+    raise SystemExit(code if code < 128 else 124)
+raise SystemExit(128 + os.WTERMSIG(status))
+"""
+
+#: A private user namespace supplies the capability needed to create the PID namespace and mount its
+#: own procfs without asking the host for root. `--kill-child` binds timeout cleanup to the namespace
+#: init, while `--` stops `unshare` parsing further options.
+_PID_NAMESPACE = (
+    "unshare", "--user", "--map-root-user", "--pid", "--fork", "--kill-child", "--mount-proc",
+    "--propagation", "private",
+)
+_PID_INIT = ("--", sys.executable, "-c", _NAMESPACE_INIT)
+PID_ISOLATION: tuple[str, ...] = (*_PID_NAMESPACE, *_PID_INIT)
+
+#: The process boundary with a private network. Pathname AF_UNIX sockets survive a network namespace,
+#: so `_NAMESPACE_INIT` also pivots into an allowlisted root before hostile code starts. Every
+#: attacker-authored execution requires the complete prefix and that private-root setup.
+NETWORK_ISOLATION: tuple[str, ...] = (
+    *_PID_NAMESPACE, "--net", *_PID_INIT,
+)
+
+# A Docker action cannot create another user namespace under the default container mapping. Its
+# launcher can grant CAP_SYS_ADMIN inside the container instead; this form uses that already-namespaced
+# capability, then `_NAMESPACE_INIT` drops it before customer code starts. It is never selected on an
+# ordinary host unless the probe proves the complete PID/procfs/network/mount boundary.
+_PRIVILEGED_PID_NAMESPACE = (
+    "unshare", "--pid", "--fork", "--kill-child", "--mount-proc", "--propagation", "private",
+)
+PRIVILEGED_NETWORK_ISOLATION: tuple[str, ...] = (
+    *_PRIVILEGED_PID_NAMESPACE, "--net", *_PID_INIT,
+)
+_NETWORK_PREFIXES = (NETWORK_ISOLATION, PRIVILEGED_NETWORK_ISOLATION)
+
+
+def network_isolated(prefix: tuple[str, ...]) -> bool:
+    """Whether a probed prefix carries the complete hostile-execution boundary."""
+    return prefix in _NETWORK_PREFIXES
 
 #: The probe's answer for the default runner, computed once per process. `None` = not yet asked.
 _ISOLATION_CACHE: tuple[str, ...] | None = None
 
 
 def isolation_prefix(runner=None) -> tuple[str, ...]:
-    """The argv prefix that denies a child process a network, or `()` where the kernel refuses.
+    """A verified private PID and network namespace prefix, or `()` where the kernel refuses it.
 
     **The customer's entry point is attacker-authored content on a pull request** — `entry_env` says
     so at length — and until 2026-08-24 it was the ONE customer-authored thing that never got this
@@ -388,11 +814,15 @@ def isolation_prefix(runner=None) -> tuple[str, ...]:
     its author had unrestricted egress on a runner where the model's own shell did not. That is the
     weaker half of the perimeter protecting the stronger one.
 
-    `unshare -n` needs `CAP_SYS_ADMIN`, which Docker's default capability set does not grant, so on a
-    stock GitHub-hosted runner this returns `()` and the residual `_run_shell` documents is the live
-    one at both sites. It is PROBED rather than assumed because the answer belongs to the customer's
-    runner configuration: a self-hosted runner with a wider capset gets the stronger arm without
-    being told to ask for it.
+    Sanitising the child's environment does not hide this process or its siblings in a shared procfs.
+    A witness can also double-fork into a new session, close its streams and mutate protected state
+    after `bounded_run` returns. The private PID namespace closes both routes: its procfs contains
+    only the new namespace, and Linux kills every remaining member when namespace PID 1 exits.
+
+    There is deliberately no uncontained execution fallback. Callers interpret `()` as a refusal.
+    PID-only isolation is not sufficient. The contained root exposes only runtime distribution paths
+    and roots the caller names; arbitrary host files and control sockets are absent. A runner that
+    cannot create the network and mount boundary refuses the execution before customer code starts.
 
     An INJECTED runner is never cached. The cache exists so a run pays for one probe rather than one
     per execution; a test that scripts the probe must get the answer it scripted.
@@ -406,15 +836,117 @@ def isolation_prefix(runner=None) -> tuple[str, ...]:
 
 
 def _probe_isolation(runner) -> tuple[str, ...]:
-    """Ask the kernel once. Anything other than a clean exit means we did NOT get a namespace —
-    `containment.py`'s rule, that confirming containment is the burden of proof and ambiguity is
-    failure, applied to the one control this module can assert about itself."""
+    """Prove PID 1, private procfs/network, overlay and pivot before trusting the boundary."""
+    with tempfile.TemporaryDirectory(prefix="shard-containment-probe-") as probe_root:
+        root = pathlib.Path(probe_root)
+        protected = root / "protected"
+        hidden = root / "hidden"
+        lower, target = root / "lower", root / "target"
+        storage, upper, work = root / "storage", root / "storage/upper", root / "storage/work"
+        jail = root / "jail"
+        for path in (protected, lower, target, upper, work, jail):
+            path.mkdir(parents=True, exist_ok=True)
+        hidden.write_text("must not be visible", encoding="utf-8")
+        env = _contained_entry_env(
+            protected,
+            jail_root=jail,
+            overlay=(lower, target, upper, work, storage),
+            execution_cwd=target,
+            base={"PATH": os.environ.get("PATH", "")},
+        )
+        check = ("[ ! -e \"$1\" ] && [ ! -S /var/run/docker.sock ] "
+                 "&& [ ! -S /run/docker.sock ]")
+        for prefix in _NETWORK_PREFIXES:
+            try:
+                proc = runner(
+                    [*prefix, "bash", "-c", check, "bash", str(hidden)],
+                    capture_output=True, text=True, errors="replace", timeout=10, env=env,
+                )
+            except (OSError, subprocess.SubprocessError):
+                continue
+            if proc.returncode == 0:
+                return prefix
+    return ()
+
+
+def _resolved_existing_paths(candidates) -> list[str]:
+    """Canonical existing paths, once each; unavailable optional roots stay unavailable."""
+    resolved = []
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            path = pathlib.Path(candidate).resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        rendered = str(path)
+        if rendered not in resolved:
+            resolved.append(rendered)
+    return resolved
+
+
+def _resolved_bindings(bind_files) -> list[list[str]]:
+    """Canonical source/target pairs for immutable file binds."""
+    bindings = []
+    for source_path, target_path in bind_files:
+        try:
+            binding_source = str(pathlib.Path(source_path).resolve(strict=True))
+            target_candidate = pathlib.Path(target_path)
+            try:
+                target = str(target_candidate.resolve(strict=True))
+            except FileNotFoundError:
+                target = str(target_candidate.parent.resolve(strict=True) / target_candidate.name)
+        except (OSError, RuntimeError):
+            continue
+        pair = [binding_source, target]
+        if pair not in bindings:
+            bindings.append(pair)
+    return bindings
+
+
+def _resolved_overlay(overlay) -> dict[str, str] | None:
+    """Canonical overlay paths, or no overlay when an optional path disappeared."""
+    if overlay is None:
+        return None
+    names = ("lower", "target", "upper", "work", "storage")
     try:
-        proc = runner([*NETWORK_ISOLATION, "true"], capture_output=True, text=True,
-                      errors="replace", timeout=10)
-    except (OSError, subprocess.SubprocessError):
-        return ()
-    return NETWORK_ISOLATION if proc.returncode == 0 else ()
+        values = [str(pathlib.Path(path).resolve(strict=True)) for path in overlay]
+    except (OSError, RuntimeError):
+        return None
+    return dict(zip(names, values, strict=True)) if len(values) == len(names) else None
+
+
+def _contained_entry_env(*readonly_paths, jail_root, writable_paths=(), bind_files=(),
+                         protected_relatives=(), overlay=None,
+                         execution_cwd=None, base=None, secret_env_names=()) -> dict:
+    """Sanitise entry env and describe the only host paths the private root may expose.
+
+    The private manifest is removed before the customer process is forked. Runtime distribution roots
+    are added by the trusted init; everything else is absent unless a caller names it here. Command
+    files and host sockets are therefore unreachable even when hostile code guesses their paths.
+    """
+    import json
+
+    source = os.environ if base is None else base
+    protected = _resolved_existing_paths(readonly_paths)
+    writable = _resolved_existing_paths(writable_paths)
+    bindings = _resolved_bindings(bind_files)
+    env = entry_env(source, secret_env_names=secret_env_names)
+    # An inherited TMPDIR can point outside the allowlist. All temporary state belongs in the
+    # private root instead, and these conventional spellings keep compilers and managed runtimes
+    # working without exposing the host's shared temporary directory.
+    env.update({"TMPDIR": "/tmp", "TMP": "/tmp", "TEMP": "/tmp"})
+    env[_CONTAINMENT_PATHS_ENV] = json.dumps({
+        "jail_root": str(pathlib.Path(jail_root).resolve(strict=True)),
+        "readonly": protected,
+        "writable": writable,
+        "bind_files": bindings,
+        "protected_relatives": list(protected_relatives),
+        "overlay": _resolved_overlay(overlay),
+        "execution_cwd": (str(pathlib.Path(execution_cwd).resolve(strict=True))
+                          if execution_cwd is not None else None),
+    }, separators=(",", ":"))
+    return env
 
 
 def reset_isolation_cache() -> None:
@@ -490,6 +1022,15 @@ MAX_CAPTURED_BYTES = 16 * 1024 * 1024
 TRUNCATION_NOTE = "\n[shard: output truncated at {} bytes]\n"
 
 
+def _finished_capture(chunks: list[bytes], seen: list[int], *, cap: int,
+                      text: bool, errors: str | None) -> str | bytes:
+    """Render one drained stream without hiding that bytes past the cap were discarded."""
+    raw = b"".join(chunks)
+    if seen[0] > cap:
+        raw += TRUNCATION_NOTE.format(seen[0]).encode()
+    return raw.decode("utf-8", errors or "replace") if text else raw
+
+
 def bounded_run(argv, *, cwd=None, capture_output=True, text=True, errors="replace",
                 timeout=None, env=None, cap: int = MAX_CAPTURED_BYTES, **kw):
     """`subprocess.run`'s contract, with a ceiling on how much output is held in memory.
@@ -526,8 +1067,17 @@ def bounded_run(argv, *, cwd=None, capture_output=True, text=True, errors="repla
             except OSError:
                 pass
 
-    proc = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            env=env, **kw)
+    # A child that closes its streams and leaves a background writer behind can otherwise mutate the
+    # preserved candidate after the post-run check. One session per entry lets this runner reap that
+    # whole execution tree before returning an observation.
+    kw["start_new_session"] = True
+    # The runner process may itself have a pipe or terminal on fd 0. Hostile code has no business
+    # inheriting bytes addressed to Shard: a workflow secret piped to the CLI otherwise survives the
+    # private root and appears as `/proc/self/fd/0`. A caller that deliberately supplies `stdin=` keeps
+    # subprocess semantics; omission means a closed input, never ambient authority.
+    stdin = kw.pop("stdin", subprocess.DEVNULL)
+    proc = subprocess.Popen(argv, cwd=cwd, stdin=stdin, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, env=env, **kw)
     out: list[bytes] = []
     err: list[bytes] = []
     out_seen, err_seen = [0], [0]
@@ -538,22 +1088,59 @@ def bounded_run(argv, *, cwd=None, capture_output=True, text=True, errors="repla
     try:
         proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-        proc.kill()
+        _kill_process_group(proc.pid)
         proc.wait()
         for r in readers:
             r.join(timeout=5)
         raise
+    _kill_process_group(proc.pid)
     for r in readers:
         r.join(timeout=5)
 
-    def finish(chunks: list[bytes], seen: list) -> str | bytes:
-        raw = b"".join(chunks)
-        if seen[0] > cap:
-            raw += TRUNCATION_NOTE.format(seen[0]).encode()
-        return raw.decode("utf-8", errors or "replace") if text else raw
-
     return subprocess.CompletedProcess(argv, proc.returncode,
-                                       stdout=finish(out, out_seen), stderr=finish(err, err_seen))
+                                       stdout=_finished_capture(out, out_seen, cap=cap, text=text,
+                                                                errors=errors),
+                                       stderr=_finished_capture(err, err_seen, cap=cap, text=text,
+                                                                errors=errors))
+
+
+class ContainmentUnavailable(RuntimeError):
+    """A hostile host command was refused before its payload started."""
+
+
+def contained_run(argv, *, cwd, readonly_paths=(), writable_paths=(), timeout=None,
+                  base_env=None, secret_env_names=()):
+    """Run a trusted runtime processing hostile bytes in the proved allowlisted root.
+
+    Compilers are the primary caller. There is deliberately no raw fallback: inability to build the
+    complete root/PID/network boundary is a refusal, not permission to inspect the host filesystem.
+    """
+    prefix = isolation_prefix()
+    if not network_isolated(prefix):
+        raise ContainmentUnavailable(
+            "the required private PID, mount, procfs and network boundary is unavailable"
+        )
+    with tempfile.TemporaryDirectory(prefix="shard-host-command-root-") as jail_root:
+        proc = bounded_run(
+            [*prefix, *argv], cwd=str(cwd), capture_output=True, text=True, errors="replace",
+            timeout=timeout,
+            env=_contained_entry_env(
+                *readonly_paths, jail_root=jail_root, writable_paths=writable_paths,
+                execution_cwd=cwd, base=base_env, secret_env_names=secret_env_names,
+            ),
+        )
+    stdout = redact_secrets(proc.stdout or "", secret_env_names=secret_env_names)
+    stderr = redact_secrets(proc.stderr or "", secret_env_names=secret_env_names)
+    if proc.returncode == 125 and stderr.startswith(_CONTAINMENT_ERROR):
+        raise ContainmentUnavailable(stderr.strip())
+    return subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
+
+
+def _kill_process_group(pid: int) -> None:
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
 
 
 MAX_EVIDENCE_CHARS = 4000
@@ -624,6 +1211,42 @@ class WitnessSpec:
 
 
 @dataclass(frozen=True)
+class _TrialPlan:
+    snapshot: SourceSnapshot
+    prefix: tuple[str, ...]
+    runner: object
+    timeout: int
+    input_path: pathlib.Path
+    run_path: pathlib.Path
+    digest: str
+    protected: tuple[tuple[str, pathlib.Path, bytes], ...]
+    secret_env_names: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _TrialExecution:
+    """Process-boundary inputs that are constant for one pristine trial."""
+
+    prefix: tuple[str, ...]
+    runner: object
+    timeout: int
+    protected: tuple[tuple[str, pathlib.Path, bytes], ...] = ()
+    logical_input: str | None = None
+    verify_original: bool = True
+    expected_input: bytes | None = None
+    secret_env_names: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class _ProtectedInput:
+    label: str
+    path: pathlib.Path
+    expected: bytes
+    device: int
+    inode: int
+
+
+@dataclass(frozen=True)
 class Witness:
     """What was observed. `demonstrated` is ground truth and nothing may override it."""
 
@@ -664,6 +1287,10 @@ class Witness:
     #: and dropped. Measured on the first real container run — a gate-eligible finding that FAILED a
     #: build shipped `input_present: false` and a reproduce command with an empty path in it.
     input_path: str = ""
+    #: The exact verified bytes behind `input_path`. A later claim or delayed same-UID writer can
+    #: change a filesystem path after adjudication; the bundle must never reopen one and call the new
+    #: bytes evidence. `None` means no input survived the integrity boundary.
+    input_bytes: bytes | None = None
 
     @property
     def gate_eligible(self) -> bool:
@@ -1245,7 +1872,9 @@ def controls_digest(repo, entry: str | None) -> str:
 def adjudicate(spec: WitnessSpec, repo, *, baseline_digest: str | None,
                baseline_controls: str | None = None,
                runner=bounded_run, timeout: int = DEFAULT_TIMEOUT,
-               workdir=None) -> Witness:
+               workdir=None, source_snapshot: SourceSnapshot | None = None,
+               protected_inputs: tuple[tuple[str, pathlib.Path, bytes], ...] = (),
+               secret_env_names: tuple[str, ...] = ()) -> Witness:
     """Execute the customer's entry point against the agent's payload and observe what happens.
 
     `baseline_digest` is taken BEFORE the agent runs. A mismatch is a REFUSAL, not a negative result:
@@ -1262,14 +1891,48 @@ def adjudicate(spec: WitnessSpec, repo, *, baseline_digest: str | None,
     write is the asymmetry the module docstring rests on — then `_nothing_adjudicated` (the run
     delivered no observation) and `_controlled_verdict` (the observation, against its controls).
 
-    `baseline_controls` is `controls_digest` taken before ANY entry point in this phase ran, and it is
-    checked on BOTH SIDES of the execution because neither side covers the other. Before: this claim
-    is being graded after some EARLIER claim's execution changed the fixtures, and refusing here also
-    declines to spend an execution on a tree already known to be the wrong one. After: THIS execution
-    changed them, which the check before it cannot have seen. `None` leaves the comparison off, which
-    is what a caller with no run-start snapshot has — a maintenance script, a maintenance script.
+    `source_snapshot` is captured before the model on the shipping path. Every execution receives a
+    fresh writable materialisation of it; no attack, control or base trial shares filesystem state.
+    Direct callers that omit it get a snapshot immediately, before their first execution.
+
+    `baseline_controls` retains the phase-boundary check for callers that captured those fixtures
+    earlier. Trial verification is the other half: an entry point that replaces itself or any captured
+    helper is refused before its output is interpreted. `None` leaves only that full-source boundary.
     """
-    refusal, resolved, digest = _preconditions(spec, repo, baseline_digest)
+    owned = source_snapshot is None
+    if source_snapshot is None:
+        try:
+            source_snapshot = SourceSnapshot.capture(repo)
+        except SnapshotError as e:
+            return _refuse(spec, SOURCE_ISOLATION_REFUSAL +
+                           f"source could not be staged as a pristine tree: {e}; "
+                           f"nothing was adjudicated")
+    try:
+        return _adjudicate_pristine(spec, source_snapshot, baseline_digest=baseline_digest,
+                                    baseline_controls=baseline_controls, runner=runner,
+                                    timeout=timeout, workdir=workdir,
+                                    protected_inputs=protected_inputs,
+                                    secret_env_names=secret_env_names)
+    finally:
+        if owned:
+            source_snapshot.close()
+
+
+def _adjudicate_pristine(spec: WitnessSpec, snapshot: SourceSnapshot, *,
+                         baseline_digest: str | None, baseline_controls: str | None,
+                         runner, timeout: int, workdir,
+                         protected_inputs: tuple[tuple[str, pathlib.Path, bytes], ...],
+                         secret_env_names: tuple[str, ...]) -> Witness:
+    """Adjudicate only from the pre-model tree, with one new tree per execution."""
+    repo = snapshot.source
+    try:
+        snapshot.verify_original()
+        snapshot.verify_source()
+    except SnapshotError as e:
+        return _refuse(spec, SOURCE_ISOLATION_REFUSAL +
+                       f"pristine source verification failed: {e}; nothing was adjudicated")
+
+    refusal, _resolved, digest = _preconditions(spec, repo, baseline_digest)
     if refusal is not None:
         return refusal
     # AFTER `_preconditions`, so a proposal with a bad entry point is still told about that first —
@@ -1291,7 +1954,8 @@ def adjudicate(spec: WitnessSpec, repo, *, baseline_digest: str | None,
     # `_controlled_verdict` builds every baseline and every benign control as `argv[:-1] + [control]`,
     # so the attack run and the runs it is scored against cannot end up on different sides of the
     # perimeter. A control with a network the attack did not have would be a differential over two
-    # different programs. `isolation_prefix` is `()` wherever the kernel refuses — see its docstring.
+    # different programs. `isolation_prefix` is `()` wherever the kernel refuses; that is a refusal,
+    # never permission to execute the witness without the private PID and network boundary.
     # ONE EXECUTION PATH FOR EVERY RUN, and the argument for it is the paragraph above applied to
     # the FILENAME. Until 2026-09-01 the attack ran on `shard_witness_input` and each control on
     # `shard_witness_input.baseline` / `.benign<N>`, so the last element of argv was a string this
@@ -1308,7 +1972,14 @@ def adjudicate(spec: WitnessSpec, repo, *, baseline_digest: str | None,
         run_path.write_bytes(spec.payload)
     except OSError as e:
         return _refuse(spec, f"could not stage the payload for execution: {e}", digest=digest)
-    argv = [*isolation_prefix(), "bash", "--", str(resolved), str(run_path)]
+    prefix = isolation_prefix()
+    if not network_isolated(prefix):
+        return _refuse(
+            spec,
+            CONTAINMENT_REFUSAL + "this runner cannot create the private PID, mount, procfs and "
+            "network boundary, so no customer-authored entry point was executed",
+            digest=digest,
+        )
     try:
         # errors="replace": this runs the CUSTOMER'S witness entry point, and a witness that
         # demonstrates a memory-safety bug crashes — raw memory, sanitiser output and arbitrary bytes
@@ -1318,8 +1989,12 @@ def adjudicate(spec: WitnessSpec, repo, *, baseline_digest: str | None,
         # settled this for the same reason.
         # `env=` and not the inherited environment — see `entry_env`. This script is written by whoever
         # opened the pull request, and its output is published back to them.
-        proc = runner(argv, cwd=str(repo), capture_output=True, text=True, errors="replace",
-                      timeout=timeout, env=entry_env())
+        protected = (*protected_inputs,
+                     ("preserved witness input", input_path, spec.payload))
+        proc = _execute_trial(snapshot, spec.entry, run_path, _TrialExecution(
+            prefix, runner, timeout, protected=protected, expected_input=spec.payload,
+            secret_env_names=secret_env_names,
+        ))
     except subprocess.TimeoutExpired:
         # A hang is not a demonstration. It is also not nothing, so it is recorded as evidence — and the
         # input that caused it is the most useful thing a reviewer could be handed, so it is carried too.
@@ -1342,8 +2017,11 @@ def adjudicate(spec: WitnessSpec, repo, *, baseline_digest: str | None,
                        evidence=f"the entry point did not finish within {timeout}s",
                        why_not=f"the entry point did not finish within {timeout}s, and a hang is not "
                                f"a demonstration",
-                       timed_out=True,
-                       input_path=str(input_path))
+                       timed_out=True, input_path=str(input_path), input_bytes=spec.payload)
+    except SnapshotError as e:
+        return _refuse(spec, SOURCE_ISOLATION_REFUSAL +
+                       f"pristine witness trial was refused: {e}; nothing was adjudicated",
+                       digest=digest)
     except (OSError, subprocess.SubprocessError) as e:
         return _refuse(spec, f"the entry point could not be executed: {e}", digest=digest)
 
@@ -1351,18 +2029,18 @@ def adjudicate(spec: WitnessSpec, repo, *, baseline_digest: str | None,
     # marker test, `observed_location`, `Witness.evidence`, the bundle, the PR comment — sees the same
     # scrubbed text, so a demonstration cannot be built on our own credential and the differential
     # below stays a comparison of like with like. See `redact_secrets`.
-    output = redact_secrets((proc.stdout or "") + (proc.stderr or ""))
+    output = redact_secrets(
+        original_paths((proc.stdout or "") + (proc.stderr or ""), snapshot),
+        secret_env_names=secret_env_names,
+    )
     if refused := _nothing_adjudicated(spec, proc, output, digest=digest, input_path=input_path):
         return refused
     # AFTER the run and BEFORE the verdict, because the run is what may have changed them and the
     # verdict is what reads them. `_nothing_adjudicated` goes first: an entry point whose interpreter
     # is missing, or one that was killed, has a more specific thing wrong with it than its fixtures.
-    if changed := _controls_changed(spec, repo, baseline_controls, digest,
-                                    when="while the entry point was running on this input"):
-        return changed
-    return _controlled_verdict(spec, repo, runner=runner, timeout=timeout, argv=argv,
-                               input_path=input_path, run_path=run_path, digest=digest,
-                               proc=proc, output=output)
+    plan = _TrialPlan(snapshot, prefix, runner, timeout, input_path, run_path, digest, protected,
+                      secret_env_names)
+    return _controlled_verdict(spec, plan, proc=proc, output=output)
 
 
 def _preconditions(spec: WitnessSpec, repo, baseline_digest: str | None
@@ -1399,18 +2077,7 @@ def _preconditions(spec: WitnessSpec, repo, baseline_digest: str | None
 
 def _controls_changed(spec: WitnessSpec, repo, baseline_controls: str | None, digest: str, *,
                       when: str) -> Witness | None:
-    """The refusal owed when the benign fixtures are not the ones this phase started with, or None.
-
-    `when` is the only thing that differs between the two call sites, and it is the whole value of the
-    sentence: "before this claim was adjudicated" sends the reader to an EARLIER claim's execution,
-    "while the entry point was running on this input" sends them to this one. A single generic
-    sentence would name neither, which is the defect `_baseline_contradicts` already fixed one door
-    over by naming WHICH control answered.
-
-    A refusal and not a non-demonstration, for `_nothing_adjudicated`'s reason: `demonstrated=False`
-    alone is what a clean run that observed nothing produces, so a verdict taken against controls the
-    repository did not declare has to say so or it reads as a clean result.
-    """
+    """Refuse controls that differ from an earlier caller-owned phase snapshot."""
     if baseline_controls is None or controls_digest(repo, spec.entry) == baseline_controls:
         return None
     return _refuse(spec, f"the benign controls declared at {spec.entry}{BENIGN_SUFFIX} changed "
@@ -1424,12 +2091,11 @@ def _stage_payload(payload: bytes, workdir) -> pathlib.Path:
 
     MEASURED 2026-08-12: THE DEFAULT IS ALSO WHAT BLOCKS A DISPLACED WITNESS, AND IT FAILS SILENTLY.
 
-    The design notes records that the free image carries no JVM, node, ruby, php or
-    dotnet, so the entry point for five of the twelve detected languages cannot execute inside the
-    artefact at all. The obvious answer is to execute it where the customer's toolchain already is —
-    the runner — and the seam for that is `adjudicate`'s `runner=` parameter, which was PROVEN to
-    carry it: driving `adjudicate` with a runner that executes in a different filesystem namespace
-    reproduces in-process results EXACTLY, anti-forgery refusal included.
+    The design notes records the historical image that lacked the JVM, node, ruby, php
+    and dotnet. Those runtimes were added later. The displaced-runner experiment remains relevant for
+    a runtime or build SDK the current image does not carry: driving `adjudicate` with a runner that
+    executes in a different filesystem namespace reproduced in-process results exactly, anti-forgery
+    refusal included.
 
     It reproduces them only when the payload is somewhere BOTH sides can see. With just the checkout
     shared — which is exactly what a container action is given — the executor cannot open the path
@@ -1454,8 +2120,9 @@ def _stage_payload(payload: bytes, workdir) -> pathlib.Path:
     `run_simple` never passed a workdir, so every real call took it.
     """
     if workdir is not None:
-        work = pathlib.Path(workdir)
-        work.mkdir(parents=True, exist_ok=True)
+        parent = pathlib.Path(workdir)
+        parent.mkdir(parents=True, exist_ok=True)
+        work = pathlib.Path(tempfile.mkdtemp(prefix="claim-", dir=parent))
         input_path = work / "shard_witness_input"
         input_path.write_bytes(payload)
     else:
@@ -1475,9 +2142,8 @@ def _nothing_adjudicated(spec: WitnessSpec, proc, output: str, *, digest: str,
     or it reads as a clean result — the fail-open each arm's comment records being measured.
     """
     # **THE ENTRY POINT'S OWN INTERPRETER IS MISSING, and until 2026-08-13 that was SILENT.**
-    # an internal audit: the free image is `python:3.12-slim` plus `git`, so
-    # `node`, `java`, `ruby`, `php` and `dotnet` are absent — and the audit's own words for the C case
-    # are *"the failure when it is not done is quiet"*. It was quiet for every language.
+    # an internal audit measured the earlier image before its current runtimes were
+    # added. The refusal remains necessary for a runtime or build SDK the release image still lacks.
     #
     # A `.shard/entry.sh` that `exec`s a runtime the image does not carry makes bash exit **127**, and
     # nothing here distinguished that from a program that simply did not demonstrate. So the customer
@@ -1490,9 +2156,10 @@ def _nothing_adjudicated(spec: WitnessSpec, proc, output: str, *, digest: str,
     # catches the failure and exits 0 still leaves the sentence in its output.
     if missing := _missing_runtime(proc.returncode, output):
         return _refuse(spec, f"the entry point could not run: {missing}. Nothing was adjudicated, so "
-                             f"this is NOT a clean result — the free image carries python3 and bash "
-                             f"and no other runtime, and an entry point needing one cannot execute "
-                             f"inside it", digest=digest)
+                             f"this is NOT a clean result — the release image does not carry every "
+                             f"runtime or build SDK. Build the target in an earlier trusted step or "
+                             f"use an adapter supported by the image; preflight reports its runtime "
+                             f"inventory", digest=digest)
 
     # **A KILLED WITNESS IS A REFUSAL, NOT A NEGATIVE RESULT — 2026-08-18, and this is a fail-open.**
     #
@@ -1524,6 +2191,7 @@ def _nothing_adjudicated(spec: WitnessSpec, proc, output: str, *, digest: str,
         return Witness(
             demonstrated=False, expectation=spec.expectation, exit_code=proc.returncode,
             entry_digest=digest, evidence=output[-MAX_EVIDENCE_CHARS:], input_path=str(input_path),
+            input_bytes=spec.payload,
             refusal=f"the entry point was KILLED (rc={code}) rather than finishing, so nothing was "
                     f"adjudicated and this is NOT a clean result. The commonest cause is the reported "
                     f"input itself — a payload that kills or hangs the entry point leaves no exit "
@@ -1532,9 +2200,7 @@ def _nothing_adjudicated(spec: WitnessSpec, proc, output: str, *, digest: str,
     return None
 
 
-def _controlled_verdict(spec: WitnessSpec, repo, *, runner, timeout: int, argv: list[str],
-                        input_path: pathlib.Path, run_path: pathlib.Path, digest: str,
-                        proc, output: str) -> Witness:
+def _controlled_verdict(spec: WitnessSpec, plan: _TrialPlan, *, proc, output: str) -> Witness:
     """The verdict on what was observed — after every control had its chance to refute it.
 
     `_adjudge` decides from the observation alone. A demonstration then pays for its controls — the
@@ -1543,13 +2209,13 @@ def _controlled_verdict(spec: WitnessSpec, repo, *, runner, timeout: int, argv: 
     grading against fewer controls than the repository asked for is the quiet-degradation shape this
     module exists to refuse.
 
-    **A control that is no longer THERE is not this function's arm.** `_stage_controls` resolves the
-    fixtures from the checkout and is reached only after the customer's entry point has already run,
-    so the set it finds can be one the execution just changed. `adjudicate` compares it against the
-    snapshot the phase started with, on both sides of that execution; see `_controls_changed`.
+    Controls are read from the immutable snapshot, not from the tree the attack just ran in. Each is
+    then executed in another materialisation at the same stable path, so argv stays byte-identical
+    without sharing the attack's files.
     """
     demonstrated, why_not = _adjudge(spec, proc.returncode, output)
     ran: list[str] = []
+    repo = plan.snapshot.source
 
     if demonstrated and _baseline_required(spec):
         # THE BASELINE RUN, and it is what makes an agent-chosen observation mean anything.
@@ -1583,13 +2249,13 @@ def _controlled_verdict(spec: WitnessSpec, repo, *, runner, timeout: int, argv: 
         # ANY control reproducing the observation refutes it. More controls can only ever refuse more,
         # which is the direction a gate must fail in.
         try:
-            controls, dropped = _stage_controls(input_path, repo, spec)
+            controls, dropped = _stage_controls(repo, spec)
         except OSError as e:
             # A control the customer DECLARED and we could not stage is a refusal, not a quiet fallback
             # to the weaker one. Silently grading against fewer controls than the repository asked for
             # is the same shape as `2fd4e36`'s green check on a diff nobody read.
             return _refuse(spec, f"the benign control declared at {spec.entry}{BENIGN_SUFFIX} could not "
-                                 f"be staged ({e}), so nothing was adjudicated", digest=digest)
+                                 f"be staged ({e}), so nothing was adjudicated", digest=plan.digest)
         if dropped:
             output += (f"\n[shard] {dropped} further benign control(s) beyond the first "
                        f"{MAX_BENIGN_CONTROLS} were NOT run; this verdict is checked against fewer "
@@ -1599,14 +2265,25 @@ def _controlled_verdict(spec: WitnessSpec, repo, *, runner, timeout: int, argv: 
             # one execution path so the differential compares two runs of one command line. Building
             # a new argv per control is what let the staged filename become a marker.
             try:
-                run_path.write_bytes(control.read_bytes())
+                plan.run_path.write_bytes(control)
             except OSError as e:
-                return _refuse(spec, f"the run on {what} could not be staged: {e}", digest=digest)
-            baseline = _run(runner, argv, repo, timeout)
+                return _refuse(spec, f"the run on {what} could not be staged: {e}",
+                               digest=plan.digest)
+            try:
+                baseline = _run_trial(
+                    plan.snapshot, spec.entry, plan.run_path, prefix=plan.prefix,
+                    runner=plan.runner, timeout=plan.timeout,
+                    protected=plan.protected, expected_input=control,
+                    secret_env_names=plan.secret_env_names,
+                )
+            except SnapshotError as e:
+                return _refuse(spec, SOURCE_ISOLATION_REFUSAL +
+                               f"the run on {what} was refused: {e}; nothing was adjudicated",
+                               digest=plan.digest)
             if baseline is None:
                 return _refuse(spec, f"the run on {what} could not be completed, so "
                                      f"{_OBSERVED[spec.expectation]} could not be attributed to the "
-                                     f"payload", digest=digest)
+                                     f"payload", digest=plan.digest)
             ran.append(what)
             contradiction = _baseline_contradicts(spec, *baseline, control=what)
             if contradiction:
@@ -1637,9 +2314,10 @@ def _controlled_verdict(spec: WitnessSpec, repo, *, runner, timeout: int, argv: 
         demonstrated=demonstrated,
         expectation=spec.expectation,
         exit_code=proc.returncode,
-        entry_digest=digest,
+        entry_digest=plan.digest,
         evidence=output[-MAX_EVIDENCE_CHARS:],
-        input_path=str(input_path),
+        input_path=str(plan.input_path),
+        input_bytes=spec.payload,
         controls=tuple(ran),
         # Passed straight through, with no `"" if demonstrated else ...` guard, because the invariant
         # is `_adjudge`'s and belongs where it can be enforced: it returns "" exactly when it says
@@ -1657,7 +2335,9 @@ INHERITED, INTRODUCED, UNATTRIBUTED = "inherited", "introduced", "unattributed"
 
 
 def attribute(spec: WitnessSpec, base_repo, *, runner=bounded_run, timeout: int = DEFAULT_TIMEOUT,
-              workdir=None) -> tuple[str, str]:
+              workdir=None, source_snapshot: SourceSnapshot | None = None,
+              protected_inputs: tuple[tuple[str, pathlib.Path, bytes], ...] = (),
+              secret_env_names: tuple[str, ...] = ()) -> tuple[str, str]:
     """Did THIS change introduce the demonstrated defect? Returns `(verdict, why)`.
 
     **THE CAUSAL ANSWER TO A QUESTION `fail-on: new` WAS ANSWERING LEXICALLY.** Until 2026-08-12 "new"
@@ -1701,6 +2381,36 @@ def attribute(spec: WitnessSpec, base_repo, *, runner=bounded_run, timeout: int 
     """
     if base_repo is None:
         return UNATTRIBUTED, "no base revision was available to compare against"
+    owned = source_snapshot is None
+    if source_snapshot is None:
+        try:
+            source_snapshot = SourceSnapshot.capture(base_repo)
+        except SnapshotError as e:
+            return UNATTRIBUTED, SOURCE_ISOLATION_REFUSAL + \
+                f"the base revision could not be snapshotted: {e}"
+    try:
+        try:
+            return _attribute_pristine(spec, source_snapshot, runner=runner, timeout=timeout,
+                                       workdir=workdir, protected_inputs=protected_inputs,
+                                       secret_env_names=secret_env_names)
+        except SnapshotError as e:
+            return UNATTRIBUTED, SOURCE_ISOLATION_REFUSAL + str(e)
+    finally:
+        if owned:
+            source_snapshot.close()
+
+
+def _attribute_pristine(spec: WitnessSpec, snapshot: SourceSnapshot, *, runner, timeout: int,
+                        workdir,
+                        protected_inputs: tuple[tuple[str, pathlib.Path, bytes], ...],
+                        secret_env_names: tuple[str, ...],
+                        ) -> tuple[str, str]:
+    base_repo = snapshot.source
+    try:
+        snapshot.verify_original()
+        snapshot.verify_source()
+    except SnapshotError as e:
+        raise SnapshotError(f"the base revision's pristine source could not be verified: {e}") from e
     digest = entry_digest(base_repo, spec.entry)
     if digest is None:
         return UNATTRIBUTED, (f"{spec.entry} did not exist at the base revision, so the defect could "
@@ -1714,15 +2424,25 @@ def attribute(spec: WitnessSpec, base_repo, *, runner=bounded_run, timeout: int 
     base_controls = controls_digest(base_repo, spec.entry)
 
     # THE PROBE FIRST. It is the cheap half and it decides whether the expensive half means anything.
-    probe = _base_control(spec, base_repo, runner=runner, timeout=timeout, workdir=workdir)
+    try:
+        probe = _base_control(spec, snapshot, runner=runner, timeout=timeout, workdir=workdir,
+                              protected_inputs=protected_inputs,
+                              secret_env_names=secret_env_names)
+    except SnapshotError as e:
+        return UNATTRIBUTED, SOURCE_ISOLATION_REFUSAL + \
+            f"the defect could not be re-run at the base revision: {e}"
     if probe != 0:
         return UNATTRIBUTED, (f"the entry point did not run cleanly at the base revision "
                               f"(exit {probe}), so a non-reproduction there is not evidence the "
                               f"defect is new — a base checkout carries no build artifacts")
 
     before = adjudicate(spec, base_repo, baseline_digest=digest, baseline_controls=base_controls,
-                        runner=runner, timeout=timeout, workdir=workdir)
+                        runner=runner, timeout=timeout, workdir=workdir,
+                        source_snapshot=snapshot, protected_inputs=protected_inputs,
+                        secret_env_names=secret_env_names)
     if before.refusal:
+        if before.refusal.startswith(SOURCE_ISOLATION_REFUSAL):
+            return UNATTRIBUTED, before.refusal
         return UNATTRIBUTED, f"the defect could not be re-run at the base revision: {before.refusal}"
     if before.timed_out:
         # A base run that ran out of clock answered NOTHING. Falling through to the INTRODUCED arm below
@@ -1740,8 +2460,11 @@ def attribute(spec: WitnessSpec, base_repo, *, runner=bounded_run, timeout: int 
                         "introduced it")
 
 
-def _base_control(spec: WitnessSpec, base_repo, *, runner, timeout, workdir) -> int | None:
+def _base_control(spec: WitnessSpec, snapshot: SourceSnapshot, *, runner, timeout, workdir,
+                  protected_inputs: tuple[tuple[str, pathlib.Path, bytes], ...],
+                  secret_env_names: tuple[str, ...]) -> int | None:
     """The base entry point's exit code on its control input, or None if it could not be run at all."""
+    base_repo = snapshot.source
     resolved = resolve_entry(base_repo, spec.entry)
     if resolved is None:
         return None
@@ -1751,47 +2474,245 @@ def _base_control(spec: WitnessSpec, base_repo, *, runner, timeout, workdir) -> 
             tempfile.mkdtemp(prefix="shard-attribute-"))
         scratch.mkdir(parents=True, exist_ok=True)
         probe = scratch / "shard_base_control"
-        probe.write_bytes(controls[0].read_bytes() if controls else b"")
+        probe_bytes = controls[0].read_bytes() if controls else b""
+        probe.write_bytes(probe_bytes)
     except OSError:
         return None
-    result = _run(runner, [*isolation_prefix(), "bash", "--", str(resolved), str(probe)],
-                  base_repo, timeout)
+    protected = (*protected_inputs, ("base control input", probe, probe_bytes))
+    prefix = isolation_prefix()
+    if not network_isolated(prefix):
+        return None
+    result = _run_trial(
+        snapshot, spec.entry, probe, prefix=prefix, runner=runner, timeout=timeout,
+        protected=protected, expected_input=probe_bytes, secret_env_names=secret_env_names,
+    )
     return None if result is None else result[0]
 
 
-def _stage_controls(input_path: pathlib.Path, repo,
-                    spec: WitnessSpec) -> tuple[list[tuple[str, pathlib.Path]], int]:
+def _stage_controls(repo, spec: WitnessSpec) -> tuple[list[tuple[str, bytes]], int]:
     """The inputs the observation must be ABSENT on, in the order they are run. Raises OSError.
 
-    Every one is staged BESIDE the payload rather than read from the checkout, so all executions take an
-    identical argv shape from an identical directory. That matters for the displaced-witness seam
-    documented in `adjudicate`: an executor that can see the payload can see its controls.
+    Every declared control is read into memory before any control runs. Staging all of them beside the
+    payload let the first customer-authored run rewrite a later control before that control was copied
+    to the stable execution path. The immutable bytes keep all executions on an identical argv without
+    leaving the differential itself in a directory the entry point can edit.
 
     The empty control comes FIRST and is never dropped. It is the cheapest refutation — a marker of "a"
     or " " dies on it — and ordering it first means the common rejection costs one execution rather
     than N.
     """
-    controls = [("an empty payload", _stage_baseline(input_path))]
+    controls = [("an empty payload", b"")]
     benign, dropped = benign_controls(repo, spec.entry)
     root = pathlib.Path(repo).resolve()
-    for i, source in enumerate(benign):
-        staged = input_path.with_name(f"{input_path.name}{BENIGN_SUFFIX}{i}")
-        staged.write_bytes(source.read_bytes())
+    for source in benign:
+        data = source.read_bytes()
         # NAMED by the path in the CUSTOMER's repository, not by where it was staged: the sentence is
         # read by someone deciding which of their own fixtures to go and look at.
         controls.append((f"the benign input this repository declares at {source.relative_to(root)}",
-                         staged))
+                         data))
     return controls, dropped
 
 
-def _stage_baseline(input_path: pathlib.Path) -> pathlib.Path:
-    """An EMPTY payload beside the real one — the "no attack" input the marker must not survive."""
-    baseline = input_path.with_name(input_path.name + ".baseline")
-    baseline.write_bytes(b"")
-    return baseline
+def _execute_trial(snapshot: SourceSnapshot, entry: str, input_path: pathlib.Path,
+                   execution: _TrialExecution):
+    """Run one input in a fresh tree and refuse changed source or evidence."""
+    if not network_isolated(execution.prefix):
+        raise SnapshotError(
+            "the private PID, mount, procfs and network boundary is unavailable; the entry point "
+            "was not executed"
+        )
+    if execution.verify_original:
+        snapshot.verify_original()
+    expected_input, sealed, staged_input, staged_identity = _prepare_trial_input(
+        snapshot, input_path, execution.expected_input, execution.protected,
+    )
+    repo = snapshot.materialize()
+    resolved = resolve_entry(repo, entry)
+    if resolved is None:
+        raise SnapshotError(f"entry point {entry!r} disappeared from a materialised trial")
+    if execution.logical_input is None:
+        # Keep the historical argv for deterministic/external runners. Inside the namespace the fresh
+        # staged file is bound onto that name, while its parent is only an ephemeral jail directory:
+        # sibling state an attack writes cannot reach the host or the next control's fresh root.
+        bindings = ((staged_input, input_path),)
+        executed_entry, executed_input = str(resolved), str(input_path)
+        visible_inputs = (input_path,)
+    else:
+        logical_target = repo / execution.logical_input
+        bindings = ((staged_input, logical_target),)
+        # Preserve the harness contract's working-directory-relative argv. BASH_SOURCE/$0-relative
+        # helpers then resolve inside the pristine trial, while the exact candidate is mounted onto
+        # the historical name only in the child namespace.
+        executed_entry, executed_input = entry, execution.logical_input
+        visible_inputs = ()
+    argv = [*execution.prefix, "bash", "--", executed_entry, executed_input]
+    failure = None
+    proc = None
+    with tempfile.TemporaryDirectory(prefix="shard-witness-overlay-") as overlay_storage:
+        private = pathlib.Path(overlay_storage)
+        storage, jail = private / "overlay", private / "jail"
+        upper, work = storage / "upper", storage / "work"
+        for path in (upper, work, jail):
+            path.mkdir(parents=True, exist_ok=True)
+        try:
+            proc = execution.runner(
+                argv, cwd=str(repo), capture_output=True, text=True, errors="replace",
+                timeout=execution.timeout,
+                env=_contained_entry_env(
+                    *visible_inputs,
+                    jail_root=jail,
+                    writable_paths=(),
+                    bind_files=bindings,
+                    protected_relatives=(entry.path for entry in snapshot.manifest
+                                         if entry.kind != "dir"),
+                    overlay=(snapshot.source, repo, upper, work, storage),
+                    execution_cwd=repo,
+                    secret_env_names=execution.secret_env_names,
+                ),
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            failure = e
+        # Every boundary is checked even when an earlier one failed. Same-UID entry code can locate
+        # the snapshot store as well as its disposable trial, and it can reach the preserved candidate
+        # beside `shard_witness_run`; a short-circuit would leave one unchecked after the child ran.
+        failures = _trial_boundary_failures(
+            snapshot, sealed, staged_input, expected_input, staged_identity, upper,
+            verify_original=execution.verify_original,
+        )
+    if failures:
+        raise SnapshotError(
+            "protected trial state changed while the entry point was running: " + "; ".join(failures)
+        )
+    if failure is not None:
+        raise failure
+    stderr = redact_secrets(proc.stderr or "", secret_env_names=execution.secret_env_names)
+    if (getattr(proc, "returncode", None) == 125
+            and stderr.startswith(_CONTAINMENT_ERROR)):
+        raise SnapshotError(stderr.strip())
+    return proc
 
 
-def _run(runner, argv: list[str], repo, timeout: int) -> tuple[int | None, str] | None:
+def _prepare_trial_input(snapshot: SourceSnapshot, input_path: pathlib.Path,
+                         expected: bytes | None,
+                         protected: tuple[tuple[str, pathlib.Path, bytes], ...],
+                         ) -> tuple[bytes, tuple[_ProtectedInput, ...], pathlib.Path,
+                                    _ProtectedInput]:
+    """Seal the caller's input and give this trial an independently backed immutable copy."""
+    if expected is None:
+        try:
+            expected = input_path.read_bytes()
+        except OSError as exc:
+            raise SnapshotError(f"trial input became unreadable: {exc}") from exc
+    input_identity = _read_protected_input("trial input", input_path, expected)
+    sealed = (*_seal_protected_inputs(protected), input_identity)
+    staged = snapshot.materialize_input(expected)
+    staged_identity = _read_protected_input("fresh trial input", staged, expected)
+    return expected, sealed, staged, staged_identity
+
+
+def _trial_boundary_failures(snapshot: SourceSnapshot, sealed: tuple[_ProtectedInput, ...],
+                             staged: pathlib.Path, expected: bytes,
+                             staged_identity: _ProtectedInput, upper: pathlib.Path, *,
+                             verify_original: bool) -> list[str]:
+    """Run every post-execution identity check; one failure must not mask a second."""
+    checks = [
+        lambda: _verify_protected_inputs(sealed),
+        lambda: _read_protected_input("fresh trial input", staged, expected,
+                                      identity=staged_identity),
+        lambda: _verify_overlay(snapshot, upper),
+        snapshot.verify_trial,
+        snapshot.verify_source,
+    ]
+    if verify_original:
+        checks.append(snapshot.verify_original)
+    failures = []
+    for check in checks:
+        try:
+            check()
+        except SnapshotError as exc:
+            failures.append(str(exc))
+    return failures
+
+
+def _verify_overlay(snapshot: SourceSnapshot, upper: pathlib.Path) -> None:
+    """Refuse any copy-up or whiteout of a manifested file, even when its bytes were restored."""
+    for expected in snapshot.manifest:
+        if expected.kind == "dir":
+            continue
+        candidate = upper.joinpath(*pathlib.PurePosixPath(expected.path).parts)
+        if os.path.lexists(candidate):
+            raise SnapshotError(
+                f"witness execution transiently changed pristine source: {expected.path}"
+            )
+
+
+def _seal_protected_inputs(
+        protected: tuple[tuple[str, pathlib.Path, bytes], ...]) -> tuple[_ProtectedInput, ...]:
+    return tuple(_read_protected_input(label, path, expected) for label, path, expected in protected)
+
+
+def _verify_protected_inputs(protected: tuple[_ProtectedInput, ...]) -> None:
+    """Require every external input to retain its regular-file identity and exact bytes."""
+    for sealed in protected:
+        _read_protected_input(sealed.label, sealed.path, sealed.expected, identity=sealed)
+
+
+def _read_protected_input(label: str, path: pathlib.Path, expected: bytes, *,
+                          identity: _ProtectedInput | None = None) -> _ProtectedInput:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as e:
+        raise SnapshotError(f"{label} became unreadable or stopped being a regular file: {e}") from e
+    try:
+        status = os.fstat(descriptor)
+        if not stat.S_ISREG(status.st_mode) or status.st_nlink != 1:
+            raise SnapshotError(f"{label} stopped being one private regular file")
+        if status.st_size != len(expected):
+            raise SnapshotError(f"{label} no longer has the size supplied to the entry point")
+        if identity is not None and (status.st_dev, status.st_ino) != (
+                identity.device, identity.inode):
+            raise SnapshotError(f"{label} was replaced after it was staged")
+        chunks = []
+        remaining = len(expected)
+        while remaining:
+            block = os.read(descriptor, min(remaining, 1024 * 1024))
+            if not block:
+                break
+            chunks.append(block)
+            remaining -= len(block)
+        actual = b"".join(chunks)
+        if remaining or os.read(descriptor, 1) or actual != expected:
+            raise SnapshotError(f"{label} no longer contains the bytes supplied to the entry point")
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+    return _ProtectedInput(label, path, expected, status.st_dev, status.st_ino)
+
+
+def _run_trial(snapshot: SourceSnapshot, entry: str, input_path: pathlib.Path, *,
+               prefix: tuple[str, ...], runner, timeout: int,
+               protected: tuple[tuple[str, pathlib.Path, bytes], ...] = (),
+               expected_input: bytes | None = None,
+               secret_env_names: tuple[str, ...] = (),
+               ) -> tuple[int | None, str] | None:
+    """A control execution as ``(exit, output)``, or ``None`` when execution could not finish."""
+    try:
+        proc = _execute_trial(snapshot, entry, input_path, _TrialExecution(
+            prefix, runner, timeout, protected=protected, expected_input=expected_input,
+            secret_env_names=secret_env_names,
+        ))
+    except (OSError, subprocess.SubprocessError):
+        return None
+    rendered = original_paths((proc.stdout or "") + (proc.stderr or ""), snapshot)
+    return proc.returncode, redact_secrets(rendered, secret_env_names=secret_env_names)
+
+
+def _run(runner, argv: list[str], repo, timeout: int, *,
+         secret_env_names: tuple[str, ...] = ()) -> tuple[int | None, str] | None:
     """One execution as `(exit code, output)`, or None if it could not be completed. Never raises.
 
     The exit code joins the output here because `DIFFERENTIAL_NONZERO_EXIT` grades a baseline on its
@@ -1808,13 +2729,15 @@ def _run(runner, argv: list[str], repo, timeout: int) -> tuple[int | None, str] 
         # entry point. Scrubbing one call site and not the other would leave the hole open on every
         # run that reaches a differential baseline.
         proc = runner(argv, cwd=str(repo), capture_output=True, text=True, errors="replace",
-                      timeout=timeout, env=entry_env())
+                      timeout=timeout, env=entry_env(secret_env_names=secret_env_names))
     except (OSError, subprocess.SubprocessError):
         return None
     # Redacted on the control side too, for `adjudicate`'s reason on the attack side: the two texts are
     # compared, so scrubbing one and not the other would make our own key look like a marker the
     # payload introduced.
-    return proc.returncode, redact_secrets((proc.stdout or "") + (proc.stderr or ""))
+    return proc.returncode, redact_secrets(
+        (proc.stdout or "") + (proc.stderr or ""), secret_env_names=secret_env_names,
+    )
 
 
 #: What each expectation's baseline is attributing to the payload, for the refusal sentence.
@@ -2129,11 +3052,12 @@ def _refuse(spec: WitnessSpec, why: str, *, digest: str = "") -> Witness:
 __all__ = [
     "BENIGN_SUFFIX", "DEFAULT_TIMEOUT", "DIFFERENTIAL_NONZERO_EXIT", "EXPECTATIONS",
     "FATAL_SIGNAL_CODES", "INHERITED", "INTRODUCED", "MAX_BENIGN_CONTROLS", "MAX_EVIDENCE_CHARS",
-    "NETWORK_ISOLATION",
+    "NETWORK_ISOLATION", "PID_ISOLATION", "PRIVILEGED_NETWORK_ISOLATION",
     "TIMEOUT_KILL_CODES", "TRACEBACK_TOKENS", "UNATTRIBUTED", "UNHANDLED_EXCEPTION",
     "UNMEASURED_EXPECTATIONS", "Witness", "WitnessSpec", "adjudicate", "attribute", "benign_controls",
     "controls_digest",
-    "entry_digest", "entry_env", "isolation_prefix", "observed_location", "offered_expectations",
+    "entry_digest", "entry_env", "isolation_prefix", "network_isolated", "observed_location",
+    "offered_expectations",
     "payload_readings", "redact_secrets", "reset_isolation_cache", "resolve_entry",
     "secret_values",
     "self_defeating_marker", "witness_contract",

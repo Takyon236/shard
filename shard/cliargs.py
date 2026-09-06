@@ -35,13 +35,14 @@ guards that already exist and REJECTED:
 ## The three registration points a new module here costs
 
 `FREE_MODULES` (a maintenance script), `PAID_MODULES` (a maintenance script) and the
-free-tier module list in the design notes, which the maintainers' suite parses. Two of the
-three are not checked by the maintainers' fast check, so they are named here rather than left to be
-rediscovered.
+reachability tuple in the free build script. Tier registration is
+checked from those executable sources; the old hand-copied onboarding list was retired because it
+drifted twice.
 """
 
 
 import argparse
+import math
 
 from shard.budget import SCAN_PROFILES
 from shard.gate import FAIL_ON_CHOICES
@@ -49,6 +50,17 @@ from shard.gate import FAIL_ON_CHOICES
 # and by nothing else here, and the free build script only rewrites single-name
 # `from` imports — a two-name line would survive the drop with one name unused, which is an F401 in
 # the published repository's own lint, over code it did not write.
+
+
+def _ceiling(value: str) -> float:
+    """A CLI ceiling that cannot disable its own comparison through NaN or infinity."""
+    try:
+        number = float(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError("must be a finite non-negative number") from e
+    if not math.isfinite(number) or number < 0:
+        raise argparse.ArgumentTypeError("must be a finite non-negative number")
+    return number
 
 #: It lives beside the `--model` flag it is the default OF, and `shard/cli.py` re-exports it because
 #: every caller — the tests, `action.py`'s argv builder — has always read it off `shard.cli`.
@@ -72,7 +84,7 @@ def _endpoint_args(parser) -> None:
                         help="environment variable holding the endpoint's key")
 
 
-def _budget_args(parser, *, scan_default: str) -> None:
+def _budget_args(parser, *, scan_default: str, max_steps_available: bool = False) -> None:
     """The three per-run ceilings. Same argument as `_endpoint_args`, and the same drift happened.
 
     `0` MEANS UNMETERED on all three, and `_budget` (below) depends on that reading — so the sentence
@@ -82,10 +94,11 @@ def _budget_args(parser, *, scan_default: str) -> None:
 
     `--max-steps` is deliberately NOT here: it is diff-mode only, and `0` on it is refused rather than
     unmetered (`_max_steps`). A flag whose zero means the opposite of these three does not belong in
-    the helper that promises they agree.
+    the helper that promises they agree. `max_steps_available` changes only the scan help sentence, so
+    the separate capability never recommends a flag its parser does not offer.
     """
     parser.add_argument(
-        "--max-spend-usd", type=float, default=0.0,
+        "--max-spend-usd", type=_ceiling, default=0.0,
         help="hard ceiling on inference spend, debited from the price the endpoint reports on every "
              "response. 0 means unmetered. The run stops BEFORE a model call it cannot afford at the "
              "highest price it has already paid this run, so the ceiling holds rather than being "
@@ -94,16 +107,19 @@ def _budget_args(parser, *, scan_default: str) -> None:
              "it, and a call can be priced above every call before it — no endpoint we support "
              "accepts a spend cap as a request parameter, so a call's real cost arrives with its "
              "response")
-    parser.add_argument("--max-minutes", type=float, default=0.0, help="0 means unmetered")
-    parser.add_argument("--max-tokens", type=float, default=0.0, help="0 means unmetered")
+    parser.add_argument("--max-minutes", type=_ceiling, default=0.0, help="0 means unmetered")
+    parser.add_argument("--max-tokens", type=_ceiling, default=0.0, help="0 means unmetered")
+    override_help = ("Explicit --max-tokens and --max-steps values always win over both"
+                     if max_steps_available
+                     else "An explicit --max-tokens value always wins over both")
     parser.add_argument(
         "--scan", choices=sorted(SCAN_PROFILES), default=scan_default,
         help="which kind of scan this is, and therefore what unset ceilings mean. THIS SETS A "
              "BUDGET, NOT A SCOPE: in diff mode the run reviews exactly the diff whichever you pick. "
              "'initial' is a first look at a target, sized for COVERAGE, because a first scan that "
              "stops early reports a floor rather than a result. 'followup' is every run after that: "
-             "the baseline exists, so the run pays for the change rather than for the tree. An "
-             "explicit --max-tokens or --max-steps always wins over both")
+             "the baseline exists, so the run pays for the change rather than for the tree. "
+             + override_help)
 
 
 def build_parser(handlers: dict) -> argparse.ArgumentParser:
@@ -143,15 +159,14 @@ def _preflight_parser(sub, handler) -> None:
     pre.add_argument("--repo", default=".", help="path to the checkout")
     pre.add_argument("--workdir", default=None,
                      help="also validate an already-materialised workdir against the contract")
-    # SUPPLIED, NOT GUESSED. A checkout does not know whether its origin is public, and the free
-    # tier is public + simple — so half the rule is unavailable locally. `free_tier_verdict` answers
-    # "unknown" without it, deliberately: a pricing instrument that resolves ambiguity in our own
-    # favour is the kind of thing a customer finds out about later.
+    # SUPPLIED, NOT GUESSED. A checkout does not know whether its origin is public. For a private
+    # repository it also cannot observe group revenue or contributor count, so `free_tier_verdict`
+    # stays `unknown` and names the facts the operator must check.
     pre.add_argument("--visibility", default="", choices=["", "public", "private"],
-                     help="public or private. Half of the free-tier rule, and a checkout cannot "
-                          "know it; omitted means the verdict is 'unknown' rather than a guess.")
+                     help="public or private. Public can be decided here; private remains unknown "
+                          "until the operator checks group revenue and contributor count.")
     # THE ENDPOINT PROBE, opt-in. §6c promises preflight refuses a bad endpoint rather than
-    # producing a bad run, and it costs ONE request — so it is a flag rather than a default, because
+    # producing a bad run, and it costs ONE MODEL TURN — so it is a flag rather than a default, because
     # a profiling command that quietly spends money is worse than one that has to be asked.
     pre.add_argument("--entry-template", action="store_true",
                      help="print a ready-to-commit .shard/entry.sh for this repository's primary "
@@ -162,17 +177,18 @@ def _preflight_parser(sub, handler) -> None:
                           "conventional path. Preflight checks whether it exists and is runnable, "
                           "because without one NOTHING a run reports can fail a build")
     pre.add_argument("--probe-endpoint", action="store_true",
-                     help="spend one request confirming the endpoint supports native tool calling. "
-                          "Without it a scan on an incapable endpoint finds nothing and looks clean.")
+                     help="spend one probe turn confirming the endpoint supports native tool calling; "
+                          "transient transport failures may retry. "
+                          "The probe reports an unsupported endpoint before a review begins.")
     _endpoint_args(pre)
     pre.add_argument("--json", action="store_true")
     pre.set_defaults(handler=handler)
 
 
 def _diff_parser(sub, handler) -> None:
-    """`diff` — review a pull request. The free tier and the v1 shipping artefact, and the
+    """`diff` — review a pull request. The free tier's shipping artefact, and the
     only command carrying the two ablation arms a maintenance script drives."""
-    dif = sub.add_parser("diff", help="review a pull request; the free tier and the v1 artefact")
+    dif = sub.add_parser("diff", help="review a pull request; the free tier's shipping artefact")
     dif.add_argument("--repo", default=".", help="path to the checkout")
     dif.add_argument("--base-ref", default="HEAD~1", help="what this pull request is measured against")
     dif.add_argument("--witness-entry", default=None,
@@ -189,12 +205,12 @@ def _diff_parser(sub, handler) -> None:
     # no measurement of a diff-scoped run supports a ceiling, and one invented here would be a
     # number nobody checked, quoted to a customer as a safety property. Both profiles are still
     # offered here; on this mode they are opt-in rather than imposed.
-    _budget_args(dif, scan_default=None)
+    _budget_args(dif, scan_default=None, max_steps_available=True)
     dif.add_argument("--fail-on", choices=FAIL_ON_CHOICES, default="none",
                      help="none reports only. reproduced gates on a finding carrying a DEMONSTRATION. "
-                          "new gates only when a demonstrated finding sits on a line this change "
-                          "introduced — derived from the diff in hand, nothing stored. A hypothesis "
-                          "NEVER gates")
+                          "new gates when a demonstrated defect is attributed to this change: it "
+                          "replays against the base when possible, then falls back to changed-line "
+                          "attribution with reduced confidence. A hypothesis NEVER gates")
     dif.add_argument("--max-steps", type=int, default=None,
                      help="how many turns the hunt may take. Omit for the measured default, "
                           "simple.DEFAULT_MAX_STEPS — or the higher floor a --scan profile sets, "
@@ -211,6 +227,13 @@ def _diff_parser(sub, handler) -> None:
                           "2026-08-08 did. Omit for the measured "
                           "default, diffscope.HUNK_RADIUS")
     dif.add_argument("--out-dir", default=None)
+    dif.add_argument(
+        "--journal-path", default=None,
+        help="opt in to retaining the raw run transcript at this path. It contains model reasoning "
+             "and source returned by tools, so the path must be outside --out-dir and is never "
+             "exposed by the GitHub Action. Without this option, a private temporary journal is "
+             "used only to derive redacted telemetry and the run log, then deleted before the "
+             "command returns")
     # ABLATION ARM ONLY — the maintainers' notes arm A, and the same shape the separate package uses for
     # `contract_endpoint`. It reproduces the pre-2026-08-19 toolset (four tools, nothing executable) so
     # that a maintenance script --compare-execution` has a control. Not a customer knob: `README.md`

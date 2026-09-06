@@ -53,12 +53,18 @@ import pathlib
 import os
 import re
 import shlex
+import stat
 import subprocess
 import urllib.parse
 from dataclasses import dataclass, fields
 
+from shard.inspectionview import markdown as inspection_markdown
+
 # The shared prompt/report rendering boundary — see `diffscope.prompt_safe`. Used here for the ONE
 # place a model-written string becomes markdown structure rather than markdown prose: the heading.
+from shard.artefactfs import (atomic_write as _atomic_write,
+                              rooted_write,
+                              trusted_directory as _trusted_directory)
 from shard.target import HARNESS_NAME
 # `safe_directory_argv` for `head_revision` — one more NAME on an import edge this module already has,
 # which is the same trade `_REPRODUCE_SH`'s collapse into one constant records. A container action runs
@@ -153,8 +159,11 @@ def _advice_sentence(advice: str) -> str:
 
 
 #: A fingerprint is used as a PATH SEGMENT and as a code-scanning identity, so it may contain only
-#: characters that are safe in both. Anything else is hashed — see `Finding.fingerprint`.
-_SAFE_TOKEN = re.compile(r"[A-Za-z0-9._-]{1,64}")
+#: characters that are safe in both. A leading dot is unsafe even when it is not `.` or `..`: the
+#: shipped upload action excludes dot-path contents by default, so `.proof` succeeds locally and then
+#: silently loses its input in the hosted evidence artefact. Anything unsafe is hashed — see
+#: `Finding.fingerprint`.
+_SAFE_TOKEN = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}")
 
 #: WHY AN ALERT NAMES THE ENTRY POINT. **One declaration, read by the markdown note AND by the SARIF
 #: rule**, because two spellings of one disclaimer is precisely how these channels came to disagree: on
@@ -341,6 +350,10 @@ class Finding:
     crash_count: int = 0
     doubts: tuple[str, ...] = ()
     poc_path: str | None = None              # the crashing input on disk, for the bundle
+    #: A verified immutable copy for simple-mode witnesses. Customer-authored entry points run with
+    #: the same UID as this process, so a path can change after adjudication; reopening it at report
+    #: time can never establish that the bytes copied are the bytes that were judged.
+    poc_bytes: bytes | None = None
     reproduce_command: str = ""
     #: WHAT THE VERDICT WAS REACHED AGAINST — the checkout's `HEAD`, from `head_revision`, or `""` when
     #: this run could not name one. Third of the three things `README.md` says a bundle ships, and the
@@ -361,6 +374,13 @@ class Finding:
     #: told "nonzero_exit was observed" and shown nothing. The design notes, "Found by the first
     #: PAID container run".
     evidence: str = ""
+    #: The observation class and, for the marker arm, the exact marker that made this finding
+    #: demonstrable. Replay cannot infer either from an exit code: ordinary input rejection is often
+    #: non-zero, while an output-marker demonstration may exit zero.
+    witness_expectation: str = ""
+    witness_marker: str = ""
+    witness_entry: str = ""
+    witness_controls: tuple[str, ...] = ()
     #: WITHIN-RUN PROPOSAL ORDINAL — simple mode's 1-based order the claim behind this finding was
     #: proposed in. `rank` reads it as a STABLE tiebreak (below `replays`, above `fingerprint`) so a
     #: correction the model made after an earlier claim renders AFTER it, rather than wherever the two
@@ -512,12 +532,29 @@ def finding_names(findings) -> list[str]:
     Every kept finding is numbered, including one that gets no bundle written: a hypothesis with no
     candidate input shares its anchor with the demonstration beside it, so leaving it out of the
     count would hand two entries of one document the same `id` again.
+
+    **Reserve every base fingerprint before adding suffixes.** A run containing `fault`, `fault` and
+    the legitimate fingerprint `fault-2` used to allocate `fault`, `fault-2`, `fault-2`; the last
+    bundle removed and replaced the second one's proof. Stable cross-run identity remains the base
+    fingerprint. Only the within-run directory/id skips occupied base and generated names.
     """
-    seen: dict[str, int] = {}
+    fingerprints = [f.fingerprint for f in findings]
+    reserved = set(fingerprints)
+    used: set[str] = set()
+    next_suffix: dict[str, int] = {}
     names: list[str] = []
-    for f in findings:
-        nth = seen[f.fingerprint] = seen.get(f.fingerprint, 0) + 1
-        names.append(f.fingerprint if nth == 1 else f"{f.fingerprint}-{nth}")
+    for fingerprint in fingerprints:
+        if fingerprint not in used:
+            name = fingerprint
+        else:
+            suffix = next_suffix.get(fingerprint, 2)
+            name = f"{fingerprint}-{suffix}"
+            while name in reserved or name in used:
+                suffix += 1
+                name = f"{fingerprint}-{suffix}"
+            next_suffix[fingerprint] = suffix + 1
+        used.add(name)
+        names.append(name)
     return names
 
 
@@ -894,6 +931,8 @@ class RunFacts:
     #: accumulate between runs"*). A consumer of the artefacts could not read it anywhere, which is
     #: this class's founding defect: a fact the run knows, in a channel that is deleted with the runner.
     stateful: bool | None = None
+    #: This is a measured source-read inventory, not a replacement meaning for files_reviewed.
+    inspection: dict | None = None
 
 
 #: Which statuses mean the run reached its own end. Anything else and the finding count is a floor.
@@ -1096,7 +1135,7 @@ def _summary_table(findings, *, status: str, run: RunFacts | None,
                      f"ceiling, so raising `--max-steps` raises it too"))
     if run.files_reviewed is not None:
         against = f" against `{run.base_ref}`" if run.base_ref else ""
-        rows.append(("reviewed", f"{run.files_reviewed} changed file(s){against}"))
+        rows.append(("scope", f"{run.files_reviewed} changed file(s){against}"))
     if run.fail_on:
         gate = {"none": "`none` — report only, this run could not fail the build",
                 "reproduced": "`reproduced` — a demonstrated finding fails the build",
@@ -1115,7 +1154,7 @@ def _summary_table(findings, *, status: str, run: RunFacts | None,
     # It read `N unavailable on this runner … this run had less leverage than one with them`, which says
     # a bigger machine would restore them. It would not. Three of the four gate on `caps.container`,
     # which is `vul_image` — recovered from the workdir's `test_poc.sh` and required to match
-    # `hands._VUL_IMAGE_RE` (`cgmask-…:vul`), the benchmark/ARVO convention. That is a property of the
+    # `target.VUL_IMAGE_RE` (`cgmask-…:vul`), the benchmark/ARVO convention. That is a property of the
     # TARGET, not of the box, and no customer repository has one. Asked directly whether a paid GitHub
     # runner would help, the honest answer is no, and the report was saying otherwise.
     if run.unavailable_levers:
@@ -1383,7 +1422,8 @@ def build_survey_markdown(summary: str, *, target: str = "", truncated: bool = F
 
 
 def build_markdown(findings, *, status: str, dropped: int = 0, target: str = "",
-                   gate_reasons=(), scope_reasons=(), run: RunFacts | None = None) -> str:
+                   gate_reasons=(), scope_reasons=(), run: RunFacts | None = None,
+                   bundle_names: dict[int, str] | None = None) -> str:
     """The short human report. Deliberately short — it is read in a pull request, not filed.
 
     A run with no findings gets a paragraph too, and it says what was DONE rather than what is true of
@@ -1405,7 +1445,9 @@ def build_markdown(findings, *, status: str, dropped: int = 0, target: str = "",
     # CAPPED list, and pass the same one to both readers"* — and `cliemit._emit` passes `cap(findings)`
     # to it while `resultdoc` numbers the same list again. `rank` is a stable sort on a total key over
     # a list `cap` already ranked, so all three number the same findings in the same order.
-    named = list(zip(ordered, finding_names(ordered)))
+    derived = finding_names(ordered)
+    named = [(f, (bundle_names or {}).get(id(f), name))
+             for f, name in zip(ordered, derived)]
     reproduced = [pair for pair in named if pair[0].gate_eligible]
     hypotheses = [pair for pair in named if not pair[0].gate_eligible]
 
@@ -1436,6 +1478,8 @@ def build_markdown(findings, *, status: str, dropped: int = 0, target: str = "",
     for reason in scope_reasons:
         out += [f"> **{reason}**", ""]
 
+    if run and run.inspection is not None:
+        out += inspection_markdown(run.inspection)
     if not ordered:
         out.append(_no_finding_paragraph(status, run.error_kind if run else ""))
         return "\n".join(out) + "\n"
@@ -1597,7 +1641,7 @@ def _finding_block(f: Finding, *, reproduced: bool, bundle: str) -> list[str]:
     out = [f"### {prompt_safe(f.title, limit=300)}", ""]
     # **WHERE. The human report did not say, and for one whole configuration nothing else did either.**
     # This block emitted the heading, the replay count, the model's prose, the sanitizer, the evidence,
-    # the reproduce command and the doubts — and never `location` or `line`. The location reached the
+    # the bundle record and the doubts — and never `location` or `line`. The location reached the
     # SARIF alone, and `README.md` tells the customer `github_token` is optional: *"the run is still
     # correct and still gates — it simply produces no alerts"*. On that configuration the SARIF is a
     # file in an artefact zip and the report is what a reviewer reads, so the answer to "which file"
@@ -1659,31 +1703,43 @@ def _finding_block(f: Finding, *, reproduced: bool, bundle: str) -> list[str]:
             out.append(f"_Last {_EVIDENCE_IN_REPORT} characters; the bundle has the rest._")
         out.append("")
     if f.reproduce_command:
-        # **THE BLOCK WAS COPY-PASTE-SHAPED AND ONLY WORKED AS A FILE.** It printed
-        # `f.reproduce_command` — the whole ten-line program — inside an ```sh fence, and that program
-        # resolves both of its paths from `$0`. Pasted into a shell, `$0` is the shell: measured
-        # 2026-09-02 from the repository root, `shard: the reproducing input is missing from
-        # /github/workspace`, rc=2. It refuses rather than lying, which is better than the v2.3.0
-        # behaviour it replaced, but the refusal names the reviewer's cwd and not the directory that
-        # holds the file — and the file was named in NO shipped prose: `reproduce.sh` appeared in
-        # neither `README.md`, `action.yml`, `CHANGELOG.md` nor `examples/`, and the report never
-        # said `bundles/`, `input` or `output.txt` either.
+        # **THE REPORT USED TO TURN AN AUDIT RECORD INTO AN EXECUTION INSTRUCTION.** It printed
+        # `sh bundles/<name>/reproduce.sh`, and neither the downloaded directory nor the script inside
+        # it carries producer authentication — a direct shell invitation across the credential boundary,
+        # onto whichever host the reviewer happened to read the report on. The documentation verifier
+        # built around that command accepted deterministic input, script, product, and post-validation
+        # path swaps (an internal audit enumerates the four), so it
+        # was removed rather than patched into a second adjudicator. Naming the bytes and the
+        # observation keeps them visible without claiming that executing an untrusted bundle
+        # re-establishes the verdict.
         #
-        # ONE COMMAND, NOT THE PROGRAM. The reviewer wants what to run; the program is what runs, it
-        # is in the bundle, and `shard-result.json` carries it verbatim as `reproduction.command` for
-        # anything that wants to read it. Reprinting it here as a second, non-working spelling of the
-        # same thing is this file's most-recorded defect class.
+        # THE PROCEDURE IS NAMED AND ITS PATH IS NOT. The guide ships: `packaging/the design notes, and
+        # the free build script emits that whole directory as `docs/`. But this markdown is read in a pull
+        # request and out of an artefact zip, where a source-tree documentation path resolves to
+        # nothing, so the report names the guide and never a path to it.
         #
-        # RELATIVE TO THIS REPORT, which is a fact rather than a guess in the same way `_survey_where`
-        # naming its sibling is: `cliemit._emit` writes `shard-report.md` and `bundles/` into the one
-        # `out_dir`, so the path below resolves from wherever this file is. `resultdoc` derives
-        # `reproduction.bundle` from the same `finding_names`, so the two artefacts name one directory.
-        out += ["Reproduce:", "", "```sh", f"sh bundles/{bundle}/reproduce.sh", "```", "",
-                f"_`bundles/{bundle}/` sits beside this report and holds the whole reproduction: "
-                f"`reproduce.sh` (which finds the checkout it was unpacked into and runs the entry "
-                f"point there), `input` — the exact bytes the verdict was reached on — `output.txt`, "
-                f"and `metadata.json`, which records the revision this was produced against. The "
-                f"script says so when your checkout is at a different one._", ""]
+        # WHAT THE GUIDE OFFERS BOUNDS WHAT THIS BLOCK MAY ASK FOR. `replay.md` states that no trusted
+        # acquisition or replay command ships, and that a post-download checksum "does not prove who
+        # produced them": retention and inspection are what a reader can actually carry out, so the
+        # sentence below asks for those and does not tell anyone to authenticate a producer the
+        # shipped procedure cannot authenticate. Replay is the half that does NOT ship —
+        # `_bundle_metadata` records the observation class, the marker and the control NAMES, and
+        # nothing here adjudicates them — which is why this block stops at retention.
+        #
+        # The bundle path is exact rather than a guess, in the same way `_survey_where` naming its
+        # sibling is: `cliemit._emit` writes `shard-report.md` and `bundles/` into the one `out_dir`,
+        # and `resultdoc` derives `reproduction.bundle` from the same `finding_names` value, so the two
+        # artefacts name one directory.
+        out += ["Safe acquisition required", "",
+                "`reproduce.sh` is the command recorded for this finding, not an independent replay "
+                "verifier; do not execute it on a workstation or in a credentialed job. Keep the "
+                "bundle with the run that produced it and retain and inspect it as the "
+                "version-matched finding-bundle guide shipped with Shard directs; that guide also "
+                "states what retention can and cannot establish about the producer and the source "
+                "bytes. This build ships no independent replay verifier: stop after acquisition and "
+                "do not use this bundle as a gate.", "",
+                f"`bundles/{bundle}/` sits beside this report and holds `reproduce.sh`, `input`, "
+                f"`output.txt` when captured, and `metadata.json`.", ""]
     if f.doubts:
         # Advisory by construction — `Verdict.doubts` cannot change `reproduced`. Surfaced because a
         # human reviewer should see what the oracle was unsure of, not because it downgrades anything.
@@ -1748,31 +1804,26 @@ def head_revision(repo) -> str:
     return revision if done.returncode == 0 and _FULL_SHA.match(revision) else ""
 
 
-def write_bundle(finding: Finding, dest) -> pathlib.Path:
-    """The distinguishing artefact: the crashing input, the command, and what it was produced against.
+def _bundle_input_bytes(finding: Finding, require_input: bool) -> bytes | None:
+    if require_input and finding.poc_bytes is None:
+        raise FileNotFoundError(
+            "the demonstrated finding has no immutable reproducing input to attach")
+    if finding.poc_bytes is not None:
+        return finding.poc_bytes
+    if not finding.poc_path:
+        return None
+    try:
+        return pathlib.Path(finding.poc_path).read_bytes()
+    except OSError:
+        # A missing hypothesis input leaves a legible metadata-only bundle. Gate-eligible callers use
+        # immutable `poc_bytes`, so their missing input was refused before this read.
+        if require_input:
+            raise
+        return None
 
-    The integration guide — *"it costs almost nothing to emit, because the oracle already produced
-    it"*. Written for a finding whether or not it reproduced, because a hypothesis with a candidate
-    input is still the fastest thing to hand a reviewer; `metadata.json` states which it is.
-    """
-    dest = pathlib.Path(dest)
-    dest.mkdir(parents=True, exist_ok=True)
 
-    if finding.poc_path:
-        src = pathlib.Path(finding.poc_path)
-        try:
-            (dest / "input").write_bytes(src.read_bytes())
-        except OSError:
-            # A missing PoC must not take the whole report down. The metadata records its absence, so a
-            # bundle without an input is legible rather than mysterious.
-            pass
-
-    # WHAT WAS OBSERVED, in full. The reproduce command and the input say how to see it again; this is
-    # what we saw. A reviewer who cannot run the entry point themselves has nothing else.
-    if finding.evidence:
-        (dest / "output.txt").write_text(finding.evidence, encoding="utf-8")
-
-    (dest / "metadata.json").write_text(json.dumps({
+def _bundle_metadata(finding: Finding, *, input_present: bool, output_present: bool) -> bytes:
+    return json.dumps({
         "rule_id": finding.rule_id,
         "title": finding.title,
         "reproduced": finding.gate_eligible,
@@ -1782,47 +1833,72 @@ def write_bundle(finding: Finding, dest) -> pathlib.Path:
         "crash_count": finding.crash_count,
         "container_digest": finding.container_digest,
         "reproduce_command": finding.reproduce_command,
-        "input_present": (dest / "input").is_file(),
-        "output_present": (dest / "output.txt").is_file(),
-        # THE THIRD THING THE DOCSTRING ABOVE AND `README.md` BOTH PROMISE. Empty is a statement too:
-        # it says this run could not name the revision, so a reader who finds `""` here knows the
-        # script's own check is switched off rather than passing. See `head_revision`.
+        "input_present": input_present,
+        "output_present": output_present,
+        "witness_expectation": finding.witness_expectation,
+        "witness_marker": finding.witness_marker,
+        "witness_entry": finding.witness_entry,
+        "witness_controls": list(finding.witness_controls),
+        # Empty says this run could not name a revision; the acquisition procedure then refuses to
+        # authenticate the bundle. See `head_revision`.
         "revision": finding.revision,
         "doubts": list(finding.doubts),
-    }, indent=2, sort_keys=True), encoding="utf-8")
+    }, indent=2, sort_keys=True).encode("utf-8")
 
+
+def _bundle_file_size(dest_fd: int, name: str) -> int:
+    """Inspect one bundle child through a no-follow descriptor, including zero-byte inputs."""
+    flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(name, flags, dir_fd=dest_fd)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise OSError("bundle child is not one regular single-link file")
+        return info.st_size
+    finally:
+        os.close(fd)
+
+
+def _write_bundle_fd(finding: Finding, dest_fd: int, *,
+                     require_input: bool = False) -> dict[str, bytes]:
+    """Write one bundle below a held directory and return the authoritative source bytes."""
+    source = _bundle_input_bytes(finding, require_input)
+    files: dict[str, tuple[bytes, int]] = {}
+    if source is not None:
+        files["input"] = (source, 0o644)
+    if finding.evidence:
+        # WHAT WAS OBSERVED, in full. A reviewer who cannot run the entry point has nothing else.
+        files["output.txt"] = (finding.evidence.encode("utf-8"), 0o644)
+    files["metadata.json"] = (
+        _bundle_metadata(finding, input_present=source is not None,
+                         output_present=bool(finding.evidence)),
+        0o644,
+    )
     if finding.reproduce_command:
-        # THE TITLE IS COMMENTED PER LINE, and that is not tidiness. `Finding.title` is MODEL PROSE on
-        # the free tier — `simple._report_finding` records `title.strip()`, which removes surrounding
-        # whitespace and leaves interior newlines alone — and this string is written into a file a
-        # reviewer executes. Measured 2026-09-02 on this function: a claim titled
-        # `"overflow\ntouch /tmp/TITLE_OWNED  # "` emitted a `reproduce.sh` whose line 3 was
-        # `touch /tmp/TITLE_OWNED  #`, and running the bundle created the file at rc=0.
-        #
-        # `_shell_comment` closes the CLASS rather than that example: a `#`-comment in POSIX `sh` ends
-        # only at a newline, so a title that cannot contain an uncommented newline cannot reach
-        # executable position whatever else is in it.
-        script = dest / "reproduce.sh"
-        script.write_text(
-            f"#!/bin/sh\n{_shell_comment(finding.title)}\n{finding.reproduce_command}\n",
-            encoding="utf-8")
-        # **THE SHEBANG IS A PROMISE AND THE MODE DID NOT KEEP IT.** Written by `write_text`, the file
-        # shipped 0644 with `#!/bin/sh` on line 1, so the natural thing a reviewer does with it —
-        # `./reproduce.sh` — was `bash: ./reproduce.sh: Permission denied`, rc=126. Measured
-        # 2026-09-02 inside the built image on a live bundle: `-rw-r--r-- 1 root root 601
-        # reproduce.sh`. Loud and recoverable rather than a trap, and one `chmod` ends it.
-        #
-        # GUARDED, because the mode is a convenience and the bundle is the artefact. `cliemit._emit`
-        # wraps this whole function in `_write_artefact`, which names a raising bundle in `failed` and
-        # writes nothing — so an out-dir on a mount that cannot carry the bit (FAT, an SMB share with
-        # `noperm`) would cost the reviewer the reproducing INPUT to gain an execute flag they do not
-        # need: `sh reproduce.sh`, which is what the report tells them to run, works at any mode.
-        try:
-            os.chmod(script, 0o755)
-        except OSError:
-            # Not swallowed silently — `metadata.json` beside it carries the same command, and the
-            # report names the script with `sh`, so nothing downstream depends on the bit.
-            pass
+        # The title is model prose. `_shell_comment` prevents an interior newline from turning a
+        # comment into a command; atomic creation with 0755 keeps the shebang's executable promise.
+        script = f"#!/bin/sh\n{_shell_comment(finding.title)}\n{finding.reproduce_command}\n"
+        files["reproduce.sh"] = (script.encode("utf-8"), 0o755)
+    for name, (data, mode) in files.items():
+        _atomic_write(dest_fd, name, data, mode=mode)
+    for name, (data, _mode) in files.items():
+        if _bundle_file_size(dest_fd, name) != len(data):
+            raise OSError(f"bundle file {name!r} changed during publication")
+    if require_input and "input" not in files:
+        raise OSError("the reproduction bundle was written without its required input")
+    return {name: data for name, (data, _mode) in files.items()}
+
+
+def write_bundle(finding: Finding, dest, *, require_input: bool = False) -> pathlib.Path:
+    """Write the crashing input, command, observation and target identity through a held directory.
+
+    The path API remains for direct hypothesis/replay callers. The Action emitter calls the descriptor
+    form above while it holds a private staging directory, so a same-run process cannot redirect a
+    child write through a symlink between files.
+    """
+    dest = pathlib.Path(dest)
+    with _trusted_directory(dest, create=True) as (_held_path, dest_fd):
+        _write_bundle_fd(finding, dest_fd, require_input=require_input)
     return dest
 
 
@@ -2028,7 +2104,7 @@ def _repo_relative(text: str, workdir: pathlib.Path) -> str:
     root = str(workdir.resolve())
     return text.replace(f"{root}/repo/", "").replace(f"{root}/repo", "").replace(f"{root}/", "")
 
-def _findings(result, workdir: pathlib.Path, setup) -> list:
+def _findings(result, workdir: pathlib.Path, setup, *, revision: str) -> list:
     """Adapt a `SolveResult` into the mode-agnostic records `shard/report.py` writes.
 
     The separate capability emits one finding per DISTINCT reproduced defect — one at the default `--max-findings 1`,
@@ -2048,12 +2124,19 @@ def _findings(result, workdir: pathlib.Path, setup) -> list:
     harness = setup.fields.get("harness", HARNESS_NAME)
     verdicts = getattr(result, "all_verdicts", None) or [verdict]
     by_signature = getattr(result, "poc_by_signature", None) or {}
-    revision = head_revision(workdir)
-
     findings = []
     for one in verdicts:
         sanitizer = getattr(one, "sanitizer", None)
         signature = getattr(one, "signature", "")
+        # The verdict and these bytes cross the report boundary together. A path is mutable state: a
+        # detached child replaced ``poc-findings/<signature>`` after `_findings` returned and the
+        # emitter delivered the replacement as a reproduced input. The sweep already owns immutable
+        # per-signature bytes, including restored verdicts. The report layer never reopens live
+        # ``./poc``: on a partial/malformed multi-verdict result that is the LAST finding's mutable
+        # path, not evidence for whichever signature is being adapted. `write_bundle` prefers these
+        # bytes, and their absence makes required delivery fail closed.
+        poc_bytes = by_signature.get(signature)
+        poc_path = _sweep_poc(workdir, signature, by_signature) if poc_bytes is not None else None
         # ONE reading, shared by the rule id and by the record. `_rule_id` needs the access line, and
         # the access line is in the evidence rather than on the sanitiser line — so computing it
         # twice would be two chances for the id and the alert's own classification to disagree.
@@ -2086,7 +2169,8 @@ def _findings(result, workdir: pathlib.Path, setup) -> list:
             # EVERY finding gets the bytes that produced IT, primary included. `./poc` is the fallback
             # and never the preference — see `_sweep_poc`, and see the measurement in its docstring for
             # what happens when the primary is allowed to keep `./poc`.
-            poc_path=_sweep_poc(workdir, signature, by_signature),
+            poc_path=poc_path,
+            poc_bytes=poc_bytes,
             # WHAT THIS WAS PRODUCED AGAINST, on the record so `write_bundle` can put it in
             # `metadata.json` and the program can check it. See `head_revision`.
             revision=revision,
@@ -2124,10 +2208,9 @@ def _sweep_poc(workdir: pathlib.Path, signature: str, by_signature: dict) -> str
         # backup and adjudicates it directly, and there `./poc` genuinely holds that finding's bytes.
         live = workdir / "poc"
         return str(live) if live.exists() else None
-    out = workdir / "poc-findings"
-    out.mkdir(exist_ok=True)
-    path = out / (signature or "unsigned")
-    path.write_bytes(data)
+    root = workdir.resolve()
+    path = root / "poc-findings" / (signature or "unsigned")
+    rooted_write(root, path, data, create_parents=True)
     return str(path)
 
 def _crash_title(sanitizer: str | None) -> str:

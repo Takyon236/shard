@@ -1,7 +1,8 @@
 """Shared tool primitives — the registry types and the sandboxed read tools.
 
 This module is the dependency-free base every registry builder in this tree imports, on both tiers.
-It has no imports from within ``shard``.
+Its one in-package dependency is ``artefactfs``, the standard-library-only descriptor boundary shared
+by both tiers; it imports nothing back from this module.
 
 What lives here: ``ToolContext``, ``ToolResult``, ``Tool``, the ``ToolRegistry``, schema helpers
 (``_param_schema``, ``tool_to_openai``), and the three sandboxed read tools (``_read_file``,
@@ -24,11 +25,16 @@ would have made the misreading official.
 
 from __future__ import annotations
 
-import os
+import errno
 import re
+import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
+
+from shard.artefactfs import read_file, trusted_directory
+from shard.toolreads import (capture_refs, directory_entries, grep_refs,
+                             immutable_directory_link, regex_hits, selected_path)
 
 
 # ── the severed ReAct contract, kept as the RECORD it is ────────────────────────────────────────────
@@ -50,9 +56,9 @@ from typing import Any, Callable
 # carried over." The contract itself has no consumer left in this repository.
 
 #: What a root the caller did not set is worth: NOTHING. It has to be a real ``Path`` rather than
-#: ``None`` because ``_read_allowed_roots`` calls ``.resolve()`` on all three (verified: ``None`` raises
-#: ``AttributeError`` there), and it is deliberately a path that exists nowhere, so an unset root grants
-#: no reads instead of granting whatever the old literal happened to name.
+#: ``None`` because ``ToolContext`` captures a canonical path for all three roots (verified: ``None``
+#: raises ``TypeError`` there), and it is deliberately a path that exists nowhere, so an unset root
+#: grants no reads instead of granting whatever the old literal happened to name.
 _UNSET_ROOT = Path("/nonexistent/shard-toolcontext-unset")
 
 
@@ -101,10 +107,20 @@ class ToolContext:
     engine_root: Path = _UNSET_ROOT
     audit_root: Path = _UNSET_ROOT
     shard_root: Path = Path(__file__).resolve().parent.parent
+    #: Names the caller configured as inference credentials. Hostile subprocesses strip these exact
+    #: variables in addition to the shape-based defaults; names such as NPM_AUTH carry no key suffix.
+    secret_env_names: tuple[str, ...] = ()
     # LEVER 1 (code_query / weggli): path to the weggli binary, or None to let _code_query resolve it
     # (vendored path → shutil.which → degrade). Injected by the harness; None on the deterministic path
     # (tests fake the subprocess), so the default suite never needs the binary.
     weggli: Path | None = None
+    immutable_read_roots: bool = False
+    _captured_read_roots: tuple[Path, ...] = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        self._captured_read_roots = tuple(
+            Path(root).resolve() for root in (self.engine_root, self.shard_root, self.audit_root)
+        )
 
 
 @dataclass
@@ -112,6 +128,8 @@ class ToolResult:
     ok: bool
     data: Any = None
     error: str = ""
+    # Reporting observes the rendered source window without changing the model's tool envelope.
+    source_read: dict | None = field(default=None, compare=False, repr=False)
 
     def to_dict(self) -> dict:
         return {"ok": self.ok, "data": self.data, "error": self.error}
@@ -210,8 +228,7 @@ class ToolRegistry:
 
 # --- read-only tools (P1) ---------------------------------------------------
 def _is_within(p: Path, root: Path) -> bool:
-    """True iff ``p`` resolves inside ``root``. ``resolve()`` collapses ``..`` and follows symlinks,
-    so neither a ``../`` traversal nor a symlink out of the tree can slip past this check."""
+    """True iff ``p`` resolves inside ``root``; callers still need a descriptor-bound operation."""
     try:
         p.resolve().relative_to(root)
         return True
@@ -224,7 +241,12 @@ def _read_allowed_roots(ctx: ToolContext) -> tuple[Path, ...]:
     legitimately span the whole audit tree (results/scripts for self-improve, the engine + Shard's own
     source). Deliberately NOT home/ssh/aws: the autonomous loop has no business reading ~/.ssh or
     ~/.claude.json, so an absolute path or ``..`` traversal outside these three roots is refused."""
-    return (ctx.engine_root.resolve(), ctx.shard_root.resolve(), ctx.audit_root.resolve())
+    return ctx._captured_read_roots
+
+
+def _selected_read_path(ctx: ToolContext, path: str) -> tuple[Path, Path, Path] | None:
+    """Return ``(captured root, relative target, display path)`` without trusting a mutable link."""
+    return selected_path(_read_allowed_roots(ctx), ctx.immutable_read_roots, path)
 
 
 # --- Large-file INDEX: the "where am I" instrument --------------------------------------------------
@@ -348,6 +370,28 @@ OBS_WINDOW_CHARS = 12000
 # count and derives it from here instead of restating 400 beside a comment that only says it should match.
 READ_MAX_LINES = 400
 
+# The largest file whose complete line map one tool call will build. It matches the 16 MiB ceiling on
+# hostile execution output: 1,398 default observation windows, while a sparse/generated giant is
+# refused before allocation. Callers needing a larger source must narrow it outside the model loop.
+READ_MAX_FILE_BYTES = 16 * 1024 * 1024
+
+
+def _read_source(ctx: ToolContext, path: str) -> tuple[bytes, Path, Path] | ToolResult:
+    """Select and read one model-visible source through the descriptor boundary."""
+    selected = _selected_read_path(ctx, path)
+    display = Path(path) if Path(path).is_absolute() else _read_allowed_roots(ctx)[0] / path
+    if selected is None:
+        return ToolResult(False, error=f"refused: read outside allowed roots ({display})")
+    root, relative, shown = selected
+    try:
+        with trusted_directory(root) as (_root, root_fd):
+            return read_file(root_fd, relative, max_bytes=READ_MAX_FILE_BYTES), shown, root / relative
+    except OSError as exc:
+        if exc.errno == errno.EFBIG:
+            return ToolResult(False, error=(f"file exceeds the {READ_MAX_FILE_BYTES}-byte read ceiling: "
+                                            f"{shown}"))
+        return ToolResult(False, error=f"not a regular single-link file: {shown}")
+
 
 def _read_file(ctx: ToolContext, path: str, offset: int = 0, max_bytes: int = OBS_WINDOW_CHARS,
                max_lines: int = READ_MAX_LINES) -> ToolResult:
@@ -358,19 +402,29 @@ def _read_file(ctx: ToolContext, path: str, offset: int = 0, max_bytes: int = OB
     (the loop's observation-window bound, aligned to max_obs_chars) is hit — whichever comes first —
     then appends a marker naming the exact next START LINE to re-call with. A single line longer than
     ``max_bytes`` is char-truncated with an explicit note so the observation window is never blown."""
-    p = Path(path)
-    if not p.is_absolute():
-        p = ctx.engine_root / path
-    if not any(_is_within(p, r) for r in _read_allowed_roots(ctx)):
-        return ToolResult(False, error=f"refused: read outside allowed roots ({p})")
-    if not p.is_file():
-        return ToolResult(False, error=f"not a file: {p}")
-    lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+    source = _read_source(ctx, path)
+    if isinstance(source, ToolResult):
+        return source
+    raw, p, selected = source
+    lines = raw.decode("utf-8", errors="replace").splitlines()
     n = len(lines)
     start = max(0, int(offset))
     cap = max(1, int(max_lines))
     if start >= n:
-        return ToolResult(True, "" if n == 0 else f"[offset {start} past end of file ({n} lines)]")
+        result = ToolResult(True, "" if n == 0 else f"[offset {start} past end of file ({n} lines)]",
+                            source_read={"path": str(p), "start_line": 0, "end_line": 0,
+                                         "total_lines": n, "partial_line": False})
+    else:
+        result = _read_window(lines, p, start, cap, max_bytes)
+    # Display spelling still selects the index language. Reporting names the SAME selected target
+    # that supplied the bytes: collapsing a symlink/../ spelling lexically credited the wrong file.
+    result.source_read["path"] = str(selected)
+    return result
+
+
+def _read_window(lines: list[str], p: Path, start: int, cap: int, max_bytes: int) -> ToolResult:
+    """Render one source window; report its computed bounds without parsing the rendered text."""
+    n = len(lines)
     # Reserve headroom below max_bytes for the paging marker AND the loop's JSON-envelope escaping: the
     # ToolCallingLoop clamps `json.dumps(result.to_dict())[:max_obs_chars]` and max_bytes defaults to that
     # same max_obs_chars — so a page filled to max_bytes has its trailing `offset=` marker (emitted LAST)
@@ -395,12 +449,14 @@ def _read_file(ctx: ToolContext, path: str, offset: int = 0, max_bytes: int = OB
     out: list[str] = []
     used = 0
     i = start
+    partial_line = False
     while i < n and (i - start) < cap:
         line = lines[i]
         if not out and len(line) > content_cap:
             # Pathological single long line (minified/one-liner): char-truncate THIS line so we never
             # blow the observation window; advance past it so the next page starts on a fresh line.
             out.append(line[:content_cap] + f"\n...[line {i} truncated to {content_cap} chars of {len(line)}]")
+            partial_line = True
             i += 1
             break
         if out and used + len(line) + 1 > content_cap:
@@ -411,11 +467,36 @@ def _read_file(ctx: ToolContext, path: str, offset: int = 0, max_bytes: int = OB
     chunk = "\n".join(out)
     if i < n:
         chunk += f"\n...[truncated: {n - i} more lines; re-call read_file with offset={i}]"
-    return ToolResult(True, chunk + index_txt)
+    return ToolResult(True, chunk + index_txt,
+                      source_read={"path": str(p), "start_line": start + 1, "end_line": i,
+                                   "total_lines": n, "partial_line": partial_line})
 
 
 # Cap on files scanned by one _grep call — a bounded tool call, not an unbounded whole-tree crawl.
 _GREP_MAX_FILES = 5000
+# Directory fan-out has to be bounded independently of readable files: five thousand empty
+# directories otherwise evade the file cap. This freezes the existing whole-tree budget at 5,000
+# entries; tests may lower the file cap without silently changing the traversal ceiling.
+_GREP_MAX_ENTRIES = _GREP_MAX_FILES
+_GREP_MAX_DEPTH = 64
+# Same per-file ceiling as the repository survey. ``survey`` imports this module, so the value lives
+# here without importing it back and creating a cycle. Grep searches this prefix and reports the skip.
+_GREP_MAX_FILE_BYTES = 262_144
+# A complete grep call captures at most the same 16 MiB that ``read_file`` may map. This rejects a
+# broad generated tree before the isolated matcher duplicates its bytes across a process boundary.
+_GREP_MAX_TOTAL_BYTES = READ_MAX_FILE_BYTES
+# Patterns arrive through the 12,000-character observation channel; accepting more buys no reachable
+# capability and lets compilation itself become the resource sink the worker exists to bound.
+_GREP_MAX_PATTERN_BYTES = OBS_WINDOW_CHARS
+# Five thousand retained rows is already larger than the observation channel can deliver and bounds
+# the model-controlled ``max_matches`` argument to roughly 2 MiB rather than one row per input line.
+_GREP_MAX_RETAINED_MATCHES = _GREP_MAX_FILES
+# Regex evaluation shares the 60-second ceiling of one hostile witness execution. CPython's engine can
+# otherwise spend indefinitely on a short nested-quantifier pattern despite every filesystem bound.
+_GREP_WALL_SECONDS = 60.0
+# Directory listings share the traversal fan-out budget but keep a separate name so either contract
+# can be tightened independently after a measured customer tree requires it.
+_LIST_MAX_ENTRIES = _GREP_MAX_ENTRIES
 
 # VCS metadata directories excluded from whole-tree grep walks, by PATH COMPONENT.
 # Excluded BEFORE the _GREP_MAX_FILES cap so the budget is actually available for source files.
@@ -436,118 +517,104 @@ _GREP_MAX_FILES = 5000
 _VCS_DIRS: frozenset[str] = frozenset({".git", ".hg", ".svn"})
 
 
+def _grep_notes(state, batch, result, match_limit: int) -> list[str]:
+    notes: list[str] = []
+    if result.capped:
+        notes.append(f"...[stopped at max_matches={match_limit}; more matches may exist — "
+                     f"narrow `path`; at most {_GREP_MAX_RETAINED_MATCHES} matches are retained]")
+    if state.unscanned:
+        notes.append(f"...[truncated: scanned {_GREP_MAX_FILES} of {state.files} files; "
+                     f"{state.unscanned} not searched — an empty/short result is NOT proof of absence; "
+                     "narrow `path`]")
+    if state.truncated or state.depth_skipped:
+        notes.append(f"...[truncated at {_GREP_MAX_ENTRIES} filesystem entries / "
+                     f"depth {_GREP_MAX_DEPTH}; narrow `path`]")
+    if state.vcs_skipped:
+        notes.append(f"...[skipped {state.vcs_skipped} VCS metadata director(ies) "
+                     f"({', '.join(sorted(_VCS_DIRS))}); pass an explicit path to search within one]")
+    if state.links_skipped:
+        notes.append(f"...[skipped {state.links_skipped} untrusted symlink file(s) resolving outside "
+                     "the allowed roots or authored after the source snapshot]")
+    if batch.partial_files:
+        notes.append(f"...[searched only the first {_GREP_MAX_FILE_BYTES} bytes of "
+                     f"{batch.partial_files} oversized file(s)]")
+    if batch.byte_skipped:
+        notes.append(f"...[truncated after {_GREP_MAX_TOTAL_BYTES} source bytes; "
+                     f"{batch.byte_skipped} file(s) not searched; narrow `path`]")
+    if batch.unreadable:
+        notes.append(f"...[skipped {batch.unreadable} unreadable file(s)]")
+    return notes
+
+
 def _grep(ctx: ToolContext, pattern: str, path: str = ".", max_matches: int = 50) -> ToolResult:
     """Regex-search files under ``path``, confined to the read-allowed roots.
 
     Returns a flat ``list[str]`` of ``"<file>:<line>: <text>"`` hits. Anything that made the scan
-    INCOMPLETE (match cap, file cap, skipped files) is reported as a synthetic trailing entry using
+    INCOMPLETE (match cap, file cap, skipped files) is reported as a synthetic entry using
     ``_read_file``'s ``...[...]`` marker convention — never by changing the return shape, because
     ``the benchmark`` registers this same function as its own ``grep`` tool.
 
     Why the markers matter: a silently truncated scan returns an empty list, and the agent reads
     "no matches" as evidence of ABSENCE having searched a fraction of the tree.
     """
-    base = Path(path)
-    if not base.is_absolute():
-        base = ctx.engine_root / path
-    roots = _read_allowed_roots(ctx)
-    if not any(_is_within(base, r) for r in roots):
-        return ToolResult(False, error=f"refused: read outside allowed roots ({base})")
-    rx = re.compile(pattern)
-    # Confining the BASE does NOT confine the WALK. `rglob` refuses to DESCEND into a symlinked
-    # directory, but it still YIELDS a symlinked FILE, and `read_text` follows it — so a symlink
-    # planted under an allowed root (the solver's `run_bash` can create one) would read any file the
-    # process can, defeating the whole point of `_read_allowed_roots`. The real invariant is therefore
-    # per-candidate, not per-base: every file is re-resolved and re-checked inside the loop.
-    #
-    # LIMIT, stated so it is not over-claimed: this closes SYMLINK escape, not HARDLINK escape. A hard
-    # link has no separate target to resolve — `os.link(outside, base/x)` makes `base/x` genuinely a
-    # name for that inode — so `resolve()` is blind to it and the read is allowed. Closing it needs
-    # st_dev/st_ino identity checks against the roots. `_read_file` shares the same blind spot.
-    # SORTED, because the scan is capped. `rglob` yields in directory order, so WHICH 5000 of a larger
-    # tree got searched was not reproducible — two identical greps could return different results, and
-    # the agent has no way to tell that apart from a real change in the code it is reading.
-    if base.is_file():
-        files: list[Path] = [base]
-        vcs_skipped: int = 0
-    else:
-        # PRUNED WALK, not rglob-then-filter. `rglob` descends into `.git` and stats every packed
-        # object, and only then does the filter throw them away — measured on this repository, 2,906
-        # paths enumerated to keep 436, 106ms against 3.2ms for the pruned walk: 33x. The wrong
-        # variable was driving it: the cost scaled with the customer's git HISTORY rather than with
-        # their source, on the tool the agent calls most (1,022 `read_file`-class calls over 29 runs,
-        # 18 greps in a single diff run).
-        #
-        # `os.walk` honours mutation of `dirnames`, so this STOPS the descent rather than hiding the
-        # results — the same pattern `target.profile_repo` already uses and documents for the same
-        # reason. Directories are still matched by exact NAME, so `mygit.c` and `gitweb/index.c` are
-        # untouched, exactly as the component filter left them.
-        #
-        # An explicit `path=".git"` is still honoured and still needs no special case: base IS that
-        # directory, the walk starts inside it, and only a NESTED VCS directory would be pruned.
-        #
-        # SORTED, because the scan is capped and directory order is not reproducible — two identical
-        # greps must not return different results.
-        files = []
-        vcs_skipped = 0
-        for dirpath, dirnames, filenames in os.walk(base, onerror=lambda _e: None):
-            vcs_skipped += sum(1 for d in dirnames if d in _VCS_DIRS)
-            dirnames[:] = [d for d in dirnames if d not in _VCS_DIRS]
-            here = Path(dirpath)
-            # `is_file()` kept: `filenames` includes broken symlinks, which `rglob(...)+is_file()`
-            # excluded, and they must not consume the file cap. It is now one stat per KEPT file
-            # rather than one per walked path, which is where the saving is.
-            files.extend(p for p in (here / n for n in filenames) if p.is_file())
-        files.sort()
-    unscanned = max(0, len(files) - _GREP_MAX_FILES)
-    hits: list[str] = []
-    escaped = unreadable = 0
-    capped = False
-    for f in files[:_GREP_MAX_FILES]:
-        if not any(_is_within(f, r) for r in roots):
-            escaped += 1
-            continue
-        try:
-            text = f.read_text(encoding="utf-8", errors="replace")
-        except Exception:
-            unreadable += 1          # binary/permission/vanished — counted, never silently dropped
-            continue
-        for i, line in enumerate(text.splitlines(), 1):
-            if rx.search(line):
-                hits.append(f"{f}:{i}: {line.strip()[:200]}")
-                if len(hits) >= max_matches:
-                    capped = True
-                    break
-        if capped:
-            break
-    notes: list[str] = []
-    if capped:
-        notes.append(f"...[stopped at max_matches={max_matches}; more matches may exist — "
-                     f"narrow `path` or raise max_matches]")
-    if unscanned:
-        notes.append(f"...[truncated: scanned {_GREP_MAX_FILES} of {len(files)} files; {unscanned} not "
-                     f"searched — an empty/short result is NOT proof of absence; narrow `path`]")
-    if vcs_skipped:
-        notes.append(f"...[skipped {vcs_skipped} VCS metadata director(ies) "
-                     f"({', '.join(sorted(_VCS_DIRS))}); pass an explicit path to search within one]")
-    if escaped:
-        notes.append(f"...[skipped {escaped} file(s) resolving outside the allowed roots (symlinks)]")
-    if unreadable:
-        notes.append(f"...[skipped {unreadable} unreadable file(s)]")
+    selected = _selected_read_path(ctx, path)
+    display = Path(path) if Path(path).is_absolute() else _read_allowed_roots(ctx)[0] / path
+    if selected is None:
+        return ToolResult(False, error=f"refused: read outside allowed roots ({display})")
+    root, relative, base = selected
+    match_limit = min(max(1, int(max_matches)), _GREP_MAX_RETAINED_MATCHES)
+    selector = (lambda candidate: _selected_read_path(ctx, candidate)
+                ) if ctx.immutable_read_roots else None
+    try:
+        walked = grep_refs(
+            root, relative, base, selector=selector, max_files=_GREP_MAX_FILES,
+            max_entries=_GREP_MAX_ENTRIES, max_depth=_GREP_MAX_DEPTH, vcs_dirs=_VCS_DIRS,
+        )
+    except OSError:
+        walked = None
+    if walked is None:
+        return ToolResult(False, error=f"not a regular file or directory: {base}")
+    files, state = walked
+    batch = capture_refs(files, max_file_bytes=_GREP_MAX_FILE_BYTES,
+                         max_total_bytes=_GREP_MAX_TOTAL_BYTES)
+    try:
+        result = regex_hits(pattern, batch, max_matches=match_limit,
+                            timeout=_GREP_WALL_SECONDS,
+                            max_pattern_bytes=_GREP_MAX_PATTERN_BYTES)
+    except TimeoutError:
+        return ToolResult(False, error=f"grep exceeded its {_GREP_WALL_SECONDS:g}-second ceiling")
+    except (OSError, ValueError) as exc:
+        return ToolResult(False, error=str(exc))
     # Notes go FIRST, not last. The loop truncates a serialized observation with a plain head-slice
     # (agentloop/loop `[:max_obs_chars]`), so anything appended at the end is the FIRST thing dropped —
-    # and `max_matches` is model-controlled and uncapped, so a large result silently loses exactly the
-    # warning that says the result is incomplete. An "incomplete scan" caveat the agent never sees is
-    # worse than no caveat: it reads an empty/short result as proof of absence.
-    return ToolResult(True, notes + hits)
+    # so a large result silently loses exactly the warning that says the result is incomplete.
+    return ToolResult(True, _grep_notes(state, batch, result, match_limit) + result.hits)
+
+
+def _immutable_directory_link(ctx: ToolContext, path: Path) -> bool:
+    """Classify a captured in-tree directory link without reopening the link itself."""
+    if not ctx.immutable_read_roots:
+        return False
+    return immutable_directory_link(lambda candidate: _selected_read_path(ctx, candidate), path)
 
 
 def _list_dir(ctx: ToolContext, path: str = ".") -> ToolResult:
-    p = Path(path)
-    if not p.is_absolute():
-        p = ctx.engine_root / path
-    if not any(_is_within(p, r) for r in _read_allowed_roots(ctx)):
-        return ToolResult(False, error=f"refused: read outside allowed roots ({p})")
-    if not p.is_dir():
-        return ToolResult(False, error=f"not a dir: {p}")
-    return ToolResult(True, sorted(x.name + ("/" if x.is_dir() else "") for x in p.iterdir()))
+    selected = _selected_read_path(ctx, path)
+    display = Path(path) if Path(path).is_absolute() else _read_allowed_roots(ctx)[0] / path
+    if selected is None:
+        return ToolResult(False, error=f"refused: read outside allowed roots ({display})")
+    root, relative, shown = selected
+    try:
+        entries, truncated = directory_entries(root, relative, max_entries=_LIST_MAX_ENTRIES)
+    except (OSError, ValueError):
+        return ToolResult(False, error=f"not a descriptor-confined directory: {shown}")
+    result = []
+    for name, mode in entries:
+        is_dir = stat.S_ISDIR(mode) or (
+            stat.S_ISLNK(mode) and _immutable_directory_link(ctx, shown / name)
+        )
+        result.append(name + ("/" if is_dir else ""))
+    result.sort()
+    if truncated:
+        result.insert(0, f"...[truncated at {_LIST_MAX_ENTRIES} entries; narrow `path`]")
+    return ToolResult(True, result)

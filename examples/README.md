@@ -57,7 +57,7 @@ reason a real entry point produces nothing that gates.
 ## The shape every one of them shares
 
 ```bash
-bash .shard/entry.sh <payload-file>
+bash .shard/entry.sh path/to/payload-file
 ```
 
 One argument, a path to a file whose contents Shard supplies. Four rules, and the third is the one
@@ -77,10 +77,12 @@ that costs people a run:
 
 ## Starting from nothing in your own project
 
+Use the non-overwriting creation sequence in [Getting started](../docs/getting-started.md#2-add-and-validate-a-witness).
+It refuses existing and symlinked paths. After you edit the generated skeleton, check its empty input:
+
 ```bash
-mkdir -p .shard
-shard preflight --entry-template > .shard/entry.sh
-bash .shard/entry.sh /dev/null        # must be silent and exit 0 before you go further
+set -euo pipefail
+bash -- .shard/entry.sh /dev/null     # must be silent and exit 0 before you go further
 ```
 
 The template is a fixed skeleton with one invocation line chosen by your repository's primary
