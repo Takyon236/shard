@@ -1,7 +1,7 @@
 [project]
 name = "shard"
-version = "2.3.0"
-description = "Security analysis that runs in your CI and reports a finding only when it can attach a reproducing input."
+version = "4.0.3"
+description = "Security analysis in your CI: hypotheses stay informational, and demonstrated findings include a reproducing input."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
@@ -72,4 +72,11 @@ ignore = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # `-q` because a green run should be one line. The interesting output is a failure.
-addopts = "-q"
+#
+# `-rs` because without it a skip is one dot, and a dot is what a pass looks like. MEASURED 2026-09-02
+# on a clean clone: `python -m pytest` reported "83 passed, 3 skipped" and named neither the tests nor
+# the reason, while `-rs` names both — "SKIPPED [3] tests/test_examples.py:54: php is not on PATH".
+# Those three are the php example's whole witness check, so a machine without php produced output
+# byte-identical to one that ran it. It also survives a contributor who types `-q` out of habit: the
+# resulting `-qq` drops the count line and keeps this report.
+addopts = "-q -rs"

@@ -24,7 +24,7 @@ followed, both of them visible in the tree before this module was written:
   `agentloop.py` describes when the gate refuses to pass a build and `report.py` describes what escapes
   into `EXIT_CONFIG`. A rule that three modules describe and none can import is a rule that drifts.
 
-a maintenance script had already named this surface: its rows are grouped under `"gate"`, and there were a
+A maintenance script had already named this surface: its rows are grouped under `"gate"`, and there were a
 dozen of them scoring a module that did not exist. The group came first; this is the module catching up.
 
 ## The layer
@@ -83,7 +83,7 @@ def is_new_finding(finding, introduced) -> bool:
 
     A MODULE-LEVEL function rather than the closure it was for one afternoon, because
     a maintenance script scores this rule and a bench that re-implements the rule scores a COPY.
-    the maintainers' notes's trap 3 — copies of one value in files that cannot import each other WILL
+    The maintainers' notes's trap 3 — copies of one value in files that cannot import each other WILL
     drift — arrived here immediately: the bench was measured against a MUTATED `_cmd_diff` and did not
     notice, because it was grading its own transcription of the rule rather than the rule.
 

@@ -1,6 +1,6 @@
 """The state repository — where understanding accumulates between runs.
 
-the design notes Owner decision, 2026-08-07: *we do not write in the customer's main
+The design notes. Owner decision, 2026-08-07: *we do not write in the customer's main
 repository. The customer creates a dedicated repository which hosts everything from our end, and we
 write there.*
 
@@ -10,7 +10,7 @@ write there.*
 
 ## Why this does not re-open "no control plane"
 
-the maintainers' notes closes it: we build no scheduling, auth, tenancy or storage. We still do not. The state
+The maintainers' notes closes it: we build no scheduling, auth, tenancy or storage. We still do not. The state
 repository is **the customer's**, in their own organisation, created by them and written by a token they
 issue. We operate no service and hold no data. The repository under review is never modified, which also
 removes the objection that a security tool opens pull requests against production code.
@@ -18,7 +18,7 @@ removes the objection that a security tool opens pull requests against productio
 **This module is NOT what `fail-on: new` uses, and the claim that it was is retired.** An earlier
 edition of this docstring asserted it was *"the same mechanism `fail-on: new` needs for baselines
 (the integration guide)"* — an answer §10.1 never gave, since §10.1's own preference was code
-scanning's alert history. the design notes closed it on 2026-08-11 and chose neither: a finding is
+scanning's alert history. The design notes closed it on 2026-08-11 and chose neither: a finding is
 new when the defect sits on a line the pull request introduced, read from the diff, storing nothing.
 
 The reason matters here, because it is about this module's own contract. Making a stored baseline

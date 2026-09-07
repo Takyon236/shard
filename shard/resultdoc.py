@@ -22,8 +22,7 @@ boundary, where the reader is somebody else's software.
 
 **The honesty is in the data, not in the prose.** Every caveat the markdown states in a sentence
 has a code in `limits`: an unfinished run, a ceiling that bound, a walk that truncated, a lever
-that could not fire, an alert anchored on the entry point rather than the fault. `docs/
-ADOPTION-GAPS-2026-08-26.md` B5 names the consequence of leaving them in prose — *"make sure
+that could not fire, an alert anchored on the entry point rather than the fault. The design notes B5 names the consequence of leaving them in prose — *"make sure
 whatever consumes that output does not read '0 findings' as green. The tool is careful here;
 dashboards usually are not."* A dashboard cannot read careful. It can read a code.
 
@@ -39,7 +38,7 @@ to eliminate. The shape refuses the mistake rather than documenting against it.
 **Three fields say the same thing about a finding, and they cannot disagree.** `gate_eligible`,
 `level`, and whether `reproduction` is null are all derived from `Finding.gate_eligible` here, in
 one expression each, so whichever a consumer reads it gets the same answer.
-the maintainers' suite asserts the agreement per finding rather than trusting this paragraph.
+The maintainers' suite asserts the agreement per finding rather than trusting this paragraph.
 
 ## The classification, added 2026-08-28
 
@@ -56,7 +55,7 @@ than defaulting. A consumer must read null as "this run did not establish a clas
 
 ## What this is NOT
 
-Not a coverage report. the design notes A2 is open and `limits` reports it on
+Not a coverage report. The design notes A2 is open and `limits` reports it on
 every run rather than papering over it.
 
 **And `weakness` is not a re-ranking of the finding.** The severity describes the WEAKNESS CLASS and
@@ -73,6 +72,7 @@ from shard.report import (
     COMPLETED_STATUSES,
     TRANSPORT_ERROR_ADVICE,
     cap,
+    finding_names,
     is_numbered,
     rank,
     report_label,
@@ -96,7 +96,7 @@ OBSERVED_IN_RESULT = 2000
 #:
 #: KEYED, NOT DERIVED, and for `TRANSPORT_ERROR_ADVICE`'s reason one file over: the CODES are decided
 #: by run facts that other modules own, and the SENTENCES are decided here, because this module owns
-#: what a consumer reads. the maintainers' suite pins that every code emitted has a statement and
+#: what a consumer reads. The maintainers' suite pins that every code emitted has a statement and
 #: every statement has a code, so a limit cannot be detected and then rendered as nothing.
 #:
 #: A statement is written to be quotable on its own. It lands in somebody else's dashboard, next to
@@ -133,6 +133,10 @@ LIMIT_STATEMENTS: dict[str, str] = {
         "not the same as a candidate that ran and did not demonstrate",
     "gate_not_evaluated":
         "the gate could not be evaluated on this run, so the exit code is not a verdict",
+    "gate_on_claimed_location":
+        "at least one finding was counted as new on the agent's claim that this change introduced it, "
+        "not on a measured location and not on a re-run against the base revision. The defect is "
+        "demonstrated; which change introduced it is not established",
     "scope_degraded":
         "the set of changed files could not be resolved, so what was reviewed is not what changed",
     "no_baseline":
@@ -142,7 +146,8 @@ LIMIT_STATEMENTS: dict[str, str] = {
 
 
 def build(findings, *, status: str, mode: str, target: str = "", run=None,
-          gate_reasons=(), scope_reasons=(), artefacts=None) -> dict:
+          gate_reasons=(), scope_reasons=(), artefacts=None,
+          bundle_names: dict[int, str] | None = None) -> dict:
     """The whole result of one scan, as one document.
 
     `findings` is the full set and is CAPPED here, by the same `report.cap` the SARIF uses, so the two
@@ -155,6 +160,12 @@ def build(findings, *, status: str, mode: str, target: str = "", run=None,
     """
     kept, dropped = cap(findings)
     ordered = rank(kept)
+    # THE SAME NAMES `cliemit._emit` WRITES THE DIRECTORIES UNDER — `report.finding_names`, over the
+    # same capped list, which `cap` already returned ranked. Re-derived here rather than passed in
+    # because this builder is also called directly, and a second spelling of the rule is exactly what
+    # this fixes: the bundle path used to be `bundles/{fingerprint}` regardless of the numbered
+    # directory the emitter actually used.
+    named = list(zip(ordered, finding_names(ordered)))
     reproduced = [f for f in ordered if f.gate_eligible]
     hypotheses = [f for f in ordered if not f.gate_eligible]
     ident = getattr(run, "report_id", "") or ""
@@ -178,11 +189,13 @@ def build(findings, *, status: str, mode: str, target: str = "", run=None,
         },
         "gate": _gate(run, reproduced, gate_reasons, scope_reasons),
         "repository": _repository(run),
+        "inspection": getattr(run, "inspection", None),
         "run": _run(run),
         "limits": limits(ordered, status=status, run=run,
                          gate_reasons=gate_reasons, scope_reasons=scope_reasons, dropped=dropped),
-        "reproduced": [_finding(f) for f in reproduced],
-        "hypotheses": [_finding(f) for f in hypotheses],
+        "reproduced": [_finding(f, (bundle_names or {}).get(id(f), name))
+                       for f, name in named if f.gate_eligible],
+        "hypotheses": [_finding(f, name) for f, name in named if not f.gate_eligible],
         "artefacts": dict(artefacts or {}),
     }
 
@@ -219,12 +232,20 @@ def _weakness(f) -> dict | None:
     }
 
 
-def _finding(f) -> dict:
-    """One finding. `reproduction` is null when there is none, which is the only thing that gates."""
+def _finding(f, name: str) -> dict:
+    """One finding. `reproduction` is null when there is none, which is the only thing that gates.
+
+    `name` is `report.finding_names`' within-run name for this finding — the fingerprint, numbered
+    when an earlier entry of this run already took it. REQUIRED, with no default, so no caller can
+    reach this function without having decided which directory it means; the defect being closed is
+    a second derivation, and a default is a place for a third to grow.
+    """
     reproduced = bool(f.gate_eligible)
     observed = f.evidence or ""
     return {
-        "id": f.fingerprint,
+        # NOT `f.fingerprint`, which repeats within a run: identity names the defect SITE, so one
+        # defect demonstrated twice is one fingerprint and was two entries with one `id` here.
+        "id": name,
         "rule": f.rule_id,
         "rule_title": f.rule_title or f.title,
         "title": f.title,
@@ -247,7 +268,7 @@ def _finding(f) -> dict:
             "crashes": f.crash_count,
             "sanitizer": f.sanitizer,
             "command": f.reproduce_command,
-            "bundle": f"bundles/{f.fingerprint}",
+            "bundle": f"bundles/{name}",
             "container_digest": f.container_digest,
         } if reproduced else None,
         "observed": observed[:OBSERVED_IN_RESULT],
@@ -325,8 +346,17 @@ def limits(findings, *, status: str, run=None, gate_reasons=(), scope_reasons=()
         codes.append("stopped_by_ceiling")
     if getattr(run, "error_kind", ""):
         codes.append("transport_error")
-    if gate_reasons:
-        codes.append("gate_not_evaluated")
+    # FROM THE ARM THAT FIRED, not from the presence of any reason. All three arms of
+    # `clidiff._gate_reasons` mapped onto `gate_not_evaluated` until 2026-09-02, and that function's own
+    # docstring says the opposite — "Every arm is ADDITIVE and none of them suppresses the gate". Arm 3
+    # requires `gate.is_new_finding`, which requires `gate_eligible`, so it can fire ONLY on a run that
+    # exits 1: "the exit code is not a verdict" was emitted only ever on builds Shard correctly failed.
+    #
+    # `getattr` because `limits` is public and a caller may still hand it plain sentences; an
+    # uncoded reason reads as the general caveat, which is the conservative answer and the one this
+    # module gave every reason before codes existed. The maintainers' suite pins that every arm
+    # of the real producer carries a code, and that the code has a statement.
+    codes.extend(getattr(r, "code", "gate_not_evaluated") for r in gate_reasons)
     if scope_reasons:
         codes.append("scope_degraded")
     if any(f.witness_refused for f in findings):
@@ -336,7 +366,18 @@ def limits(findings, *, status: str, run=None, gate_reasons=(), scope_reasons=()
     refused = getattr(run, "exec_refused", None)
     if refused:
         codes.append("executions_refused")
-    if getattr(run, "exec_calls", None) is None and run is not None:
+    # **ZERO IS THE FACT. `None` IS AN UNKNOWN AND CLAIMS NOTHING**, which is the rule `build`'s
+    # docstring states for every other field and which this one code broke — by testing `is None`, the
+    # exact opposite of the state its sentence describes.
+    #
+    # Measured 2026-09-02 by running both emitters rather than by reading the branch: `clipaid` never
+    # sets `exec_calls`, so this fired on EVERY deep run — the one place the sentence "this run
+    # executed nothing in the checkout" is reliably false, since acquiring a workdir compiles and runs
+    # the target. Meanwhile `exec_calls == 0`, the state it exists to report, emitted nothing at all.
+    #
+    # An unset counter is now silent. Saying "we executed nothing" because we did not count is the
+    # false-clean direction, and this whole array exists to answer "how do I know your clean is clean".
+    if getattr(run, "exec_calls", None) == 0:
         codes.append("no_execution")
     # A lever that did not register is only a LOSS when the workdir could have used it. The two facts
     # answer different questions and rendering the first alone told runs that lost nothing that they
@@ -350,4 +391,7 @@ def limits(findings, *, status: str, run=None, gate_reasons=(), scope_reasons=()
     if dropped:
         codes.append("findings_dropped")
     codes.append("no_coverage_statement")
-    return [{"code": c, "statement": LIMIT_STATEMENTS[c]} for c in codes]
+    # DEDUPED, order preserved. Arm 2 of `_gate_reasons` carries `witness_refused`, which the finding
+    # scan above emits too — one fact, two detectors, and a consumer reading a repeated row would count
+    # one limit twice.
+    return [{"code": c, "statement": LIMIT_STATEMENTS[c]} for c in dict.fromkeys(codes)]

@@ -1,6 +1,6 @@
 """Simple mode — diff-scoped source hunting, and the two tiers that keep it honest.
 
-the design notes This is the v1 shipping artefact and the free tier, so it is also
+The design notes. This is the v1 shipping artefact and the free tier, so it is also
 where a false positive would actually reach a customer first.
 
 ## The ordering that is the whole design
@@ -27,13 +27,13 @@ tier and it is the honest one.
 
 ## Why hypotheses are emitted at all
 
-A mode that reports nothing on most repositories is the onboarding failure the integration guideb
+A mode that reports nothing on most repositories is the onboarding failure the integration guide
 names, and silence is not rigour. They are emitted as `note`, they say on their face that they cannot
 fail a build, and `report.Finding.level` is what enforces it.
 
 ## Simple-safe
 
-Nothing here may import the separate package. the maintainers' suite measures it.
+Nothing here may import the separate package. The maintainers' suite measures it.
 """
 
 from __future__ import annotations
@@ -41,20 +41,27 @@ from __future__ import annotations
 import hashlib
 import pathlib
 import re
+import shlex
 import tempfile
 from dataclasses import dataclass, field, replace
 
 from shard.agentloop import ToolCallingLoop
 from shard.budget import BudgetGovernor
 from shard.diffscope import HUNK_RADIUS, prompt_safe
+from shard.inspection import build as build_inspection
 from shard.journal import Journal
 from shard.llm import classify_transport_error
-from shard.report import Finding
+# `_REPRODUCE_SH` and not a second copy of it: it was duplicated verbatim here for a day under a test
+# that pinned the two equal, and both copies carried the same missing `cd`. `shard/report.py` has the
+# measurement and the argument; this import edge already existed for `Finding`.
+from shard.report import _REPRODUCE_SH, Finding, head_revision, staged_relative
 from shard.sandbox import ExecState, build_exec_tools, exec_budget, scope_digest
 from shard.tools import Tool, ToolContext, ToolRegistry, ToolResult, _grep, _list_dir, _read_file
-from shard.witness import (BENIGN_SUFFIX, INHERITED, INTRODUCED, UNATTRIBUTED, Witness, WitnessSpec,
-                           adjudicate, attribute, entry_digest, observed_location,
-                           offered_expectations, self_defeating_marker, witness_contract)
+from shard.witness import (BENIGN_SUFFIX, INHERITED, INTRODUCED, SOURCE_ISOLATION_REFUSAL,
+                           UNATTRIBUTED, Witness, WitnessSpec, adjudicate, attribute, bounded_run,
+                           controls_digest, entry_digest, observed_location, offered_expectations,
+                           self_defeating_marker, witness_contract)
+from shard.witnessfs import SnapshotSet, SourceSnapshot
 
 DEFAULT_MAX_STEPS = 40
 
@@ -412,11 +419,46 @@ MAX_ADJUDICATED = 20
 ADJUDICATION_WALL_SECONDS = 1200.0
 
 
+@dataclass(frozen=True)
+class _AdjudicationPlan:
+    state: FindingState
+    repo: object
+    witness_entry: str | None
+    baseline_digest: str | None
+    runner: object
+    workdir: object
+    base_repo: object
+    tampered: str
+    max_witnessed: int
+    wall_seconds: float
+    clock: object
+    snapshots: SnapshotSet
+    secret_env_names: tuple[str, ...]
+
+
+def _adjudication_refusal(tampered: str, snapshot_refusal: str) -> str:
+    return tampered or snapshot_refusal
+
+
+def _isolation_outcome(witness: Witness, attribution: tuple[str, str], located):
+    if attribution[1].startswith(SOURCE_ISOLATION_REFUSAL):
+        # The base entry point shares an explicitly supplied witness work directory. An isolation
+        # failure can therefore mean that it replaced the candidate file the HEAD verdict carried.
+        # Refusing the gate but retaining that path would let `write_bundle` publish different bytes
+        # from the ones adjudicated, so an unverified candidate leaves no evidence path behind.
+        return replace(witness, demonstrated=False, refusal=attribution[1], input_path="",
+                       input_bytes=None), None
+    return witness, located
+
+
 def adjudicate_all(state: FindingState, repo, *, witness_entry: str | None,
                    baseline_digest: str | None, runner=None, workdir=None,
                    base_repo=None, tampered: str = "",
+                   source_snapshot: SourceSnapshot | None = None,
+                   base_snapshot: SourceSnapshot | None = None,
                    max_witnessed: int = MAX_ADJUDICATED,
-                   wall_seconds: float = ADJUDICATION_WALL_SECONDS, clock=None) -> list[Finding]:
+                   wall_seconds: float = ADJUDICATION_WALL_SECONDS, clock=None,
+                   secret_env_names: tuple[str, ...] = ()) -> list[Finding]:
     """Turn claims into findings. The ONLY place `gate_eligible` is ever set true.
 
     Runs after the loop has ended, so no proposal can be revised in response to a verdict.
@@ -461,47 +503,68 @@ def adjudicate_all(state: FindingState, repo, *, witness_entry: str | None,
     `time.monotonic` unless injected, and monotonic rather than wall so a clock step cannot hand a run
     an unbounded phase or cut a bounded one short.
     """
-    import subprocess
+    snapshots = SnapshotSet.prepare(repo, needed=bool(witness_entry), base_repo=base_repo,
+                                    source=source_snapshot, base=base_snapshot)
+    try:
+        plan = _AdjudicationPlan(
+            state, repo, witness_entry, baseline_digest, runner, workdir, base_repo, tampered,
+            max_witnessed, wall_seconds, clock, snapshots, secret_env_names,
+        )
+        return _adjudicate_captured(plan)
+    finally:
+        snapshots.close()
+
+
+def _adjudicate_captured(plan: _AdjudicationPlan) -> list[Finding]:
+    """Adjudicate from an already-owned snapshot pair; the caller always closes it."""
     import time as _time
 
-    runner = runner or subprocess.run
+    (state, repo, witness_entry, baseline_digest, runner, workdir, base_repo, tampered,
+     max_witnessed, wall_seconds, clock, snapshots, secret_env_names) = (
+        plan.state, plan.repo, plan.witness_entry, plan.baseline_digest, plan.runner, plan.workdir,
+        plan.base_repo, plan.tampered, plan.max_witnessed, plan.wall_seconds, plan.clock,
+        plan.snapshots, plan.secret_env_names,
+    )
+    runner = runner or bounded_run
     clock = clock or _time.monotonic
     started = clock()
     witnessed = 0
-
-    proposed = state.proposed
-    # (a) Which ordinals a later claim WITHDREW. `_supersedes_target` re-checks the strictly-earlier
-    # edge here because `adjudicate_all` is public and a hand-built claim (a test, a replay, the PR
-    # path) may carry a `supersedes` that never passed `_report_finding`'s guard.
-    superseded = {t for ordinal, claim in enumerate(proposed, start=1)
-                  if (t := _supersedes_target(claim, ordinal))}
-    # (b) Drop the withdrawn, then collapse byte-identical repeats to their FIRST occurrence. The
-    # ordinal is the ORIGINAL 1-based proposal index throughout — it is the handle the model was given,
-    # so it must not be re-numbered when earlier claims fall away.
-    survivors: list[tuple[int, dict]] = []
-    seen: set = set()
-    for ordinal, claim in enumerate(proposed, start=1):
-        if ordinal in superseded:
-            continue
-        key = tuple(sorted((k, repr(v)) for k, v in claim.items()))
-        if key in seen:
-            continue
-        seen.add(key)
-        survivors.append((ordinal, claim))
+    source_snapshot, base_snapshot = snapshots.source, snapshots.base
+    snapshot_refusal = snapshots.refusal(SOURCE_ISOLATION_REFUSAL)
+    pristine_repo = snapshots.repository(repo)
+    # THE CONTROLS THIS PHASE STARTED WITH, and it is taken HERE rather than threaded from
+    # `run_simple` on purpose. `run_simple`'s `watched` digest covers the LOOP and refuses every
+    # witness through `tampered` when it mismatches; this covers ADJUDICATION, which is the window
+    # that was open. Taking it at this function's own entry makes the two windows tile with no gap,
+    # and gives the same protection to `adjudicate_all`'s other callers — a test, a replay, the PR
+    # path — none of which would have remembered a new argument.
+    #
+    # It is what `witness.adjudicate` compares against on every claim below. Without it, an entry
+    # point that deletes its own `.benign` fixtures while being run took a finding its declared
+    # control REFUTES to gate_eligible=True, and every later claim in the run with it.
+    baseline_controls = controls_digest(pristine_repo, witness_entry) if witness_entry else None
+    # ONE RESOLUTION FOR THE WHOLE PHASE, above the loop and beside the other fact taken at this
+    # function's own entry. Every finding below comes out of this one checkout, so a `git rev-parse`
+    # per claim would be the same answer bought N times; and taking it HERE gives it to
+    # `adjudicate_all`'s other callers — a test, a replay, the PR path — which is the argument
+    # `baseline_controls` above makes for itself.
+    revision = head_revision(repo)
 
     out: list[Finding] = []
-    for ordinal, claim in survivors:
+    for ordinal, claim in _surviving_claims(state.proposed):
         # (c) `seq` is the proposal ordinal; `corrects` is the earlier handle this claim withdrew, so
         # its finding can say it replaced something rather than leave the retraction implicit.
         corrects = _supersedes_target(claim, ordinal)
         witness = None
         located = None
         attribution = (UNATTRIBUTED, "")
-        if tampered and claim.get("witness_expectation"):
+        refusal = _adjudication_refusal(tampered, snapshot_refusal)
+        if refusal and claim.get("witness_expectation"):
             out.append(_to_finding(claim, Witness(demonstrated=False,
                                                   expectation=claim["witness_expectation"],
-                                                  refusal=tampered),
-                                   entry=witness_entry or "", repo=repo, seq=ordinal, corrects=corrects))
+                                                  refusal=refusal),
+                                   entry=witness_entry or "", repo=pristine_repo, seq=ordinal,
+                                   corrects=corrects, revision=revision))
             continue
         if witness_entry and claim.get("witness_expectation"):
             # THE CEILING IS CHECKED BEFORE THE PAYLOAD IS EVEN DECODED, because the thing being
@@ -512,7 +575,8 @@ def adjudicate_all(state: FindingState, repo, *, witness_entry: str | None,
                 out.append(_to_finding(claim, Witness(demonstrated=False,
                                                       expectation=claim["witness_expectation"],
                                                       refusal=ceiling),
-                                       entry=witness_entry, repo=repo, seq=ordinal, corrects=corrects))
+                                       entry=witness_entry, repo=pristine_repo, seq=ordinal,
+                                       corrects=corrects, revision=revision))
                 continue
             witnessed += 1
             # Decoded HERE and not at report time, because a claim reaching this public entry point may
@@ -526,25 +590,61 @@ def adjudicate_all(state: FindingState, repo, *, witness_entry: str | None,
                 out.append(_to_finding(claim, Witness(demonstrated=False,
                                                       expectation=claim["witness_expectation"],
                                                       refusal=str(e)),
-                                       entry=witness_entry, repo=repo, seq=ordinal, corrects=corrects))
+                                       entry=witness_entry, repo=pristine_repo, seq=ordinal,
+                                       corrects=corrects, revision=revision))
                 continue
             spec = WitnessSpec(entry=witness_entry, expectation=claim["witness_expectation"],
                                payload=payload, marker=claim.get("witness_marker") or "")
-            witness = adjudicate(spec, repo, baseline_digest=baseline_digest, runner=runner,
-                                 workdir=workdir)
+            witness = adjudicate(spec, repo, baseline_digest=baseline_digest,
+                                 baseline_controls=baseline_controls, runner=runner,
+                                 workdir=workdir, source_snapshot=source_snapshot,
+                                 secret_env_names=secret_env_names)
             # Only for a DEMONSTRATED witness. The output of a run that showed nothing is not evidence
             # of a defect anywhere, and moving an alert onto a line because of it would be attributing
             # a fault to an execution that did not find one.
             if witness.demonstrated:
+                # Absolute traces name the checkout path the customer supplied, not the private
+                # snapshot path. ``adjudicate`` verified every captured source entry in that checkout
+                # after execution, so resolving the location there does not execute against it.
                 located = observed_location(witness.evidence, repo, payload=spec.payload)
                 # ONLY for a demonstrated one, and for the same reason as `located`: re-running an
                 # input that showed nothing would answer a question nobody asked, at the price of a
                 # second execution of the customer's entry point per claim.
-                attribution = attribute(spec, base_repo, runner=runner, workdir=workdir)
-        out.append(_to_finding(claim, witness, entry=witness_entry or "", located=located, repo=repo,
-                               attribution=attribution, seq=ordinal, corrects=corrects))
+                attribution = attribute(
+                    spec, base_repo, runner=runner, workdir=workdir,
+                    source_snapshot=base_snapshot, protected_inputs=_protected_candidate(witness, spec),
+                    secret_env_names=secret_env_names,
+                )
+                witness, located = _isolation_outcome(witness, attribution, located)
+        out.append(_to_finding(claim, witness, entry=witness_entry or "", located=located,
+                               repo=pristine_repo,
+                               attribution=attribution, seq=ordinal, corrects=corrects,
+                               revision=revision))
     _separate_anchor_collisions(out)
     return out
+
+
+def _surviving_claims(proposed: list[dict]) -> list[tuple[int, dict]]:
+    """Drop withdrawn and byte-identical claims without renumbering their proposal handles."""
+    # Which ordinals a later claim WITHDREW. `_supersedes_target` re-checks the strictly-earlier edge
+    # because `adjudicate_all` is public and a hand-built claim may not have passed the tool guard.
+    superseded = {target for ordinal, claim in enumerate(proposed, start=1)
+                  if (target := _supersedes_target(claim, ordinal))}
+    survivors = []
+    seen = set()
+    for ordinal, claim in enumerate(proposed, start=1):
+        if ordinal in superseded:
+            continue
+        key = tuple(sorted((name, repr(value)) for name, value in claim.items()))
+        if key in seen:
+            continue
+        seen.add(key)
+        survivors.append((ordinal, claim))
+    return survivors
+
+
+def _protected_candidate(witness: Witness, spec: WitnessSpec):
+    return (("preserved witness input", pathlib.Path(witness.input_path), spec.payload),)
 
 
 def _adjudication_ceiling(witnessed: int, elapsed: float, max_witnessed: int,
@@ -585,7 +685,7 @@ def _separate_anchor_collisions(findings: list[Finding]) -> None:
     collapse into a SINGLE alert with an arbitrary winner (`report._sarif_result`). Simple mode's
     signature is `_anchor_signature`, a SOURCE-LOCATION identity keyed on the enclosing definition — so
     two genuinely distinct defects inside one function share it (the majority case measured in
-    `_source_anchor`). the separate capability can dedup blindly because `Verdict.signature` is a CRASH identity; this
+    `_source_anchor`). The separate capability can dedup blindly because `Verdict.signature` is a CRASH identity; this
     one is not, so a blind merge here would silently drop a possibly-demonstrated finding.
 
     Within each anchor group, findings at the SAME defect site — same `(location, line)` — are kept as
@@ -652,7 +752,8 @@ def _witness_never_judged(witness) -> str:
 
 
 def _to_finding(claim: dict, witness, entry: str = "", located=None, repo=None,
-                attribution=(UNATTRIBUTED, ""), *, seq: int = 0, corrects: int = 0) -> Finding:
+                attribution=(UNATTRIBUTED, ""), *, seq: int = 0, corrects: int = 0,
+                revision: str = "") -> Finding:
     """Build the finding. Optional claim fields are read with `.get`, and that is not defensive noise.
 
     `_report_finding` always writes every key, so production never needs it — but `adjudicate_all` is a
@@ -667,6 +768,11 @@ def _to_finding(claim: dict, witness, entry: str = "", located=None, repo=None,
     after what it followed. `corrects` is the earlier handle this claim withdrew (0 when none): its
     target was already dropped in `adjudicate_all`, so the message says it replaced something rather
     than leaving the retraction — the defect this batch exists for — implicit.
+
+    `revision` is `repo`'s `HEAD`, RESOLVED BY THE CALLER and not re-derived here, because it is one
+    fact about the run and this function is called once per surviving claim. It defaults to `""` for
+    the same callers `repo=None` defaults for — a hand-built claim from a test or a replay — and `""`
+    is what switches the bundle program's tree check off rather than a value it could fire on.
     """
     demonstrated = bool(witness is not None and witness.demonstrated)
     expectation = claim.get("witness_expectation") or ""
@@ -677,7 +783,7 @@ def _to_finding(claim: dict, witness, entry: str = "", located=None, repo=None,
         message += (f"\n\nDemonstrated: the declared entry point was executed with the reported input "
                     f"and {expectation} was observed.")
         # WHAT IT WAS CHECKED AGAINST, and the limit said OUT LOUD when there was nothing to check
-        # against. the design notes §P2b.1 offered three options for the `output_marker`
+        # against. The design notes §P2b.1 offered three options for the `output_marker`
         # false positive and its third — "say the limit out loud" — was required whichever of the other
         # two won, because what ships today is the limit undocumented. Measured on the real canary:
         # four BENIGN fixtures with no attack in them at all demonstrated at exit 0.
@@ -748,8 +854,6 @@ def _to_finding(claim: dict, witness, entry: str = "", located=None, repo=None,
         # customer's Security tab as three alerts of one rule labelled "Path traversal in
         # load_template", and the winner changes whenever the source does, because `rank`'s final key is
         # the fingerprint.
-        #
-        # This is the defect `Finding.rule_title` was added for — *"an instance id in a class field is a
         rule_title=_RULE_TITLES.get(expectation or "", "Reported without a demonstration"),
         message=message,
         gate_eligible=demonstrated,
@@ -790,21 +894,42 @@ def _to_finding(claim: dict, witness, entry: str = "", located=None, repo=None,
         replays=1 if witness is not None else 0,
         crash_count=1 if demonstrated else 0,
         # THE REPRODUCING INPUT, which is the product's first sentence and which simple mode did not
-        # attach. `witness.input_path` is the file the entry point was actually executed against, so
-        # `report.write_bundle` copies THAT rather than re-deriving a payload from the claim — the agent
-        # proposed it, the runner staged it, and the bundle carries the same bytes the verdict was
-        # reached on. Carried whenever a witness ran, since a candidate input for a refuted claim is
-        # still the fastest thing to hand a reviewer; `metadata.json` states which it is.
+        # attach. `input_path` is the preserved copy beside the file actually executed;
+        # `input_bytes` is filled only after the child and every control left that copy unchanged.
+        # The bundle writes the immutable bytes, not a same-UID path a later claim could replace.
+        # Carried whenever a witness ran, since a candidate input for a refuted claim is still the
+        # fastest thing to hand a reviewer; `metadata.json` states which it is.
         poc_path=(getattr(witness, "input_path", "") or None) if witness is not None else None,
+        poc_bytes=getattr(witness, "input_bytes", None) if witness is not None else None,
         # The ENTRY comes from the caller, not from the claim: `_report_finding` never wrote an `entry`
         # key, so `claim.get("entry", "")` was always empty and every gate-eligible finding shipped
         # `bash  <payload>` — a command with no script in it, in the artefact whose entire job is to let
         # somebody else reproduce the finding. Found on the first real container run, in a bundle that
         # had just failed a build.
-        reproduce_command=(f"bash {entry} ./input" if demonstrated and entry else ""),
+        #
+        # THAT FIX SUPPLIED THE SCRIPT AND LEFT THE TWO PATHS ANCHORED TO DIFFERENT DIRECTORIES, which
+        # is the same defect one layer in: a command with a script in it that still reproduces nothing.
+        # `_REPRODUCE_SH` has the measurement. `entry` is SHELL-QUOTED because this string is executed
+        # by a reviewer's shell rather than through the argv `adjudicate` uses, where a space or a `;`
+        # in a declared entry point is just a filename.
+        # `rev` RIDES WITH `entry` because the program needs both before it execs anything: without it
+        # a bundle replayed against another branch reproduces nothing at rc=0, which is the signature
+        # F3 was raised for. `report.head_revision` records the measurement; both values are
+        # shell-quoted because this string is written into a file the reviewer runs.
+        reproduce_command=(f"entry={shlex.quote(entry)}\nrev={shlex.quote(revision)}\n{_REPRODUCE_SH}"
+                           if demonstrated and entry else ""),
+        # WHAT THE VERDICT WAS REACHED AGAINST, carried whether or not a command was emitted: a bundle
+        # for a refuted claim holds a candidate input a reviewer may replay, and it deserves the same
+        # answer to "against which tree" that a demonstrated one gets.
+        revision=revision,
         # WHAT WAS OBSERVED. Captured, capped, and then dropped on the floor until 2026-08-08: the
         # report said "nonzero_exit was observed" and showed the reviewer nothing at all.
-        evidence=(getattr(witness, "evidence", "") or "") if witness is not None else "",
+        evidence=staged_relative((getattr(witness, "evidence", "") or ""),
+                                 getattr(witness, "input_path", "")) if witness is not None else "",
+        witness_expectation=expectation if demonstrated else "",
+        witness_marker=(claim.get("witness_marker") or "") if demonstrated else "",
+        witness_entry=entry if demonstrated else "",
+        witness_controls=tuple(getattr(witness, "controls", ()) or ()) if demonstrated else (),
         # THE PROPOSAL ORDINAL, so `rank` orders a correction after what it followed rather than by hash.
         seq=seq,
     )
@@ -928,7 +1053,7 @@ class SimpleRun:
     findings, so `_cmd_diff` hardcoded `status="done"` for every run it ever made. A run whose model
     refused the prompt, whose budget ran out, or whose backend died therefore reported `done`,
     `findings: 0` and exit 0 — **indistinguishable from a clean review**, on the tier that ships first.
-    the design notes recorded this for the separate capability; it was worse here, because deep at least told
+    The design notes recorded this for the separate capability; it was worse here, because deep at least told
     the truth in its markdown.
 
     A record rather than a tuple because both halves are read at the call site and a bare pair invites
@@ -939,8 +1064,6 @@ class SimpleRun:
     status: str
     #: WHICH ceiling produced a `budget` status — `tokens`, `wall_seconds` or `usd`, and `""` when the
     #: run was not stopped by one.
-    #:
-    #: The same defect as the paragraph above, one field along, found on 2026-08-17 while closing it for
     limit_hit: str = ""
     #: How many executions the exec ceiling DENIED, or `None` when the run could not execute at all.
     #:
@@ -971,6 +1094,14 @@ class SimpleRun:
     #: "the ceiling refused nothing" is the ordinary case and would be a row nobody reads. `None`
     #: stays not-armed — a maintenance script's control arm depends on that distinction.
     exec_calls: int | None = None
+
+    #: Did the run use EVERY execution the ceiling allowed? Distinct from `exec_refused`, and the
+    #: distinction is what was missing: a refusal is proof the ceiling cut the run off, while spending
+    #: the last call is proof it MAY have. Measured 2026-09-03 — 24 of 24 used, `exec_refused: 0`,
+    #: `status: done`, the report saying `complete run`, and the agent's own final turn opening "I have
+    #: no tool budget left" at model turn 20 of an allowed 40. The model is handed `executions_left` on
+    #: every tool result, so it stops asking before it is ever refused. See `sandbox.ExecState.spent`.
+    executions_spent: bool | None = None
     #: WHY the model calls failed on an `error` status — a key of `report.TRANSPORT_ERROR_ADVICE`, or
     #: `""` when the run did not fail that way or the failure is not one we classify.
     #:
@@ -980,13 +1111,16 @@ class SimpleRun:
     #: the provider's own error string, and the record that reaches the report did not carry it on, so
     #: every transport failure arrived at the customer as one undifferentiated word.
     error_kind: str = ""
+    #: Source windows returned during this run, separate from scope and from security coverage.
+    inspection: dict | None = None
 
 
 def run_simple(*, repo, backend, journal: Journal, scope: tuple[str, ...] = (),
                witness_entry: str | None = None, model: str = "glm-5.2",
                max_steps: int = DEFAULT_MAX_STEPS, governor: BudgetGovernor | None = None,
                survey_note: str = "", runner=None, loop_factory=None,
-               windows=None, base_repo=None, execution: bool = True) -> SimpleRun:
+               windows=None, base_repo=None, execution: bool = True,
+               secret_env_names: tuple[str, ...] = ()) -> SimpleRun:
     """Hunt the diff, then adjudicate. Returns findings ready for `shard/report.py`, and the status.
 
     `loop_factory` is injected for the same reason the separate package injects `replay` and `build_registry`:
@@ -999,7 +1133,7 @@ def run_simple(*, repo, backend, journal: Journal, scope: tuple[str, ...] = (),
     anything.
 
     It is a parameter rather than a constant because the maintainers' notes arm A needs a control, and
-    a control that has to be produced by editing the source is a control nobody runs. the maintainers' notes's
+    a control that has to be produced by editing the source is a control nobody runs. The maintainers' notes's
     rule against configuration nobody sets is satisfied by something setting it: a maintenance script
     --compare-execution` is the only caller that ever will, and `--no-execution` on the CLI is how it
     reaches here.
@@ -1008,17 +1142,38 @@ def run_simple(*, repo, backend, journal: Journal, scope: tuple[str, ...] = (),
     the capability is removed and the flag with it. A permanently-on-by-default ablation switch is a
     dead option, which is the thing the maintainers' notes forbids one line above the one that permits this.
     """
+    # BEFORE the model receives a shell. Capturing after ``loop.run`` would preserve exactly the
+    # helper/entry forgery this boundary exists to remove.
+    # Every model-facing read root uses the same credential-free source boundary as execution. GitHub
+    # Actions may persist a composed Basic header in ``.git/config``; environment redaction cannot
+    # recognize it, and a read-only run could otherwise retrieve it without invoking a subprocess.
+    snapshots = SnapshotSet.prepare(repo, needed=True, base_repo=base_repo)
+    if snapshots.failure:
+        journal.record("simple_snapshot_refused", error=snapshots.failure)
+        return SimpleRun(findings=[], status="error", error_kind="", exec_refused=None,
+                         exec_calls=None, executions_spent=None)
+    args = (repo, backend, journal, scope, witness_entry, model, max_steps, governor, survey_note,
+            runner, loop_factory, windows, base_repo, execution, secret_env_names)
+    try:
+        return _run_simple_captured(args, snapshots)
+    finally:
+        snapshots.close()
+
+
+def _run_simple_captured(args, snapshots: SnapshotSet) -> SimpleRun:
+    """The review after its head/base source boundary has been captured."""
+    (repo, backend, journal, scope, witness_entry, model, max_steps, governor, survey_note,
+     runner, loop_factory, windows, base_repo, execution, secret_env_names) = args
     state = FindingState()
+    source_snapshot, base_snapshot = snapshots.source, snapshots.base
+    pristine_repo = snapshots.repository(repo)
     # ALL THREE ROOTS, and the fix is one line because the DEFAULTS are the defect. `ToolContext` was
     # written for a developer machine: `shard_root` falls back to `Path(__file__).parent.parent` and
     # `audit_root` to a hardcoded absolute path outside the repository, and `_read_allowed_roots` returns all
     # three. Setting only `engine_root` therefore granted the agent Shard's own source. Measured
     # 2026-08-12 (an internal audit Finding 2), on the shipping path:
     #
-    #     roots granted : ['<the repo>', '<the shard checkout>', '<the hardcoded audit root>']
-    #     read_file('<abs>/shard/witness.py').ok : True     <- the module that GRADES the run
-    #
-    # In the shipped image `shard_root` is `/app`, where `build_free_tree.py` puts 20 files including
+    # In the shipped image `shard_root` is `/app`, where the free build script puts 20 files including
     # `witness.py`, `simple.py`, `report.py` and `cli.py`, and `audit_root` ships as a developer's home
     # directory literal inside the customer's artefact.
     #
@@ -1027,9 +1182,9 @@ def run_simple(*, repo, backend, journal: Journal, scope: tuple[str, ...] = (),
     # defeats it — read the grader, then forge the grade — which is the CRITICAL finding on the same
     # page. It also converts the known `output_marker` false positive from latent to strategic: the
     # agent learns from `adjudicate` that the baseline runs on an EMPTY payload.
-    #
-    # the separate package has collapsed these to the workdir since the §6 fix and the maintainers' suite
-    ctx = ToolContext(engine_root=repo, shard_root=repo, audit_root=repo)
+    ctx = ToolContext(engine_root=pristine_repo, shard_root=pristine_repo,
+                      audit_root=pristine_repo,
+                      secret_env_names=secret_env_names, immutable_read_roots=True)
 
     # THE EXECUTION HALF, added 2026-08-19. `shard/sandbox.py` carries the measurement that bought it;
     # the short version is that this agent had four tools and none of them could run anything, inside a
@@ -1046,14 +1201,15 @@ def run_simple(*, repo, backend, journal: Journal, scope: tuple[str, ...] = (),
     # is a parameter of this function, so the number was always in scope here; nothing needed
     # threading, it simply was not asked for.
     exec_state = (ExecState(scratch=tempfile.mkdtemp(prefix="shard-exec-"),
-                            max_calls=exec_budget(max_steps))
+                            max_calls=exec_budget(max_steps), secret_env_names=secret_env_names,
+                            source_snapshot=source_snapshot)
                   if execution else None)
     registry = build_simple_registry(ctx, state, witness_entry=witness_entry,
-                                     exec_state=exec_state, repo=repo, runner=runner)
+                                     exec_state=exec_state, repo=pristine_repo, runner=runner)
 
     # Taken BEFORE the loop. `witness.adjudicate` refuses when it no longer matches, so a run that
     # somehow altered the thing grading it is refused rather than believed.
-    baseline = entry_digest(repo, witness_entry) if witness_entry else None
+    baseline = entry_digest(pristine_repo, witness_entry) if witness_entry else None
     # THE SAME GUARD, WIDENED TO WHAT A SHELL CAN REACH. `entry_digest` protected the entry point back
     # when the loop had no way to touch it; `run` does. The surface that matters is the files a finding
     # may point at — the changed files — plus the WITNESS CONTRACT, which is the entry point and the
@@ -1076,6 +1232,7 @@ def run_simple(*, repo, backend, journal: Journal, scope: tuple[str, ...] = (),
                    system=_system(scope, witness_entry, survey_note, windows, execution=execution),
                    model=model,
                    max_steps=max_steps, governor=governor)
+    inspection_start = journal.step
     result = loop.run(_goal(scope))
     # `getattr` because `loop_factory` is an injection point and a test double may return None. The
     # fallback is "error", never "done": a loop that returned something we cannot read did not tell us
@@ -1113,14 +1270,22 @@ def run_simple(*, repo, backend, journal: Journal, scope: tuple[str, ...] = (),
     # all; a treatment run that refused nothing was genuinely unconstrained. Those are different facts
     # and trap 7 is what happens when one integer stands for both — the same reason `network` says
     # "not-armed" here rather than "unknown".
-    journal.record("simple_exec", armed=exec_state is not None,
-                   calls=exec_state.calls if exec_state else 0,
-                   entry_calls=exec_state.entry_calls if exec_state else 0,
-                   shell_calls=exec_state.shell_calls if exec_state else 0,
-                   network=exec_state.network if exec_state else "not-armed",
-                   budget=exec_state.max_calls if exec_state else 0,
-                   refused=exec_state.refused if exec_state else None,
-                   exhausted=exec_state.exhausted if exec_state else None)
+    # ONE `is None` TEST FOR EIGHT FIELDS. Written as eight ternaries it was eight branches against
+    # this function's cap of 20, and adding the ninth field tripped the ratchet — which is the ratchet
+    # working: the shape was already the problem. The defaults differ by field on purpose, and the
+    # reason is trap 7 in this file's own header: `0` is a real answer for a count and a lie for a
+    # ceiling that was never armed, so an unarmed run reports `None` where a zero could not be told
+    # from a measurement.
+    ex = exec_state
+    journal.record("simple_exec", armed=ex is not None,
+                   calls=ex.calls if ex else 0,
+                   entry_calls=ex.entry_calls if ex else 0,
+                   shell_calls=ex.shell_calls if ex else 0,
+                   network=ex.network if ex else "not-armed",
+                   budget=ex.max_calls if ex else 0,
+                   refused=ex.refused if ex else None,
+                   exhausted=ex.exhausted if ex else None,
+                   spent=ex.spent if ex else None)
 
     # THE SAME DENOMINATOR, FOR THE OTHER ACCUMULATION MECHANISM. `state.py` feeds what we already
     # believe about this codebase into the SYSTEM message through `survey_note`, on every run since it
@@ -1148,13 +1313,32 @@ def run_simple(*, repo, backend, journal: Journal, scope: tuple[str, ...] = (),
 
     journal.record("simple_proposed", count=len(state.proposed), status=status)
     findings = adjudicate_all(state, repo, witness_entry=witness_entry, baseline_digest=baseline,
-                              runner=runner, base_repo=base_repo, tampered=tampered)
+                              runner=runner, base_repo=base_repo, tampered=tampered,
+                              source_snapshot=source_snapshot, base_snapshot=base_snapshot,
+                              secret_env_names=secret_env_names)
     journal.record("simple_adjudicated", findings=len(findings),
                    gate_eligible=sum(1 for f in findings if f.gate_eligible))
+    # THE SAME ONE TEST, for the same reason as the journal record above.
+    exec_facts = ({"exec_refused": exec_state.refused, "exec_calls": exec_state.calls,
+                   "executions_spent": exec_state.spent} if exec_state else
+                  {"exec_refused": None, "exec_calls": None, "executions_spent": None})
     return SimpleRun(findings=findings, status=status, limit_hit=limit_hit,
                      error_kind=error_kind,
-                     exec_refused=exec_state.refused if exec_state else None,
-                     exec_calls=exec_state.calls if exec_state else None)
+                     inspection=_inspection(journal, inspection_start, scope, pristine_repo, windows),
+                     **exec_facts)
+
+
+def _inspection(journal, start, scope, repo, windows):
+    """A retained transcript may predate this scan; only events after its start belong to it.
+
+    A failed journal read leaves an unknown, never an inventory claiming that no files were read.
+    Source paths are normalized before the immutable snapshot is removed, without reopening source.
+    """
+    try:
+        events = (event for event in journal.events() if event.get("step", 0) > start)
+        return build_inspection(scope, events, repo=repo, windows=windows)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
 
 
 def _system(scope: tuple[str, ...], witness_entry: str | None, survey_note: str,
@@ -1192,7 +1376,7 @@ def _system(scope: tuple[str, ...], witness_entry: str | None, survey_note: str,
 def _scope_clause(scope: tuple[str, ...], windows) -> str:
     """The changed files, and WHERE in them the change is.
 
-    the design notes: the measured commit changed one line of a 7,980-line file and was priced as
+    The design notes: the measured commit changed one line of a 7,980-line file and was priced as
     a full-file audit, because the scope named the file and the line numbers — already parsed — never
     reached the agent. This is the cheap half of that: tell it where the change is.
 
@@ -1205,7 +1389,7 @@ def _scope_clause(scope: tuple[str, ...], windows) -> str:
     untrusted pull request. Git C-quotes control characters in a path regardless of `core.quotePath`,
     `diffscope._header_path` decodes them faithfully so that `café.c` opens, and a filename containing
     real newlines therefore wrote its own paragraph here on every diff run — no state repository, no
-    prior survey, nothing to opt into. an internal audit Finding 3 has the transcript;
+    prior survey, nothing to opt into. An internal audit Finding 3 has the transcript;
     `prompt_safe`'s docstring has the reasoning and the residual.
     """
     windows = windows or {}

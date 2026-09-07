@@ -2,7 +2,7 @@
 
 ## Why this exists, and what it cost to find
 
-a measured run.1. Run against a real working checkout, `survey` emitted **200
+A measured run.1. Run against a real working checkout, `survey` emitted **200
 candidates and not one of them was in the customer's source.** All 200 came from
 `.claude/worktrees/`, which that repository gitignores, and which held 139 MB of duplicated snapshots
 of the same files. `preflight` on the same tree reported **28,674 files and 305 MB against a truth of

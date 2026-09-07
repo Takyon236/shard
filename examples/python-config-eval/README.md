@@ -11,17 +11,20 @@ You do not need Shard, a key, or a model to check that this entry point is sound
 the single most useful thing you can do before wiring one up in your own project.
 
 ```bash
+set -euo pipefail
 cd examples/python-config-eval
 
 bash .shard/entry.sh /dev/null                              # silent, exit 0   <- the baseline
 bash .shard/entry.sh .shard/entry.sh.benign/ordinary.conf   # silent, exit 0
 bash .shard/entry.sh .shard/entry.sh.benign/malformed.conf  # silent, exit 0
 
-printf 'x = __import__("os")\n' > /tmp/attack.conf
-bash .shard/entry.sh /tmp/attack.conf                       # SHARD_SETTINGS_ARBITRARY_CODE
+attack_input="$(mktemp)"
+printf 'x = __import__("os")\n' > "$attack_input"
+bash .shard/entry.sh "$attack_input"                       # SHARD_SETTINGS_ARBITRARY_CODE
+rm -f -- "$attack_input"
 ```
 
-**Those five lines are the whole contract.** An entry point that prints its marker on the first three
+**That sequence is the whole contract.** An entry point that prints its marker on the first three
 demonstrates nothing, because Shard's baseline run and its benign controls produce the same output —
 and a finding built on it is refused rather than reported. Getting this right is what separates a
 finding that fails a build from one that stays a hypothesis.
@@ -31,17 +34,20 @@ finding that fails a build from one that stays a hypothesis.
 `survey` needs no key, no endpoint and no network:
 
 ```bash
-shard survey --repo examples/python-config-eval --out-dir /tmp/shard-out
+set -euo pipefail
+example_out="$(mktemp -d)"
+shard survey --repo . --out-dir "$example_out"
 ```
 
 `preflight` tells you what a review would need and what it would cost, and — because this directory
 declares an entry point — that something here can actually gate a build:
 
 ```bash
-shard preflight --repo examples/python-config-eval --witness-entry .shard/entry.sh
+shard preflight --repo . --witness-entry .shard/entry.sh
 ```
 
-A full `diff` review needs a model endpoint and a key. See the repository README.
+A full `diff` review needs a model endpoint and a key. Continue with the
+[endpoint step](../../docs/getting-started.md#3-verify-the-endpoint).
 
 ## The two decisions worth copying
 

@@ -1,6 +1,6 @@
 """The entry point — the single external consumer surface, and what closes C4.
 
-the integration guide flagged the problem this resolves: the GitHub Action was going to become
+The integration guide flagged the problem this resolves: the GitHub Action was going to become
 a SECOND external consumer alongside the predecessor project's maintenance tooling, leaving the package
 with two entry points and the maintainers' notes's first-listed trap live in both. The benchmark driver and the
 product now run the same path, which is the only arrangement in which a green benchmark is evidence
@@ -10,15 +10,15 @@ about the product rather than about itself.
     python -m shard deep --repo . --workdir ...  acquire a workdir, run the solver, report
 
 
-the separate package is imported inside the deep subcommand's function body and nowhere else. That is not a
-startup optimisation. the design notes, "Protecting the harness": the free image ships simple mode and
+The separate package is imported inside the deep subcommand's function body and nowhere else. That is not a
+startup optimisation. The design notes, "Protecting the harness": the free image ships simple mode and
 must contain nothing of that capability, and if the two share an import closure the free tier gives
-the jewel away with no later protection recovering it. the maintainers' suite asserts this file's
+the jewel away with no later protection recovering it. The maintainers' suite asserts this file's
 closure directly, so a convenient top-level `from the separate package import ...` fails the suite rather than
 shipping.
 
 `preflight` is therefore fully available in the free image, which is correct — it is the onboarding and
-pricing instrument (the integration guideb) on every tier.
+pricing instrument (the integration guide) on every tier.
 
 ## The exit-code contract, which is the "does not break the build" promise
 
@@ -40,17 +40,14 @@ and reporting it as a security finding would be a false positive of the most ann
 
 
 import argparse
+import hashlib
 import json
 import os
 import pathlib
 import sys
-import tempfile
 
 
 #: **THE OPTIONAL CAPABILITY PACKAGE, named ONCE.** `""` in a build that does not carry it.
-#:
-#: `preflight` asks two questions it may not be able to answer: what this runner can do, and which
-#: harness kinds apply. Both answers live in a package the free artefact excludes, so both sites used
 #:
 #: One name, in one place, that the build can empty. `_optional_probe` reads it and returns None when
 #: it is blank, so the free artefact's preflight answers exactly as it did — *this build cannot say* —
@@ -79,7 +76,7 @@ def _optional_probe(module: str):
 # — the maintainers' suite's reachability probe, and the two modules that shipped as dead weight
 # because their imports sat inside `_emit`'s body — moved to `cliemit.py` with the code it is about.
 #
-# TWO LINES, NOT ONE, and that is load-bearing. `build_free_tree._drop_orphaned_imports` removes a
+# TWO LINES, NOT ONE, and that is load-bearing. The free build script removes a
 # module-scope `from x import y` whose name nothing uses any more, and it handles single-name,
 # unaliased lines ONLY. `_write_artefact`'s sole caller here is `_cmd_fix`, which the free build
 # drops — so sharing a line with `_emit` it would survive unused, which is an F401 in the published
@@ -97,7 +94,7 @@ def _optional_probe(module: str):
 # commands that cross the tier line. This file keeps `preflight`, `survey` and `action`, the exit
 # contract, and the helpers all of them share.
 #
-# ONE NAME PER LINE, and the paid three are why. `build_free_tree` drops their `_HANDLERS` rows and
+# ONE NAME PER LINE, and the paid three are why. The free build script drops their `_HANDLERS` rows and
 # then `_drop_orphaned_imports` removes each now-unused single-name import — which is what lets
 # a module this build does not carry be absent from the free artefact ENTIRELY rather than shipped with its functions
 # cut out. A grouped import would survive the row drop with two of three names unused.
@@ -199,15 +196,12 @@ def _cmd_preflight(args) -> int:
         "deep_capability_in_this_build": deep_available,
         "applicable_harness_kinds": kinds,
         "deep": _mode_verdict(profile, kinds, deep_available),
-        # THE MACHINE, answered where a customer asks BEFORE paying for a run rather than only in the
-        #
         # `None` in the free image rather than an invented answer: the probe lives behind the mode
         # split, and a preflight that guessed would be asserting something it did not measure.
         "machine": _machine_payload() if deep_available else None,
-        # THE SAME QUESTION FOR THE FREE TIER, which had no answer at all. `machine` above is deep-only
         "runtimes": probe_runtimes(profile.languages),
         # **WHAT IT WILL COST THE CUSTOMER, and what tier they are on.**
-        # the integration guideb designates preflight the pricing instrument — *"preflight
+        # the integration guide designates preflight the pricing instrument — *"preflight
         # becomes the pricing instrument"* — and it profiled the repository and said nothing about
         # money, which is the half the commercial model was built on
         # (an internal audit). COGS ≈ 0 is true and irrelevant to the buyer: they
@@ -226,7 +220,7 @@ def _cmd_preflight(args) -> int:
     if args.probe_endpoint:
         # **§6c'S OWN SENTENCE: "preflight refuses rather than producing a bad run."** Opt-in because
         # it costs one real request and preflight is otherwise free — a profiling command that quietly
-        # spends money is worse than one that has to be asked. an internal audit.
+        # spends money is worse than one that has to be asked. An internal audit.
         from shard.llm import probe_endpoint
 
         payload["endpoint"] = probe_endpoint(_backend(args), model=args.model,
@@ -262,6 +256,9 @@ def _cmd_survey(args) -> int:
                         deep_available=deep_available, languages=set(profile.languages))
 
     payload = to_payload(scan, assessment)
+    payload["mode"] = "survey"
+    payload["status"] = "done"
+    payload["findings"] = 0
     # THE SLUG WHEN WE HAVE ONE, exactly as `_cmd_diff` names its target. `str(repo)` inside the
     # action is `/github/workspace`, a path in OUR container: true of the mount, and unattributable.
     # Measured 2026-08-13 on a real scan of urllib3 — the artefact this writes said
@@ -279,25 +276,42 @@ def _cmd_survey(args) -> int:
     summary = summarise(scan, assessment)
 
     if args.out_dir:
+        from shard.artefactfs import atomic_write, trusted_directory
         from shard.report import _report_id, build_survey_markdown
 
         out = pathlib.Path(args.out_dir)
-        out.mkdir(parents=True, exist_ok=True)
-        (out / "shard-survey.json").write_text(json.dumps(payload, indent=2, sort_keys=True),
-                                               encoding="utf-8")
+        survey_bytes = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
         # **THE HUMAN ARTEFACT, STILL OPEN row 19.** Survey is the mode a customer meets first and it
         # wrote JSON and nothing else; the summary below reached a step log that GitHub deletes with
         # the runner. `shard-report.md` and not `shard-survey.md` deliberately — `action.yml` declares
         # ONE `report-path` output, and a workflow that uploads or comments it should not have to
         # branch on the mode to find the file.
         report = out / "shard-report.md"
-        report.write_text(build_survey_markdown(summary, target=args.slug or str(repo),
-                                                truncated=scan.truncated,
-                                                report_ident=_report_id(),
-                                                witness_entry=args.witness_entry or ""),
-                          encoding="utf-8")
+        # `assessment.ranked` AND NOT `payload["candidates"]`, though both are to hand. The payload is
+        # capped at its own limit for a consumer that parses it; the report takes its own, smaller cap
+        # off the full ranking, so the two artefacts stay independently correct rather than one being
+        # a truncation of the other's truncation.
+        # `files_read_in_part` TRAVELS WITH `truncated`, and the two are different ceilings. The trust
+        # row read `truncated` alone, so a scan that stopped part-way through ten files printed
+        # `trust | complete scan` eight lines above its own blind spot saying every count was a floor
+        # for them. Measured on `facebook/zstd` and `libgit2`, both 2026-09-02. See `_survey_trust`.
+        report_bytes = build_survey_markdown(
+            summary, target=args.slug or str(repo), truncated=scan.truncated,
+            partial_files=scan.files_read_in_part, report_ident=_report_id(),
+            ranked=assessment.ranked, witness_entry=args.witness_entry or "",
+        ).encode("utf-8")
+        with trusted_directory(out, create=True) as (_trusted_out, out_fd):
+            atomic_write(out_fd, "shard-survey.json", survey_bytes)
+            atomic_write(out_fd, report.name, report_bytes)
         payload["written"] = str(out / "shard-survey.json")
-        payload["artefacts"] = {"survey": str(out / "shard-survey.json"), "report": str(report)}
+        payload["artefacts"] = {
+            "survey": str(out / "shard-survey.json"),
+            "report": str(report),
+            "sha256": {
+                "survey": hashlib.sha256(survey_bytes).hexdigest(),
+                "report": hashlib.sha256(report_bytes).hexdigest(),
+            },
+        }
 
     if args.json:
         print(json.dumps(payload, indent=2, sort_keys=True))
@@ -305,20 +319,6 @@ def _cmd_survey(args) -> int:
         print(f"repository   {args.slug or repo}")
         print(summary)
     return EXIT_OK
-
-
-def _scratch_dir(out_dir: str | None) -> pathlib.Path:
-    """Somewhere we may write. `out_dir` when the caller named one, otherwise a temp directory.
-
-    The one thing this must never return is the current working directory: on a CI runner that IS the
-    repository under review, and the decision that we never write there is what makes the state-repo
-    design coherent in the first place.
-    """
-    if out_dir:
-        path = pathlib.Path(out_dir)
-        path.mkdir(parents=True, exist_ok=True)
-        return path
-    return pathlib.Path(tempfile.mkdtemp(prefix="shard-run-"))
 
 
 def _machine_payload() -> dict | None:
@@ -337,7 +337,7 @@ def _machine_payload() -> dict | None:
 
 
 def _mode_verdict(profile, kinds: list[str], deep_available: bool) -> dict:
-    """that capability's verdict for this repository, in the vocabulary the integration guideb fixed.
+    """that capability's verdict for this repository, in the vocabulary the integration guide fixed.
 
     `unsupported` and `degraded` are different answers and conflating them would be the free-target
     audit's §2 again: a repository we decline is not the same as one we can analyse with less leverage,
@@ -347,7 +347,6 @@ def _mode_verdict(profile, kinds: list[str], deep_available: bool) -> dict:
         return {"available": False, "verdict": "unsupported",
                 "reason": "this build does not carry that capability"}
     if not kinds:
-        # ONE STEP AWAY, not a refusal. A repository that ships cargo-fuzz targets is the BEST possible
         cargo = cargo_fuzz_targets(profile)
         if cargo:
             example = cargo[0].name
@@ -366,11 +365,6 @@ def _mode_verdict(profile, kinds: list[str], deep_available: bool) -> dict:
                            f".shard/test_poc.sh"),
                 "cargo_fuzz_targets": [t.name for t in cargo],
             }
-        # NAME THE CODE WE ARE REFUSING TO LOOK AT. The cargo-fuzz branch above exists because listing
-        # a capability and declining in the same breath is the worst answer available; this is the same
-        # rule for the case where the missing piece is genuinely the CUSTOMER's to supply. Measured on
-        # NousResearch/hermes-agent 2026-08-21: 7,131 files, `c=3` in a tally, and one real hand-written
-        # C tokeniser — `native/fts5_cjk/fts5_cjk.c`, a UTF-8 decoder, exactly what this mode is for. A
         if profile.native_sources:
             shown = ", ".join(profile.native_sources[:3])
             more = len(profile.native_sources) - 3
@@ -382,7 +376,8 @@ def _mode_verdict(profile, kinds: list[str], deep_available: bool) -> dict:
                            f"{shown}{f', and {more} more' if more > 0 else ''}\n"
                            f"it needs an entry point that takes ONE argument, an input file, and "
                            f"exercises that code. Declare it at .shard/test_poc.sh\n"
-                           f"start from: shard preflight --repo . --entry-template > .shard/entry.sh"),
+                           f"start from: mkdir -p .shard && shard preflight --repo . "
+                           f"--entry-template > .shard/test_poc.sh"),
                 "native_sources": list(profile.native_sources),
             }
         return {"available": True, "verdict": "unsupported",
@@ -460,6 +455,12 @@ def _report_payload(report) -> dict:
             # Tri-state, and it reaches the payload as one. `null` means the control replay was never
             # run — which is always the answer from `preflight`, since deciding it needs a subprocess.
             "control_crashed": report.control_crashed,
+            # THE TWO FACTS `verdict` NOW TURNS ON for a customer's own harness: can a fault reach us
+            # AS a fault, statically and then as measured. A payload carrying the verdict and not what
+            # decided it leaves a customer reading `degraded` with no field to check it against.
+            # `exec_tail` is null iff there is no harness; `marker_printed` is null when nobody ran
+            # one, which is always the answer from preflight.
+            "exec_tail": report.exec_tail, "marker_printed": report.marker_printed,
             "reasons": list(report.reasons)}
 
 
@@ -494,7 +495,7 @@ __all__ = ["DEEP_FAIL_ON_CHOICES", "EXIT_CONFIG", "EXIT_GATED", "EXIT_OK", "FAIL
 
 # `python -m shard.cli` — AND IT USED TO SCAN NOTHING AND EXIT 0.
 #
-# a measured run.1 logged this as an environment trap that cost time. It is worse
+# A measured run.1 logged this as an environment trap that cost time. It is worse
 # than a trap. `python -m shard.cli diff --repo . --base-ref main` is a plausible thing to write in a
 # pipeline — it names the module the documentation talks about — and with no `__main__` guard Python
 # imported this file, defined `main`, called nothing, and exited **0**. For a security gate, exit 0 with

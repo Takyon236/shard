@@ -17,13 +17,24 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Iterator
 
+from .artefactfs import append_file, read_file, trusted_directory
+
+# A default 40-step run records well below 1 MiB after the observation clamp; 64 MiB preserves
+# hundreds of such turns while refusing a sparse or accumulated resume log before allocating it.
+_MAX_JOURNAL_BYTES = 64 * 1024 * 1024
+
 
 class Journal:
     """Append-only JSONL event log with content-keyed result caching for resume."""
 
     def __init__(self, path: Path, *, now=time.time) -> None:
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        # Capture the trusted parent before any model-controlled tool runs. Re-resolving ``self.path``
+        # later would let a run_bash-created parent link redirect both resume reads and record appends.
+        self._root = self.path.parent.resolve()
+        self._name = self.path.name
+        self._directory = trusted_directory(self._root, create=True)
+        _path, self._parent_fd = self._directory.__enter__()
         self._now = now
         self._step = 0
         self._results: dict[str, Any] = {}
@@ -33,15 +44,20 @@ class Journal:
         # A/B could not be attributed to a mechanism that may never have run. Deliberately scoped to this
         # process (not seeded from a resumed file): the question it answers is "did this run fire it".
         self._counts: Counter = Counter()
-        if self.path.exists():
-            self._load()
+        try:
+            raw = self._bytes()
+        except Exception:
+            self.close()
+            raise
+        if raw is not None:
+            self._load(raw)
         # Keys present BEFORE this process started — i.e. results from a prior (interrupted) run.
         # Only these are eligible for resume reuse; results recorded during THIS run must not be
         # served back as a "cache hit" (a same-run repeat call should re-execute, not go stale).
         self._loaded_keys: set[str] = set(self._results)
 
-    def _load(self) -> None:
-        for ev in self.events():
+    def _load(self, raw: bytes) -> None:
+        for ev in self._events(raw):
             self._step = max(self._step, int(ev.get("step", 0)))
             if ev.get("type") == "tool_result" and "key" in ev:
                 self._results[ev["key"]] = ev.get("result")
@@ -50,8 +66,8 @@ class Journal:
     def record(self, type: str, **data: Any) -> dict:
         self._step += 1
         ev = {"step": self._step, "ts": self._now(), "type": type, **data}
-        with self.path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(ev, default=str) + "\n")
+        encoded = (json.dumps(ev, default=str) + "\n").encode("utf-8")
+        append_file(self._parent_fd, self._name, encoded)
         self._counts[type] += 1
         return ev
 
@@ -79,15 +95,38 @@ class Journal:
         return set(self._loaded_keys)
 
     # --- read ---------------------------------------------------------------
+    def _bytes(self) -> bytes | None:
+        try:
+            return read_file(self._parent_fd, self._name, max_bytes=_MAX_JOURNAL_BYTES)
+        except FileNotFoundError:
+            return None
+
+    def close(self) -> None:
+        """Release the parent descriptor retained across hostile tool executions."""
+        directory = getattr(self, "_directory", None)
+        if directory is not None:
+            self._directory = None
+            directory.__exit__(None, None, None)
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
     def events(self) -> Iterator[dict]:
-        if not self.path.exists():
+        data = self._bytes()
+        if data is None:
             return
+        yield from self._events(data)
+
+    @staticmethod
+    def _events(data: bytes) -> Iterator[dict]:
         # Resume must survive the exact failure it exists for: a crash mid-``record`` leaves the
         # LAST line half-written (O_APPEND writes one line at a time, so only the tail can tear).
         # Tolerate a malformed FINAL line by skipping it; a malformed NON-final line is genuine
         # mid-file corruption — re-raise rather than silently mask it.
-        with self.path.open(encoding="utf-8") as fh:
-            lines = [s for s in (line.strip() for line in fh) if s]
+        lines = [s for s in (line.strip() for line in data.decode("utf-8").splitlines()) if s]
         last = len(lines) - 1
         for i, line in enumerate(lines):
             try:

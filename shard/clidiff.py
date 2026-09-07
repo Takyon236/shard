@@ -18,9 +18,9 @@ declared exception; this module is not on that list and must never join it.
 ## Why the shared helpers are imported inside the function bodies
 
 `shard/cli.py` imports this module at module scope, to build its handler table. So a module-scope
-`from shard.cli import _backend` here would be a cycle. The four names this module borrows —
-`_backend`, `_existing_dir`, `_scratch_dir`, `_applicable_kind_names` — are therefore imported where
-they are used, which is also how every command in this package has always reached `shard.simple`,
+`from shard.cli import _backend` here would be a cycle. The three names this module borrows —
+`_backend`, `_existing_dir`, `_applicable_kind_names` — are therefore imported where they are used,
+which is also how every command in this package has always reached `shard.simple`,
 `shard.diffscope` and `shard.witness`.
 
 The alternative was a shared module holding those four. It was rejected: it would have been named for
@@ -30,6 +30,7 @@ the maintainers' notes's "a module names one job" rule exists to prevent.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import pathlib
 import tempfile
@@ -41,12 +42,66 @@ from shard.climeter import _max_steps
 from shard.climeter import _scan_payload
 from shard.climeter import _spend
 from shard.cliprint import _cost_line
-from shard.gate import exit_code, is_new_finding
+from shard.gate import EXIT_CONFIG, ConfigError, exit_code, is_new_finding
 from shard.journal import Journal
 from shard.target import profile_repo
 
 
-def _gate_reasons(findings, *, fail_on: str, scope_reasons: list[str], changed, introduced) -> list[str]:
+@contextlib.contextmanager
+def _diff_journal(args):
+    """The raw transcript for one diff run, with ownership deciding its lifetime.
+
+    An explicit path is the operator's retained diagnostic and is closed but never removed here. The
+    default is a mode-0700 temporary directory owned by this invocation; telemetry and the redacted run
+    log consume it before this context exits, then ``TemporaryDirectory`` removes the raw source-bearing
+    transcript on success or error. The Action exposes no explicit path, so it can take only that owned
+    branch.
+    """
+    supplied = getattr(args, "journal_path", None)
+    if supplied:
+        path = pathlib.Path(supplied)
+        if args.out_dir and path.resolve().is_relative_to(pathlib.Path(args.out_dir).resolve()):
+            raise ConfigError(
+                "--journal-path must be outside --out-dir: the raw transcript contains model "
+                "reasoning and source returned by tools")
+        owner = contextlib.nullcontext()
+    else:
+        owner = tempfile.TemporaryDirectory(prefix="shard-journal-")
+
+    with owner as private:
+        path = path if supplied else pathlib.Path(private) / "shard_journal.jsonl"
+        journal = Journal(path)
+        try:
+            yield journal
+        finally:
+            journal.close()
+
+
+class GateReason(str):
+    """A caveat sentence, carrying the LIMIT CODE it maps to in `resultdoc.LIMIT_STATEMENTS`.
+
+    A `str` everywhere it was already read — `report.build_markdown` interpolates it, `--json`
+    serialises it, `resultdoc._gate` calls `str()` on it — so no consumer changed. What it adds is the
+    one thing a sentence cannot carry: WHICH arm produced it.
+
+    **Measured 2026-09-02.** `resultdoc.limits` mapped the PRESENCE of any reason onto
+    `gate_not_evaluated`, whose statement is "the gate could not be evaluated on this run, so the exit
+    code is not a verdict". Arms 2 and 3 fire on runs whose gate ran and gated, and arm 3 requires
+    `is_new_finding`, which requires `gate_eligible` — so it can fire ONLY on a run that exits 1. The
+    sentence telling a dashboard to discount the exit code was emitted only ever on builds Shard had
+    correctly failed. A `str` subclass rather than a parallel list of codes because two lists that must
+    stay in step is this repository's most-recorded defect class; here the code and the sentence are
+    one object, constructed together, and cannot drift.
+    """
+
+    def __new__(cls, code: str, text: str) -> "GateReason":
+        reason = super().__new__(cls, text)
+        reason.code = code
+        return reason
+
+
+def _gate_reasons(findings, *, fail_on: str, scope_reasons: list[str], changed,
+                  introduced) -> list[GateReason]:
     """Why the gate did what it did, in the customer's words. Three arms, each a way a run can be
     LESS conclusive than its exit code suggests.
 
@@ -66,16 +121,17 @@ def _gate_reasons(findings, *, fail_on: str, scope_reasons: list[str], changed, 
     # come back — rather than the presence of a reason, so a caveat can never disable the gate again.
     diff_unread = bool(scope_reasons) and not changed
 
-    gate_reasons: list[str] = []
+    gate_reasons: list[GateReason] = []
     if diff_unread:
-        gate_reasons.append(
+        gate_reasons.append(GateReason(
+            "gate_not_evaluated",
             "fail-on new could NOT be evaluated: the diff was not read, so no finding can be "
             "attributed to this change and the gate did not fire. This is a degraded run, not a "
             "clean one — see scope_reasons for why git could not answer"
             if fail_on == "new" else
             f"the diff was not read, so this run reviewed no changed code and fail-on "
             f"{fail_on} had nothing to judge. This is a degraded run, not a clean one — see "
-            f"scope_reasons for why git could not answer")
+            f"scope_reasons for why git could not answer"))
 
     # **A WITNESS THAT NEVER GOT A VERDICT, ANNOUNCED AT THE RUN LEVEL — 2026-08-18.**
     #
@@ -94,10 +150,11 @@ def _gate_reasons(findings, *, fail_on: str, scope_reasons: list[str], changed, 
     refused = [f for f in findings if getattr(f, "witness_refused", "")]
     if refused:
         why = sorted({f.witness_refused.split(".")[0].strip() for f in refused})
-        gate_reasons.append(
+        gate_reasons.append(GateReason(
+            "witness_refused",
             f"{len(refused)} of {len(findings)} finding(s) proposed a witness that was NEVER "
             f"ADJUDICATED, so this run judged less than it looks: {'; '.join(why[:3])}. The "
-            f"gate-eligible count is a FLOOR — those findings were not refuted, they were not tried")
+            f"gate-eligible count is a FLOOR — those findings were not refuted, they were not tried"))
 
     # THE OTHER WAY `new` SILENTLY DOES NOT FIRE, and it needs no broken diff to happen.
     #
@@ -145,32 +202,87 @@ def _gate_reasons(findings, *, fail_on: str, scope_reasons: list[str], changed, 
     # caveat on a diff that exists, and suppressing this arm there would hide a real claimed-line
     # warning on exactly the runs most likely to need it.
     if fail_on == "new" and claimed and not diff_unread:
-        gate_reasons.append(
+        gate_reasons.append(GateReason(
+            "gate_on_claimed_location",
             f"{claimed} finding(s) were counted as new on the agent's claim rather than on a measured "
             f"location: the demonstration produced no source location — a successful exploit is often "
             f"SILENT, exiting 0 with no stack — and the base revision could not be re-run to check the "
             f"claim causally. They are demonstrated defects; what rests on the agent's word is that "
-            f"THIS change introduced them")
+            f"THIS change introduced them"))
     return gate_reasons
 
 
-def _cmd_diff(args) -> int:
+def _delivered_verdict(findings, written: dict, introduced, gate_new: int, status: str) -> dict:
+    """The gate inputs after reproduction bundles have actually reached disk."""
+    delivery = written.get("delivery") or {}
+    if not delivery:
+        return {"failed": False, "findings": findings, "new": gate_new, "status": status,
+                "state_findings": findings}
+
+    from shard.report import cap, finding_names
+
+    kept, _dropped = cap(findings)
+    names = set(delivery.get("delivered") or ())
+    delivered = [f for f, name in zip(kept, finding_names(kept)) if name in names]
+    delivered_new = sum(1 for f in delivered if is_new_finding(f, introduced))
+    failed = bool(delivery.get("failed_required"))
+    return {"failed": failed, "findings": delivered, "new": delivered_new,
+            "status": "error" if failed else status,
+            "state_findings": [f for f in findings if not f.gate_eligible] + delivered}
+
+
+def _delivery_exit(delivery: dict, payload: dict, fail_on: str) -> int:
+    """A missing required bundle is run-integrity failure, even when no finding gate was requested."""
+    if delivery["failed"]:
+        return EXIT_CONFIG
+    return exit_code(bool(payload["gate_eligible"]), fail_on, new=bool(delivery["new"]),
+                     status=str(payload.get("status") or "error"))
+
+
+def _counterfactual_base(args, repo: pathlib.Path,
+                         scope_reasons: list[str]) -> pathlib.Path | None:
+    """Materialise the base tree only for a gate with a witness to replay there.
+
+    This is a separate acquisition phase rather than another branch in ``_cmd_diff``: the main
+    pipeline hunts in the current checkout, while this tree exists solely to answer the later causal
+    attribution question. Keeping the condition beside the acquisition also makes the cost boundary
+    visible — report-only and reproduced gates must not archive a second checkout.
+    """
+    if args.fail_on != "new" or not args.witness_entry:
+        return None
+
+    from shard.diffscope import base_tree
+
+    base_dir = pathlib.Path(tempfile.mkdtemp(prefix="shard-base-")) / "tree"
+    return base_tree(repo, args.base_ref, base_dir, reasons=scope_reasons)
+
+
+def _cmd_diff(args, journal: Journal | None = None) -> int:
     """The pull request as an entry point: read the survey, scope to the diff, hunt, write back.
 
-    the design notes This is the FREE tier and the v1 shipping artefact, so nothing
-    in this function may import the separate package — the mode split is enforced by that absence and measured
+    The design notes. This is the FREE tier and the v1 shipping artefact, so nothing
+    in this command may import the separate package — the mode split is enforced by that absence and measured
     by the maintainers' suite.
 
     The order is load-state → scope → hunt → EMIT → write-state, and the emit comes before the write
     deliberately: the SARIF, the report and the bundles are the deliverable, and a state repository
     that is unreachable must cost the customer a bookkeeping line, never a finding or a build.
     """
+    # The DEFAULT is never the working directory OR `out_dir`. The latter is explicitly
+    # customer-forwardable, while this file holds model reasoning and source returned by tools. The
+    # Action used to put both in one directory, so the documented `upload-artifact: path: shard-out/`
+    # exfiltrated the transcript even though every public output path correctly named only its redacted
+    # derivatives. A direct CLI operator may retain it elsewhere only by passing `--journal-path`.
+    if journal is None:
+        with _diff_journal(args) as owned:
+            return _cmd_diff(args, owned)
+
     # From the dispatcher, INSIDE the body: `shard/cli.py` imports this module at module scope to
     # build its handler table, so a module-scope import back would be a cycle. See the module
     # docstring for why a shared module holding these was rejected rather than written.
-    from shard.cli import _backend, _existing_dir, _scratch_dir
-    from shard.diffscope import (HUNK_RADIUS, base_tree, hunk_windows, introduced_line_index,
-                                 load_diff, scope_paths, summarise)
+    from shard.cli import _backend, _existing_dir
+    from shard.diffscope import (HUNK_RADIUS, hunk_windows, introduced_line_index, load_diff,
+                                 scope_paths, summarise)
     from shard.simple import run_simple
     from shard.state import survey_note
     from shard.witness import offered_expectations
@@ -187,23 +299,18 @@ def _cmd_diff(args) -> int:
     changed = load_diff(repo, args.base_ref, reasons=scope_reasons)
     scope = scope_paths(changed)
 
-    # NEVER the working directory. On a runner the CWD is the customer's checkout, and
-    # the design notes is explicit that we do not write there — a stray
-    # `shard_journal.jsonl` dirties their working tree for every later step in their own workflow.
-    # `out_dir` is where our artefacts already go; without one, scratch.
-    journal = Journal(_scratch_dir(args.out_dir) / "shard_journal.jsonl")
     # Both held rather than built inline, because the run's cost is read off them AFTER the hunt. The
     # free tier is the tier with the ceilings in `action.yml` and it was the tier with no meter:
     # the ≈$0.29 of the first real diff run was obtainable only from OpenRouter's billing API, never
-    # from the product. the design notes
+    # from the product. The design notes.
     backend = _backend(args)
     diff_budget = _budget(args)
     governor = BudgetGovernor(diff_budget)
-    # WHERE in each file the change is, not only which files. the design notes: the line numbers
+    # WHERE in each file the change is, not only which files. The design notes: the line numbers
     # were parsed all along and stopped at `scope_paths`, so a one-line change in a 7,980-line file was
     # priced as a full-file audit. `--hunk-radius 0` restores the old behaviour exactly, which is what
     # makes the two comparable on the same commit.
-    # DEFAULT ON, at `HUNK_RADIUS`, and the numbers that earned it are in the design notes
+    # DEFAULT ON, at `HUNK_RADIUS`, and the numbers that earned it are in the design notes.
     # On §7's own measured shape — one line changed in a 6,895-line xmlparse.c — it cut 795,519 tokens
     # to 476,601 and $0.0977 to $0.0564 at an identical step count. On the risk §7 raised against it —
     # a defect 69 lines OUTSIDE the window — it was found and gated 3 times out of 3, anchored on the
@@ -214,7 +321,7 @@ def _cmd_diff(args) -> int:
     # THE FOURTH CEILING, and the one that actually bound the first real diff review this product ever
     # made. `DEFAULT_MAX_STEPS` was a module constant that `_cmd_diff` never passed, so no flag and no
     # action input could reach it: three ceilings were offered — dollars, minutes, tokens — and the run
-    # stopped on a fourth that was a literal. the design notes, "Found by the FIRST DOGFOOD RUN".
+    # stopped on a fourth that was a literal. The design notes, "Found by the FIRST DOGFOOD RUN".
     #
     # The DEFAULT IS UNCHANGED at 40. A default is a claim, and no measurement has chosen a different
     # number — one run of one diff says 40 was not enough for that diff, which is not a rate.
@@ -229,10 +336,7 @@ def _cmd_diff(args) -> int:
     # Under `reproduced` and `none` nothing reads it, so nothing is extracted and no entry point is
     # executed a second time. `base_reasons` joins `scope_reasons` because a base we could not obtain
     # is the same class of fact as a diff we could not read: the run answered less than it looks.
-    base_repo = None
-    if args.fail_on == "new" and args.witness_entry:
-        base_dir = pathlib.Path(tempfile.mkdtemp(prefix="shard-base-")) / "tree"
-        base_repo = base_tree(repo, args.base_ref, base_dir, reasons=scope_reasons)
+    base_repo = _counterfactual_base(args, repo, scope_reasons)
 
     run = run_simple(repo=repo, backend=backend, journal=journal, scope=scope,
                      witness_entry=args.witness_entry, model=args.model, max_steps=_max_steps(args),
@@ -245,6 +349,7 @@ def _cmd_diff(args) -> int:
                      survey_note="" if getattr(args, "no_survey", False) else survey_note(survey),
                      windows=windows,
                      base_repo=base_repo,
+                     secret_env_names=(args.api_key_env or "OPENROUTER_API_KEY",),
                      # THE CONTROL ARM. `getattr` because this entry point is reached by callers that
                      # build their own namespace (the action, and the tests), and an ablation flag
                      # must never be the reason a shipping path raises. Absent => the shipping
@@ -295,7 +400,7 @@ def _cmd_diff(args) -> int:
     #
     # **AND IT IS ANNOUNCED FOR EVERY `--fail-on` VALUE, not just `new`.** The narrow version was the
     # third defect landing on the same input, and again on customers who followed the documentation
-    # (an internal audit Finding 5): `CI-INTEGRATION.md` §4 advises `fetch-depth: 2`
+    # (an internal audit Finding 5): the integration guide §4 advises `fetch-depth: 2`
     # while `action.yml` and `README.md` advise `base_ref: <pull_request.base.sha>`, and when the base
     # has moved that SHA is outside the shallow window. Measured — `fatal: bad object`,
     # `scope_paths: ()`, `summarise: 'no changed files in scope'`, exit 0.
@@ -340,26 +445,28 @@ def _cmd_diff(args) -> int:
     written = _emit(findings, args.out_dir, status=run.status, target=args.slug or str(repo),
                     mode="diff", gate_reasons=gate_reasons, scope_reasons=scope_reasons, run=facts,
                     journal_path=journal.path)
-    outcome = _write_state(state, args, scope=scope, findings=findings,
+    delivery = _delivered_verdict(findings, written, introduced, gate_new, run.status)
+    outcome = _write_state(state, args, scope=scope, findings=delivery["state_findings"],
                            survey_payload=survey_payload, prior_reasons=state_reasons,
-                           status=run.status)
+                           status=delivery["status"])
 
     payload = {
         "mode": "diff",
         "scan": scan_facts,          # computed above for the header; one reading, one number
         # The RUN's own status, not a literal. It was `"done"` on every diff run ever made, including
-        # the ones that were not. the design notes
-        "status": run.status,
+        # the ones that were not. The design notes.
+        "status": delivery["status"],
         "limit_hit": getattr(run, "limit_hit", "") or "",
         "scope": summarise(changed),
         "examined": list(scope),
+        "inspection": facts.inspection,
         "findings": len(findings),
-        "gate_eligible": sum(1 for f in findings if f.gate_eligible),
+        "gate_eligible": sum(1 for f in delivery["findings"] if f.gate_eligible),
         # The `fail-on: new` view of the same findings: how many demonstrated ones sit on a line this
         # change introduced (`diffscope.introduced_line_index` — added lines plus deletion seams).
         # Always reported, whatever `--fail-on` says, so a report-only customer can see what the gate
         # WOULD have done before opting in.
-        "gate_new": gate_new,
+        "gate_new": delivery["new"],
         "gate_reasons": gate_reasons,
         "artefacts": written,
         "state": {"attempted": outcome.attempted, "ok": outcome.ok, "reasons": outcome.reasons},
@@ -386,9 +493,13 @@ def _cmd_diff(args) -> int:
         print(json.dumps(payload, indent=2, sort_keys=True))
     else:
         print(f"scope        {payload['scope']}")
+        if facts.inspection is not None:
+            from shard.inspectionview import summary
+
+            print(f"inspection   {summary(facts.inspection)}")
         for reason in scope_reasons:
             print(f"scope        {reason}")
-        print(f"status       {run.status}")
+        print(f"status       {payload['status']}")
         print(f"findings     {payload['findings']} "
               f"({payload['gate_eligible']} with a demonstration, the rest informational)")
         if payload["gate_eligible"]:
@@ -401,8 +512,7 @@ def _cmd_diff(args) -> int:
             print(f"state        {reason}")
     # `status=` because a run that ERRORED must not pass a gate the customer asked for. Read off the
     # payload rather than off `run`, so the exit code and the artefact cannot disagree about the run.
-    return exit_code(bool(payload["gate_eligible"]), args.fail_on, new=bool(gate_new),
-                      status=str(payload.get("status") or "error"))
+    return _delivery_exit(delivery, payload, args.fail_on)
 
 
 def _open_state(args):
@@ -509,6 +619,7 @@ def _diff_run_facts(args, run, *, spend: dict, scan_facts: dict, changed, tokens
 
     return RunFacts(
         base_ref=args.base_ref, files_reviewed=len(changed),
+        inspection=getattr(run, "inspection", None),
         # THE RUN'S OWN NUMBER, from the CI environment. `report.report_id` is pure and takes the env,
         # so this is the one line that reads it — see its docstring for why `GITHUB_RUN_NUMBER` beats a
         # counter we would have to store somewhere.
@@ -520,8 +631,14 @@ def _diff_run_facts(args, run, *, spend: dict, scan_facts: dict, changed, tokens
         # ignored its own rule.
         scan=scan_facts["kind"] if scan_facts["declared"] else "",
         scan_why=scan_facts["why"] if scan_facts["declared"] else "",
-        # WHICH CEILING STOPPED IT, ON THE FREE TIER TOO. `AgentResult.limit_hit` has carried the
         limit_hit=getattr(run, "limit_hit", "") or "",
+        # **AND WHETHER THE EXECUTION CEILING WAS SPENT, which no field carried.** `limit_hit` above
+        # names the ceiling that ENDED the loop; this names one that may have shortened it without
+        # ending it. Measured 2026-09-03: 24 of 24 executions used, `refused: 0`, `status: done`, and
+        # the report said `complete run` while the agent's own last turn opened "I have no tool budget
+        # left" at model turn 20 of an allowed 40. The model is handed `executions_left` on every tool
+        # result, so it stops asking rather than being refused — the ceiling binds in silence.
+        executions_spent=getattr(run, "executions_spent", None),
         # AND WHY, WHEN THE STOP WAS NOT A CEILING. The field above splits `budget` into three
         # resources because the customer's next action differs by which; this splits `error` the same
         # way, and the difference matters more — a revoked key, a spent balance and a mistyped model

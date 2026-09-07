@@ -1,6 +1,6 @@
 """What a pull request actually changed — the scope simple mode hunts inside.
 
-the integration guide: pull-request mode's scope is *"the diff, and what it reaches"*. This module
+The integration guide: pull-request mode's scope is *"the diff, and what it reaches"*. This module
 is the first half of that, and it is deliberately only the first half — see "What this does not do".
 
 ## The seam, and why the parser is pure
@@ -17,7 +17,7 @@ Everything that could be wrong is in the parser, and the parser never runs a pro
 ## Simple-safe
 
 Diff scoping is commodity — the design notes puts CI glue in the leave-in-Python column, and
-pull-request mode is the FREE tier. the maintainers' suite asserts this module's closure.
+pull-request mode is the FREE tier. The maintainers' suite asserts this module's closure.
 
 ## Why added lines specifically, and not the whole file
 
@@ -482,7 +482,7 @@ HUNK_RADIUS = 40
 def hunk_windows(files, *, radius: int = HUNK_RADIUS) -> dict[str, tuple[tuple[int, int], ...]]:
     """path -> the line ranges this change introduced, widened by `radius` and merged where they meet.
 
-    the design notes: the measured commit changed **one line** of a **7,980-line** file and was
+    The design notes: the measured commit changed **one line** of a **7,980-line** file and was
     priced as a full-file audit — 37 `read_file` calls and 18 `grep`s, ≈$0.29, for a version string in
     a comment. `scope_paths` scopes to changed FILES; the hunt then works the file. The line numbers
     were already parsed and simply never carried into scope.
@@ -549,7 +549,7 @@ def introduced_line_index(files) -> dict[str, frozenset[int]]:
     lines as introduced.
 
     **The 0/4 was a fact about one diff, not a property of the rule.** The canary's only deletion sits
-    on an *introduced* defect, so that measurement could never have caught this. the maintainers' notes's trap
+    on an *introduced* defect, so that measurement could never have caught this. The maintainers' notes's trap
     holds: a gate measured only on the shape where it is safe has not been tested.
 
     So the recall loss is accepted and stated: **3/5 rather than 4/5** on the canary PR run. The
@@ -606,7 +606,7 @@ def base_tree(repo, base_ref: str, dest, *, runner=subprocess.run, reasons=None)
 
     **`git archive`, NOT `git worktree add`, and the reason is the customer's repository.** A worktree
     is cheaper and it registers itself under `.git/worktrees/` — a write into the checkout we are
-    reviewing, left behind if the process dies. the design notes is explicit that we
+    reviewing, left behind if the process dies. The design notes is explicit that we
     do not write there, and `witness.adjudicate` already stages its payloads outside the checkout for
     the same reason. `git archive` reads and writes nothing.
 

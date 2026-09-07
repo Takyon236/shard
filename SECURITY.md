@@ -1,52 +1,122 @@
 # Security policy
 
-Shard is offensive security tooling. It holds real capability and it is designed to be run against
-systems the operator is authorised to test.
+Shard analyzes untrusted source, lets a model choose bounded shell commands and can run a repository
+witness. This page defines the data flow and containment boundary for teams deciding whether to install it.
 
-## Reporting a vulnerability in Shard itself
+## Version and availability
 
-Report privately rather than in a public issue, to <security@reyse.ai>, or use GitHub's private
-vulnerability reporting on this
-repository. Expect an acknowledgement within 72 hours.
+This policy describes the current v4 release candidate, not an earlier release. See [Getting
+started](docs/getting-started.md) for availability and exact source and Action revisions.
 
-Please include a reproducing input where you can. It is what we ask of our own tool.
+## Version scope
 
-## Scope
+This page describes the current `[Unreleased]` source tree. The intended v3.0.2 release bytes and its
+`@v3` major alias do not provide the immutable source snapshot, complete execution boundary, or Action
+handoff described below. The runnable v3.0.2 onboarding journey has its own narrower acceptance checks;
+a green v3.0.2 run is not evidence for any guarantee on this page. Treat these controls as unavailable
+to an installed Action until public availability is witnessed and a later major switches the install, Action and
+matching documentation together.
 
-In scope: the agent, the CI action, the report and reproduction-bundle generation, and anything that
-would let Shard act outside the boundary it was pointed at — the checkout it was given and the entry
-point the repository declared.
+## At a glance
 
-**Containment bypasses are the highest severity class in this project.** Reading or writing outside
-the checkout, or executing anything the repository did not declare, is treated as critical regardless
-of how contrived the setup.
+| Question | Answer |
+|---|---|
+| Where does Shard run? | In a container on a Linux CI runner you provide. |
+| Where does inference run? | At an endpoint you configure. Shard operates none. |
+| Does source leave the runner? | Source excerpts, diffs and tool results are sent to that endpoint. Optional delivery and state operations are listed below. |
+| Does repository code execute? | Yes. Diff mode offers a bounded shell; a declared witness also runs candidate and control inputs. |
+| Does that code have credentials or network? | It has no network and configured Shard credentials are removed. Do not place unrelated secrets in the Shard step. |
 
-### What confines this build, stated exactly
+## Network and data flow
 
-Two controls carry it, and both are asserted in the image at build time rather than documented as
-intent:
+| Destination | When contacted | Data sent |
+|---|---|---|
+| Configured model endpoint | Diff reviews | prompts containing the diff, selected source excerpts, tool results and prior model turns |
+| Configured model endpoint | opt-in `preflight --probe-endpoint` | a fixed tool-call probe and requested model identity; no repository source |
+| `api.github.com` or `GITHUB_API_URL` | only when `github_token` is supplied | report text, SARIF, repository/run identity and pull-request comment operations |
+| GitHub Actions artifact service | only when a later workflow step uses `upload-artifact` | the named report, result, SARIF, telemetry, log and finding bundles; reports, results, SARIF and bundles can contain source-derived data |
+| Configured state Git remote | only with `state_repo` | Shard's state commits through `git fetch` and `git push` operations |
 
-- **The analysis is confined to the checkout it is given.** The agent's read roots are the checkout,
-  and nothing else — including the code that grades its own findings, which it must not be able to
-  read.
-- **The image cannot be shadowed by the repository under review.** A container action runs with its
-  working directory set to the checkout, and Python puts that directory at the front of the module
-  search path. A repository containing a top-level `shard/` package would otherwise be imported and
-  executed *as the product*, as root, with the operator's inference key in the environment. The image
-  sets `PYTHONSAFEPATH` to remove that entry and proves during its own build that a decoy loses.
+Basic `survey` and basic `preflight` make no model request. Shard operates no inference or storage
+service. Configure egress for the trusted Shard process and separately for artifact upload. The model
+shell, witness, controls and compiler helpers have no network interface; if that namespace cannot be
+created, their execution is refused.
 
-**There is no network capability in this build.** No mode in this image opens a network connection to
-anything but the model endpoint you configure. There is consequently no network policy to describe
-here, and any egress beyond that endpoint is a reportable defect rather than a configuration question.
+## Source boundary
 
-**A witness entry point executes code from the repository under review**, by design — that is what
-turns a hypothesis into a reproduction. On a pull request from a fork this means executing a stranger's
-code with whatever the job holds, so treat declaring one there as a decision rather than a default.
+Before the model can read or execute repository content, Shard captures one immutable source view:
 
-Stated plainly because the alternative is worse: a safety property a user believes in and nothing
-enforces is a defect class in its own right, and it would be an odd thing to correct everywhere except
-the file where we ask other people to report ours.
+- regular files must have one link;
+- `.git` is omitted at every depth;
+- symlinks must resolve inside the checkout; and
+- sockets, FIFOs and device nodes are refused.
 
-## Using Shard
+`read_file`, `grep`, directory traversal, and every hostile execution use this snapshot rather than
+the live checkout. Capture failure stops the review instead of silently omitting or crossing the
+problematic path. The current structural outline tool is the recorded exception to this guarantee.
 
-Run it only against systems you are authorised to test.
+`SourceSnapshot.capture` has no internal entry-count, directory-depth, per-file-byte or aggregate-byte
+ceiling. Only the CI job or runner's memory, storage and time limits bound it; configure those limits
+before reviewing an untrusted repository shape.
+
+The snapshot is not a secret classifier. A regular credential file written under the checkout becomes
+source and can reach the model endpoint, so keep `.env`, `.npmrc` and job credentials outside the
+workspace. The snapshot omits `.git`; witnesses whose behavior depends on Git administration are not
+supported.
+
+## Execution boundary
+
+The outer Action container retains `SYS_ADMIN`, `DAC_OVERRIDE` and `SETPCAP` — no more — so a trusted
+initializer can create the boundary. All three are load-bearing and were measured one at a time:
+`SYS_ADMIN` alone cannot mount the private writable trial, and without `SETPCAP` the initializer
+cannot lock securebits, which is the step that takes the capabilities away again.
+Before any model-authored or repository-provided code starts, the initializer:
+
+- creates private PID, mount, proc and network namespaces;
+- exposes only read-only source and required runtimes, one writable scratch directory, private `/tmp`
+  and minimal devices;
+- omits the host root, container control sockets and GitHub command files;
+- removes the configured model and GitHub credentials, all `INPUT_*` values, credential-shaped names,
+  and control-socket variables;
+- closes ambient standard input;
+- clears effective, permitted, inheritable, ambient and bounding capability sets;
+- applies `no_new_privs`.
+
+Shard has no raw subprocess or PID-only fallback. If the complete boundary is unavailable, the run
+records a containment refusal and cannot turn that observation into a demonstrated finding.
+
+The analysis container retains those three capabilities only for the trusted namespace initializer. After that
+container exits, the Action uses a separate helper with `no_new_privs`, no network, and only `CHOWN` to
+validate file types and link counts and return output/publication ownership to the runner. That helper
+does not execute repository code.
+
+The job's own CPU, memory and time limits remain important. Untrusted code can consume resources within
+those outer limits. Side channels in the shared kernel and hardware are not claimed to be eliminated.
+
+The environment scrub is a denylist, not proof that every arbitrary variable is harmless. A secret
+with an unrelated, non-credential-looking name can remain available to repository code. Give the Shard
+step only the model key and GitHub token it needs.
+
+## Pull-request trust cases
+
+The documented workflow supports branches in the same repository. GitHub does not provide repository
+secrets to fork-originated `pull_request` jobs.
+
+Shard does not currently ship an automatic privileged fork workflow. Do not use `pull_request_target`
+or a standalone `workflow_run` recipe as a shortcut: restoring a model credential while processing an
+attacker-controlled change requires a separately reviewed, maintainer-approved protocol that proves
+both revisions and pull-request identity.
+
+## Reporting a vulnerability in Shard
+
+Do not open a public issue or include live credentials. GitHub private vulnerability reporting is not
+enabled, and no disclosure address or response-time commitment is active before launch. Wait for this
+page to name an active private channel before sending a vulnerability report.
+
+Include the affected version, environment, boundary crossed and a reproducing input or workflow.
+Containment escapes, credential exposure, source-boundary bypasses, forged gate evidence and
+release-integrity failures are in scope.
+
+## Authorized use
+
+Shard is offensive security tooling. Run it only against systems you are authorised to test.

@@ -42,7 +42,7 @@ by email, or a message on an official channel — excluding anything you
 conspicuously mark in writing as "Not a Contribution".
 
 **2. Copyright licence.**
-You grant Reyse and to recipients of software distributed by Reyse a perpetual,
+You grant Reyse and recipients of software distributed by Reyse a perpetual,
 worldwide, non-exclusive, no-charge, royalty-free, irrevocable copyright licence
 to reproduce, prepare derivative works of, publicly display, publicly perform,
 sublicense, and distribute your Contributions and such derivative works,
@@ -53,7 +53,7 @@ buried: it is what lets your Contribution ship in the commercial edition as well
 as in this one.
 
 **3. Patent licence.**
-You grant Reyse and to recipients of software distributed by Reyse a perpetual,
+You grant Reyse and recipients of software distributed by Reyse a perpetual,
 worldwide, non-exclusive, no-charge, royalty-free, irrevocable (except as stated
 in this section) patent licence to make, have made, use, offer to sell, sell,
 import and otherwise transfer the work. This licence applies only to those patent

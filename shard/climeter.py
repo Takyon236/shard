@@ -1,7 +1,7 @@
 """Every ceiling a run is given, and what it spent against them — the customer-facing half of
 `shard/budget.py`.
 
-Fourth cut of `BACKLOG.md` item 2. `budget.py` is the MECHANISM: `Budget`, `BudgetGovernor`, the
+Fourth cut of the maintainers' backlog item 2. `budget.py` is the MECHANISM: `Budget`, `BudgetGovernor`, the
 `ScanProfile` table, the debiting. This is the layer above it that a customer actually touches —
 seven flags, the four refusals, and the two payloads that report back.
 
@@ -28,7 +28,7 @@ hand, on a real run, by somebody who had just spent the day reading the file it 
 
 ## Where the tier line falls
 
-`_attempts` and `_max_findings` are deep-only and `build_free_tree` drops them from the free
+`_attempts` and `_max_findings` are deep-only and the free build script drops them from the free
 artefact; `shard/cli.py` imports each on its own line so the orphaned import goes with them. The
 other seven names are read by `_cmd_diff` and ship.
 """
@@ -66,7 +66,7 @@ def _refuse_a_token_ceiling_below_the_floor(asked: float, default_tokens: float 
     THREE THINGS IT DELIBERATELY DOES NOT TOUCH:
 
     * **Diff mode.** `_cmd_diff` calls `_budget` with no `default_tokens`, so `default_tokens is None`
-      is exactly "this mode has no measured deep ceiling to defend". a real repository's diff run finished on
+      is exactly "this mode has no measured deep ceiling to defend". A real repository's diff run finished on
       402,300 tokens; a 4M floor there would be a floor above the ceiling.
     * **`--scan followup`, whose profile is 400,000 tokens.** That is a MEASURED, named configuration
       for an incremental scan and the whole point of declaring one is that it *"genuinely overrides
@@ -154,7 +154,7 @@ def _max_steps(args) -> int:
     **AN UNSET FLAG TAKES THE SCAN PROFILE'S FLOOR, the same precedence `_budget` gives `--max-tokens`
     and `_max_findings` gives `--max-findings`.** Until 2026-08-21 `--scan initial` raised the token
     ceiling to 6,000,000 and left this at 40, so the profile moved the ceiling that was not binding and
-    left the one that was. a measured run is the measurement: the first real
+    left the one that was. A measured run is the measurement: the first real
     customer audit had to pass `--max-steps 200` by hand for a 300-file chunk, and a ceiling the
     operator must know to raise is not a profile — it is a trap with a default.
 
@@ -220,7 +220,7 @@ def _spend(backend, governor) -> dict:
     usage = getattr(backend, "usage_summary", None)
     usage = usage() if callable(usage) else {}
     priced = int(usage.get("priced_requests", 0) or 0)
-    return {
+    spend = {
         "usd": round(float(usage.get("cost_usd", 0.0) or 0.0), 6) if priced else None,
         "usd_ceiling": governor.budget.usd,
         "tokens_ceiling": governor.budget.tokens,
@@ -240,3 +240,6 @@ def _spend(backend, governor) -> dict:
         "seconds": round(governor.spent("wall_seconds"), 1),
         "seconds_ceiling": governor.budget.wall_seconds,
     }
+    if "token_reported_requests" in usage:
+        spend["token_reported_requests"] = int(usage.get("token_reported_requests", 0) or 0)
+    return spend

@@ -1,6 +1,6 @@
 """The customer deliverable — the report, the SARIF, and the reproduction bundle.
 
-the integration guide is the output contract. Three artefacts, and the ranking rule that keeps
+The integration guide is the output contract. Three artefacts, and the ranking rule that keeps
 them inside GitHub's limits.
 
 
@@ -20,7 +20,7 @@ anything without it. The check-run status is decided in `cli.py` from `SolveResu
 exactly one source, so this module cannot weaken that promise either — it can only fail to describe it.
 
 Hypotheses are still emitted, as `note`. A mode that reports nothing on most repositories is the
-onboarding failure the integration guideb names, and silence is not the same as rigour.
+onboarding failure the integration guide names, and silence is not the same as rigour.
 
 ## The source location, stated honestly
 
@@ -34,7 +34,7 @@ true statement: this harness reproduces a crash. It is not a claim about which l
 nothing here manufactures one. Anchoring a customer's Security tab on a guessed line would be a false
 positive in the most damaging possible place, and the whole product rests on findings being real.
 
-the design notes records what would close it: carry `_top_frames`' output on `Verdict` and thread it
+The design notes records what would close it: carry `_top_frames`' output on `Verdict` and thread it
 out of the solve. That is a change to the oracle and belongs in a commit that measures it.
 
 ## Ranking and capping
@@ -52,13 +52,24 @@ import json
 import pathlib
 import os
 import re
+import shlex
+import stat
+import subprocess
 import urllib.parse
 from dataclasses import dataclass, fields
 
+from shard.inspectionview import markdown as inspection_markdown
+
 # The shared prompt/report rendering boundary — see `diffscope.prompt_safe`. Used here for the ONE
 # place a model-written string becomes markdown structure rather than markdown prose: the heading.
+from shard.artefactfs import (atomic_write as _atomic_write,
+                              rooted_write,
+                              trusted_directory as _trusted_directory)
 from shard.target import HARNESS_NAME
-from shard.diffscope import prompt_safe
+# `safe_directory_argv` for `head_revision` — one more NAME on an import edge this module already has,
+# which is the same trade `_REPRODUCE_SH`'s collapse into one constant records. A container action runs
+# as root over a checkout owned by the runner's user, and without the exception git answers nothing.
+from shard.diffscope import prompt_safe, safe_directory_argv
 # MODULE SCOPE, and it has to be: `Finding.crash` is a property every writer here reads, so a lazy
 # import would run inside the render path on the customer's runner. Free-tier and stdlib-only, which
 # is what makes that safe — see `shard/crashstate.py` and `FREE_MODULES`.
@@ -74,7 +85,7 @@ _EVIDENCE_IN_REPORT = 1200
 
 #: The run statuses that mean **the audit finished**. Everything else — `error`, `budget`, `maxsteps`,
 #: `repeat` — means it stopped early, and a customer reading "no findings" is owed that difference.
-#: the design notes
+#: the design notes.
 #:
 #: One declaration, read by the markdown paragraph AND by the SARIF's `executionSuccessful`, because
 #: two spellings of "did this run finish" is how the machine-readable channel and the human one come to
@@ -91,8 +102,7 @@ COMPLETED_STATUSES = frozenset({"done", "audited"})
 #: is the whole value of the row.
 #:
 #: **KEYED, NOT DERIVED.** The kinds come from `llm.py` because that module owns the strings it builds;
-#: the wording lives here because this module owns what the customer reads. `tests/
-#: test_transport_error_kinds.py` pins that every kind has advice and every advice has a kind, so the
+#: the wording lives here because this module owns what the customer reads. The maintainers' suite pins that every kind has advice and every advice has a kind, so the
 #: two halves cannot drift into a run whose reason is classified and then rendered as nothing.
 #:
 #: The secret's NAME is not spelled here. Which environment variable holds the key is an installation's
@@ -117,9 +127,43 @@ TRANSPORT_ERROR_ADVICE: dict[str, str] = {
                 "That is an outage on the inference side, not a fault in your repository",
 }
 
+
+def _advice_sentence(advice: str) -> str:
+    """One entry of `TRANSPORT_ERROR_ADVICE`, rendered as standalone prose instead of a table cell.
+
+    The table is written for the cell: emphasis marks the phrase a scanning reader needs, the opening
+    word is lowercase because a `| stopped by |` row has no sentence in front of it, and there is no
+    terminal stop. A paragraph needs the opposite of all three. `_stopped_by` renders the entry
+    unchanged and is correct to; this is the only conversion, and it sits beside the table whose
+    convention it inverts rather than inside the paragraph, so the contract is stated where the
+    strings that must satisfy it are written.
+
+    **NEVER `str.capitalize()`.** It was the first fix and it damaged all six entries, because it
+    upper-cases the first character and LOWER-CASES EVERY OTHER ONE. Measured 2026-09-02 in the
+    shipped `shard-report.md` of a real `--model glm-5.2-typo` run: *"...would not serve the requested
+    model. check the `model` input..."*, and `rate` lost its *"Re-running"* the same way. The advice is
+    two sentences and only the first survived.
+
+    **The opening word is recased only when it is a WORD.** A cause can legitimately begin with a
+    lowercase identifier the customer has to copy — a model name (`glm-5.2`), a header (`x-api-key`),
+    a path (`.shard/entry.sh`) — and upper-casing one produces a string their provider does not know.
+    A missed capital is a cosmetic loss; a corrupted identifier is a wrong instruction, so the test is
+    biased to leave the text alone. `isalpha()` rejects the digit, dot, slash and hyphen; `islower()`
+    is the second half, and it is what keeps `vLLM` — a runtime this product's own README tells the
+    customer to point it at — from reaching them as `VLLM`.
+    """
+    plain = advice.replace("**", "")
+    opener = plain.split(" ", 1)[0].rstrip(",;:")
+    prose = opener.isalpha() and opener.islower()
+    return (plain[:1].upper() + plain[1:] if prose else plain) + "."
+
+
 #: A fingerprint is used as a PATH SEGMENT and as a code-scanning identity, so it may contain only
-#: characters that are safe in both. Anything else is hashed — see `Finding.fingerprint`.
-_SAFE_TOKEN = re.compile(r"[A-Za-z0-9._-]{1,64}")
+#: characters that are safe in both. A leading dot is unsafe even when it is not `.` or `..`: the
+#: shipped upload action excludes dot-path contents by default, so `.proof` succeeds locally and then
+#: silently loses its input in the hosted evidence artefact. Anything unsafe is hashed — see
+#: `Finding.fingerprint`.
+_SAFE_TOKEN = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}")
 
 #: WHY AN ALERT NAMES THE ENTRY POINT. **One declaration, read by the markdown note AND by the SARIF
 #: rule**, because two spellings of one disclaimer is precisely how these channels came to disagree: on
@@ -261,7 +305,7 @@ class Finding:
     """One thing to tell the customer. The shape both modes adapt into.
 
     `gate_eligible` is the only field that may affect a build's status, and it means exactly one thing:
-    a reproduction exists and was verified by something the agent could not write to. the separate capability sets it
+    a reproduction exists and was verified by something the agent could not write to. The separate capability sets it
     from `Verdict.reproduced`; simple mode sets it from a re-executed witness.
     """
 
@@ -273,12 +317,9 @@ class Finding:
     line: int = 1
     #: The CLASS's name, when `title` names this INSTANCE. Falls back to `title`, so a producer that has
     #: only one name keeps working.
-    #:
-    #: SARIF has per-result fields and per-rule fields, and a rule describes every alert of its class.
     rule_title: str = ""
     #: **THE LOCATION IS THE ENTRY POINT THAT REPRODUCES THIS, NOT THE SITE OF THE DEFECT.** Declared by
     #: the producer, never inferred by the renderer.
-    #:
     location_is_harness: bool = False
     #: The line was READ from the demonstration's own output, not taken from the agent's claim. Only a
     #: measured line may gate `fail-on:new`: an agent-claimed line on an introduced line would let the
@@ -309,21 +350,41 @@ class Finding:
     crash_count: int = 0
     doubts: tuple[str, ...] = ()
     poc_path: str | None = None              # the crashing input on disk, for the bundle
+    #: A verified immutable copy for simple-mode witnesses. Customer-authored entry points run with
+    #: the same UID as this process, so a path can change after adjudication; reopening it at report
+    #: time can never establish that the bytes copied are the bytes that were judged.
+    poc_bytes: bytes | None = None
     reproduce_command: str = ""
+    #: WHAT THE VERDICT WAS REACHED AGAINST — the checkout's `HEAD`, from `head_revision`, or `""` when
+    #: this run could not name one. Third of the three things `README.md` says a bundle ships, and the
+    #: one that was missing; `head_revision` has the measurement and what its absence costs.
+    #:
+    #: A RUN fact carried on the FINDING, and the alternative was worse. `RunFacts` is the record for
+    #: per-run context and it never reaches `write_bundle`, which sees a `Finding` and a destination —
+    #: so putting it there means either threading a second argument through `cliemit._emit` into every
+    #: bundle write, or having the writer re-derive the repository by walking up from `dest`. The walk
+    #: is a guess: `--out-dir` may sit outside the checkout, and the ancestor it would find then is a
+    #: tree the verdict was never reached in. The producer already holds the real one.
+    revision: str = ""
     container_digest: str = ""
     #: WHAT WAS OBSERVED — the output the entry point or the harness actually produced. Simple mode's
     #: counterpart to `sanitizer`, and never both: one is a crash report, the other is a captured
     #: stream, and they are the same claim from two mechanisms. It was captured, capped at 4,000
     #: characters, and then discarded: no report, no bundle, no payload carried it, so a reviewer was
-    #: told "nonzero_exit was observed" and shown nothing. the design notes, "Found by the first
+    #: told "nonzero_exit was observed" and shown nothing. The design notes, "Found by the first
     #: PAID container run".
     evidence: str = ""
+    #: The observation class and, for the marker arm, the exact marker that made this finding
+    #: demonstrable. Replay cannot infer either from an exit code: ordinary input rejection is often
+    #: non-zero, while an output-marker demonstration may exit zero.
+    witness_expectation: str = ""
+    witness_marker: str = ""
+    witness_entry: str = ""
+    witness_controls: tuple[str, ...] = ()
     #: WITHIN-RUN PROPOSAL ORDINAL — simple mode's 1-based order the claim behind this finding was
     #: proposed in. `rank` reads it as a STABLE tiebreak (below `replays`, above `fingerprint`) so a
     #: correction the model made after an earlier claim renders AFTER it, rather than wherever the two
     #: fingerprints happen to sort — the ordering half of the finding-revision batch.
-    #:
-    #: **It is a renderer hint, never an identity.** `fingerprint` ignores it, so de-duplication across
     seq: int = 0
 
     def __post_init__(self) -> None:
@@ -445,6 +506,58 @@ def cap(findings, limit: int = DEFAULT_SARIF_CAP) -> tuple[list[Finding], int]:
     return ordered[:limit], max(0, len(ordered) - limit)
 
 
+def finding_names(findings) -> list[str]:
+    """One name per finding, unique WITHIN a run: the fingerprint, numbered for a repeat.
+
+    ONE DERIVATION, READ BY BOTH SIDES, and it exists because there were two. `cliemit._emit`
+    numbered a repeated fingerprint's second bundle `<fp>-2` while `resultdoc._finding` re-derived
+    `bundles/<fp>` unconditionally, so the canonical result document sent a consumer replaying the
+    SECOND finding to the FIRST finding's input, and named the second directory in no artefact at
+    all. Measured 2026-09-02 through `simple.adjudicate_all` and `cliemit._emit`, on two
+    `fatal_signal` claims at one anchor: `bundles/42666e1d23297da8` (`b"AAA"`) and
+    `bundles/42666e1d23297da8-2` (`b"BBB"`) on disk, both `reproduced[]` entries reading
+    `bundles/42666e1d23297da8`, both `id`s `42666e1d23297da8`, and `-2` absent from the JSON, the
+    SARIF and the markdown alike.
+
+    A fingerprint repeats legitimately: identity names the defect SITE, so one defect demonstrated
+    through two channels is one fingerprint and must stay ONE code-scanning alert
+    (`simple._separate_anchor_collisions` keeps that collision on purpose). It is the WITHIN-RUN
+    name — a directory, a dictionary key — that has to distinguish them.
+
+    **Pass the CAPPED list, and pass the same one to both readers.** `cap` returns it already ranked
+    and `rank` is a stable sort on a total key, so re-ranking is the identity and the two callers
+    number the same findings in the same order. The suffix keeps the fingerprint's path-safe
+    character set (`_SAFE_TOKEN`), because these names are path segments.
+
+    Every kept finding is numbered, including one that gets no bundle written: a hypothesis with no
+    candidate input shares its anchor with the demonstration beside it, so leaving it out of the
+    count would hand two entries of one document the same `id` again.
+
+    **Reserve every base fingerprint before adding suffixes.** A run containing `fault`, `fault` and
+    the legitimate fingerprint `fault-2` used to allocate `fault`, `fault-2`, `fault-2`; the last
+    bundle removed and replaced the second one's proof. Stable cross-run identity remains the base
+    fingerprint. Only the within-run directory/id skips occupied base and generated names.
+    """
+    fingerprints = [f.fingerprint for f in findings]
+    reserved = set(fingerprints)
+    used: set[str] = set()
+    next_suffix: dict[str, int] = {}
+    names: list[str] = []
+    for fingerprint in fingerprints:
+        if fingerprint not in used:
+            name = fingerprint
+        else:
+            suffix = next_suffix.get(fingerprint, 2)
+            name = f"{fingerprint}-{suffix}"
+            while name in reserved or name in used:
+                suffix += 1
+                name = f"{fingerprint}-{suffix}"
+            next_suffix[fingerprint] = suffix + 1
+        used.add(name)
+        names.append(name)
+    return names
+
+
 # --- SARIF -------------------------------------------------------------------------------------------
 
 def build_sarif(findings, *, limit: int = DEFAULT_SARIF_CAP, status: str = "done") -> dict:
@@ -462,6 +575,13 @@ def build_sarif(findings, *, limit: int = DEFAULT_SARIF_CAP, status: str = "done
     says what happened, in the channel built for saying it.
     """
     kept, _dropped = cap(findings, limit)
+    # GROUPED BY RULE ID FIRST. The rule's `properties` must be true of every alert filed under it,
+    # and reading them off the first member stamped one defect's CWE and severity onto the whole
+    # bucket — which matters most for `shard/reproducing-input`, the neutral id 29 of the 42 crash
+    # classes fall into, spanning all three severity bands.
+    by_rule: dict[str, list] = {}
+    for f in kept:
+        by_rule.setdefault(f.rule_id, []).append(f)
     rules, seen = [], set()
     for f in kept:
         if f.rule_id in seen:
@@ -473,9 +593,14 @@ def build_sarif(findings, *, limit: int = DEFAULT_SARIF_CAP, status: str = "done
             "id": f.rule_id,
             "name": f.rule_id,
             "shortDescription": {"text": f.rule_title or f.title},
-            "defaultConfiguration": {"level": f.level},
+            # PER-RULE, and it was the last class-level field still read off ONE member. `rank` puts
+            # the gate-eligible findings first, so a bucket holding a demonstration and a refuted
+            # claim shipped `level: error` beside its own `problem.severity: recommendation` — one
+            # rule object contradicting itself in the two fields GitHub ranks and filters on.
+            "defaultConfiguration": {
+                "level": "error" if _rule_all_reproduced(by_rule[f.rule_id]) else "note"},
         }
-        rule["properties"] = _rule_properties(f)
+        rule["properties"] = _rule_properties(by_rule[f.rule_id])
         if f.location_is_harness:
             # THE SAME SENTENCE THE MARKDOWN CARRIES, in the channel a security team actually reads.
             # `_sarif_message`'s own docstring is that both channels must say the same thing, and the
@@ -514,11 +639,26 @@ def build_sarif(findings, *, limit: int = DEFAULT_SARIF_CAP, status: str = "done
     }
 
 
-def _rule_properties(f: Finding) -> dict:
+def _rule_all_reproduced(group) -> bool:
+    """Does EVERY alert of this rule carry a reproduction? The ONE predicate the rule's class-level
+    fields are decided by — `defaultConfiguration.level` here and `precision`/`problem.severity` in
+    `_rule_properties`.
+
+    It is a function rather than the expression written twice because those three fields ARE one
+    statement about the class, and they were made from two readings: the properties took the whole
+    group and the level took the FIRST member, so `rank` putting the gate-eligible finding first
+    produced a rule object saying `level: error` beside `problem.severity: recommendation` and
+    `precision: medium`. Measured 2026-09-02 in an emitted artefact, on a free-tier run with one
+    demonstrated and one refuted `output_marker` claim.
+    """
+    return all(f.gate_eligible for f in group)
+
+
+def _rule_properties(group: "list[Finding]") -> dict:
     """The rule's `properties` bag — the two fields GitHub code scanning RANKS and FILTERS on, plus
     the one that says how much to trust the alert.
 
-    the design notes A4: a Shard rule arrived in the Security tab carrying only a
+    The design notes A4: a Shard rule arrived in the Security tab carrying only a
     level, so an estate could neither sort it by severity nor slice it by weakness. That document
     calls this the *"smallest fix with the largest reporting payoff"* on the CISO's list, and the
     reason is that the design notes closes the question of building a control plane — GitHub IS
@@ -534,18 +674,35 @@ def _rule_properties(f: Finding) -> dict:
     from ClusterFuzz's bands unchanged. How sure we are that this particular alert is real is a
     different axis, and SARIF has a field for it. A Shard `error` always carries a reproducing input
     that was replayed, so it is `very-high`; a hypothesis is `note` and makes no such claim.
+
+    **AND IT TAKES THE WHOLE GROUP, because it used to take the FIRST finding and stamp its values on
+    every alert of the rule.** The invariant above was stated and not enforced. `_rule_id` returns the
+    neutral `shard/reproducing-input` for every crash class outside `_crash_title`'s eleven-string
+    list — 29 of the 42 classes `crashstate` can name, spanning all three severity bands — so on a
+    sweep with more than one defect in that bucket, every alert but one was filed in the customer's
+    Security tab under ANOTHER defect's CWE at ANOTHER defect's severity. Which one won was decided by
+    the oracle's behaviour-signature hash, through `rank`'s final tie-break.
+
+    A field that is not true of every member is DROPPED rather than guessed. An alert with no
+    `security-severity` sorts by `problem.severity` — GitHub's documented fallback — which is a worse
+    ranking than a correct number and a much better one than a confident wrong number.
     """
-    state = f.crash
+    states = [f.crash for f in group]
+    # The intersection, order-preserving from the first member so the output is stable.
+    common = set(states[0].tags).intersection(*(set(s.tags) for s in states[1:])) if states else set()
     props: dict = {
-        "tags": list(state.tags),
+        "tags": [tag for tag in states[0].tags if tag in common] if states else [],
         # CodeQL's convention, and the field GitHub falls back to when there is no security-severity.
-        "problem.severity": "error" if f.gate_eligible else "recommendation",
-        "precision": "very-high" if f.gate_eligible else "medium",
+        # ANY member that cannot gate pulls the rule down: claiming `very-high` precision for a bucket
+        # that contains an unreproduced hypothesis is the same overclaim one level up.
+        "problem.severity": "error" if _rule_all_reproduced(group) else "recommendation",
+        "precision": "very-high" if _rule_all_reproduced(group) else "medium",
     }
-    if state.security_severity:
+    severities = {s.security_severity for s in states if s.security_severity}
+    if len(severities) == 1 and len(severities) == len({s.security_severity for s in states}):
         # A STRING, which is the schema's type and not a stylistic choice: GitHub parses this field
         # as text and a JSON number is silently ignored, which loses the ranking without an error.
-        props["security-severity"] = state.security_severity
+        props["security-severity"] = severities.pop()
     return props
 
 
@@ -659,6 +816,12 @@ class RunFacts:
     trap 7, a zero you cannot distinguish from an unknown is a lie with a number on it.
     """
 
+    #: Did the run use every execution the ceiling allowed? `None` where the artefact cannot say, and
+    #: the three-way split is the point — see `sandbox.ExecState.spent`. A run that spent its whole
+    #: budget was reported as a `complete run` on 2026-09-03 while its own last turn opened "I have no
+    #: tool budget left", because the only signal anything read was `refused`, and the model is told
+    #: how many calls remain so it stops asking rather than being denied.
+    executions_spent: bool | None = None
     base_ref: str = ""
     files_reviewed: int | None = None
     witness_entry: str = ""
@@ -673,8 +836,6 @@ class RunFacts:
     scan: str = ""
     scan_why: str = ""
     #: WHAT THE REPOSITORY IS — measured by the same walk that decided the harness, never guessed.
-    #:
-    #: The report was **invisible to the repository it reviewed**: verdict, trust, gate, witness and
     target_files: int | None = None
     target_bytes: int | None = None
     target_languages: tuple[str, ...] = ()
@@ -691,16 +852,12 @@ class RunFacts:
     target_truncated: bool = False
     #: WHICH ceiling stopped the run — `tokens`, `wall_seconds`, `usd` — when one did. The status says
     #: `budget` for all three, and the advice a customer needs differs by which: raise `--max-minutes`
-    #: for the clock, `--max-tokens` for tokens. the maintainers' notes records the cost of telling a
+    #: for the clock, `--max-tokens` for tokens. The maintainers' notes records the cost of telling a
     #: customer to raise the wrong ceiling — `--max-spend-usd` is inert on an unpriced route, and
     #: `cli.py` advised raising it anyway.
     limit_hit: str = ""
     #: The flag THIS MODE offers for raising its step ceiling, or `""` when it offers none. Supplied by
     #: the caller, because the caller owns the parser and the renderer cannot know what a mode accepts.
-    #:
-    #: `status: maxsteps` is the one ceiling that names itself and still named no flag. It is the row
-    #: above's defect with the resource already known: the maintainers' notes records what advising the
-    #: wrong ceiling costs, and this is the case where advising a plausible one would be WORSE than
     #:
     #: Measured, not hypothetical: run `32017001496` on a real runner ended `maxsteps` at 592,240 tokens,
     #: and the report said its counts were a floor without naming anything that would change that.
@@ -728,7 +885,7 @@ class RunFacts:
     #: `done`. That is this class's founding defect exactly: a degraded run rendering as a clean one.
     #:
     #: It is the most expensive instance yet found, because it does not merely truncate a run, it
-    #: CHANGES A FINDING. a measured run: on the first paying engagement the
+    #: CHANGES A FINDING. A measured run: on the first paying engagement the
     #: ceiling bound twice, and the second time the agent could not read the backend that would have
     #: cleared a candidate, so the candidate shipped to the customer as a defect. It was not one.
     exec_refused: int | None = None
@@ -755,10 +912,6 @@ class RunFacts:
     #: Levers the MACHINE could not run — the separate package's `unavailable_levers`. Empty tuple means
     #: "asked, none missing"; the field being empty is not the same as the run never asking, which is
     #: why the caller passes it explicitly rather than leaving it to a default.
-    #:
-    #: **This is this class's own founding argument, one field further out.** The docstring above
-    #: records that a completed run and one cut off at its ceiling rendered as nearly the same three
-    #: lines, and that telling them apart meant reading the workflow log while the artefact is the
     unavailable_levers: tuple[str, ...] = ()
     #: Whether the WORKDIR could ever have registered those levers — `True` on a benchmark target
     #: carrying a masked `:vul` image, `False` on an ordinary repository, `None` when not established.
@@ -778,6 +931,8 @@ class RunFacts:
     #: accumulate between runs"*). A consumer of the artefacts could not read it anywhere, which is
     #: this class's founding defect: a fact the run knows, in a channel that is deleted with the runner.
     stateful: bool | None = None
+    #: This is a measured source-read inventory, not a replacement meaning for files_reviewed.
+    inspection: dict | None = None
 
 
 #: Which statuses mean the run reached its own end. Anything else and the finding count is a floor.
@@ -810,7 +965,14 @@ def _language_summary(langs: tuple[str, ...]) -> str:
     return ", ".join(langs[:3]) + f", +{len(langs) - 3} more"
 
 
-def _trust_row(status: str) -> str:
+def _trust_row(status: str, *, executions_spent: bool | None = None) -> str:
+    if status in COMPLETED_STATUSES and executions_spent:
+        # **A COMPLETED STATUS IS NOT A COMPLETE RUN when the execution ceiling was spent in full.**
+        # This row said `complete run` over a review that stopped at model turn 20 of 40 with 24 of 24
+        # executions used — measured 2026-09-03 — because the status is decided by how the loop ENDED
+        # and the loop ended by choosing to stop. It chose to stop because it had nothing left to run.
+        return (f"**complete status (`{status}`), SPENT EXECUTION BUDGET** — every execution the "
+                f"ceiling allowed was used, so this run may have stopped early. Raise `--max-steps`")
     if status in COMPLETED_STATUSES:
         return f"complete run (`{status}`)"
     return (f"**INCOMPLETE (`{status}`) — the counts below are a floor, not a result.** "
@@ -929,7 +1091,9 @@ def _summary_table(findings, *, status: str, run: RunFacts | None,
     else:
         verdict = "**no findings**"
 
-    rows = [("verdict", verdict), ("trust", _trust_row(status))]
+    rows = [("verdict", verdict),
+            ("trust", _trust_row(status,
+                                 executions_spent=run.executions_spent if run else None))]
     degraded = len(gate_reasons) + len(scope_reasons)
     if degraded:
         # NAMED in the header as well as quoted in full below. The reasons already reached the report
@@ -971,7 +1135,7 @@ def _summary_table(findings, *, status: str, run: RunFacts | None,
                      f"ceiling, so raising `--max-steps` raises it too"))
     if run.files_reviewed is not None:
         against = f" against `{run.base_ref}`" if run.base_ref else ""
-        rows.append(("reviewed", f"{run.files_reviewed} changed file(s){against}"))
+        rows.append(("scope", f"{run.files_reviewed} changed file(s){against}"))
     if run.fail_on:
         gate = {"none": "`none` — report only, this run could not fail the build",
                 "reproduced": "`reproduced` — a demonstrated finding fails the build",
@@ -990,12 +1154,9 @@ def _summary_table(findings, *, status: str, run: RunFacts | None,
     # It read `N unavailable on this runner … this run had less leverage than one with them`, which says
     # a bigger machine would restore them. It would not. Three of the four gate on `caps.container`,
     # which is `vul_image` — recovered from the workdir's `test_poc.sh` and required to match
-    # `hands._VUL_IMAGE_RE` (`cgmask-…:vul`), the benchmark/ARVO convention. That is a property of the
+    # `target.VUL_IMAGE_RE` (`cgmask-…:vul`), the benchmark/ARVO convention. That is a property of the
     # TARGET, not of the box, and no customer repository has one. Asked directly whether a paid GitHub
     # runner would help, the honest answer is no, and the report was saying otherwise.
-    #
-    # And the "less leverage" half was not true either. an internal CI workflow's own header records that the
-    # `prepared` harness kind "compiles the target with the runner's own gcc and ASAN" and that
     if run.unavailable_levers:
         names = ", ".join(f"`{n}`" for n in run.unavailable_levers)
         if run.levers_image_bound is False:
@@ -1039,8 +1200,156 @@ def _table(rows) -> list[str]:
     return out + [""]
 
 
+#: How many ranked candidates the HUMAN report lists. Measured 2026-09-02 by running the real
+#: `shard survey` CLI at each cap over two checkouts — `libgit2` (744 candidates) and `facebook/zstd`
+#: (515) — against `grep -cE 'lib/|src/|\.c:|:[0-9]+'`, which is the check F6 failed:
+#:
+#:     cap     libgit2      zstd     locations in the report
+#:     none    1,582 B    2,202 B    0     ← F6, and the pointer-only fix scores the same 0
+#:       10    2,160 B    2,914 B    10
+#:       20    2,708 B    3,541 B    20
+#:       50    4,422 B    5,863 B    50
+#:      200   12,866 B   14,704 B    200
+#:
+#: **20, because a longer list here is the same undifferentiated set, longer.** `_rank_spread` states
+#: the reason in `shard/survey.py`: the rank answers "could we prove it HERE", which is a property of
+#: the build and not of the candidate, so on a repository with no declared entry point every candidate
+#: carries one label and one reason. Extending the list adds rows, not discrimination. What the human
+#: artefact owes its reader is that locations EXIST and a sample they can open now; the complete
+#: answer is `shard-survey.json`, one file away, and it is what a tool should read.
+#:
+#: 20 roughly doubles the report on both targets and leaves it readable in a pull-request comment.
+#: **Rejected: 200**, the JSON's cap — 12.9 KB of paths is a file, not a comment. **Rejected:
+#: `DEFAULT_SARIF_CAP`** — 500 exists for code scanning's per-run alert limit, a constraint about
+#: GitHub's API that says nothing about what a person will read.
+#:
+#: **It is a SAMPLE and the report has to say so.** Measured on the same two runs, the top 20 cover 2
+#: of libgit2's 5 candidate kinds and 3 of zstd's 4, so a reader who takes the list for the set
+#: mis-reads the scan. Saying "744 candidates" and listing 20 in silence is F23 one artefact over; the
+#: `where` row is where this one says it.
+SURVEY_CANDIDATES_IN_REPORT = 20
+
+
+def _survey_where(ranked) -> str:
+    """The header row that answers "where is the attack surface" — F6's whole subject.
+
+    NAMING THE SIBLING IS A FACT, NOT A GUESS: `shard/cli.py` writes `shard-survey.json` into the
+    `--out-dir` immediately above its only call to `build_survey_markdown`, inside the same
+    `if args.out_dir:` branch, so the file this row names exists whenever this row is rendered.
+
+    **NAMING IT WAS THE WEAKER HALF OF F6 AND IT SHIPPED ALONE FOR A DAY.** The finding's Expected
+    offered two remedies — carry the top-ranked candidates with path and line, or point at the JSON —
+    and only the pointer landed. Measured on the pointer-only report: `grep -cE 'lib/|\\.c:|:[0-9]+'`
+    over `shard-report.md` still printed 0 on libgit2's 744 candidates. A pointer answers "where are
+    the locations kept"; the customer asked where the attack surface is, and `README.md` is what
+    promised them that.
+
+    THE CAP BELONGS IN THE SAME SENTENCE, because a list under a cap that does not say so is read as
+    the set. Two caps are in play and they are different numbers: this report's
+    `SURVEY_CANDIDATES_IN_REPORT` and the JSON's own. Same zstd run: the JSON's `provenance` read
+    `{'source': 358, 'test': 157}` over all 515 while its 200-row `candidates` array held
+    `{'source': 200}` — a consumer grouping the array and a consumer reading the aggregate get two
+    different breakdowns of one scan.
+
+    **"THE 20 HIGHEST-RANKED" WAS A DESCRIPTION OF A SLICE, and it shipped for a day.** Measured
+    2026-09-02 on the rebuilt artefact: on `libgit2` all 20 rows were in the vendored test framework
+    and the benchmark scripts, with zero of the 415 candidates under the library's own `src/`; on
+    `facebook/zstd` all 20 were in `contrib/` and none of the 148 under `lib/`; on a third target all
+    20 were `parser` under one `examples/` subtree out of 1,906 candidates spanning 10 kinds. Every
+    location printed was verbatim-correct — the SELECTION is what failed, and the row asserted a
+    property of the selection that the run had not established.
+
+    It happens because the rank answers *"could we prove it HERE"*, which is a property of the BUILD
+    and not of the candidate (`survey._rank_spread` states this), so on a repository with no declared
+    entry point every candidate carries one label. The list is still ordered by whatever key the
+    assessment applies below the rank; it is simply not ordered BY RANK, and a reader who takes
+    "highest-ranked" at face value concludes the attack surface is wherever that key happened to start.
+
+    THE TIE IS MEASURED, NOT ASSUMED. This function reads `ranked` structurally and does not know the
+    ordering key — `shard/survey.py` owns that and may change it. What it can check is the one thing
+    the claim depends on: whether the candidate at the cut and the first one below it carry the SAME
+    rank. If they do, nothing in the block outranks anything left out, whatever ordered them.
+
+    **THE TOTAL IS HERE NOW, and the rule it appears to break is the reason.** The docstring used to
+    say *"NO TOTAL HERE. It is in `summary`, four lines down, and a count lives in one place because
+    the second copy is what drifts."* A count does. `20 of 744` is not a count, it is the RATIO that
+    makes the block legible as a sample, and it cannot drift from `summary`'s: `summarise` prints
+    `len(assessment.ranked)` and this reads `len(ranked)`, the same sequence in the same call.
+    """
+    total = len(ranked)
+    listed = min(total, SURVEY_CANDIDATES_IN_REPORT)
+    where_the_rest_is = (
+        "`shard-survey.json`, written beside this report, carries the same ordering under its OWN "
+        "larger cap, with each candidate's kind and matched line; read its `omitted` for how many "
+        "fell below that one")
+    if not listed:
+        return "**this report counts; it names no file.** Nothing was ranked"
+    if listed == total:
+        return f"**all {total} candidate(s) are listed below, with path and line.** {where_the_rest_is}"
+    if ranked[listed - 1].rank == ranked[listed].rank:
+        return (f"**{listed} of {total} candidates are listed below, with path and line — a SAMPLE, "
+                f"not the top of a ranking.** The cut falls inside a tie: the {listed}th and the first "
+                f"one left out carry the same rank, so nothing in this block outranks what is missing "
+                f"from it, and reading it as *where the attack surface is* would be wrong. "
+                f"{where_the_rest_is}")
+    return (f"**the {listed} highest-ranked of {total} candidates are listed below, with path and "
+            f"line** — a sample; the rank separates them from the {total - listed} not shown. "
+            f"{where_the_rest_is}")
+
+
+def _survey_candidates(ranked) -> list[str]:
+    """The top `SURVEY_CANDIDATES_IN_REPORT` as `rank kind path:line`, fenced.
+
+    **FENCED AND NOT A MARKDOWN TABLE**, which is a security choice rather than a layout one. These
+    paths come from walking the target's checkout, so `|` and a backtick are both legal bytes in one:
+    a table row breaks on the first and a code span on the second, and `_fence_for` is the defence this
+    file already uses for target-derived text. `prompt_safe` on top of it, because a path may contain a
+    NEWLINE — `diffscope.prompt_safe` records what that cost one tier over — and a line break here
+    would silently split one candidate into two.
+
+    Fixed-width columns lead so the variable-length path cannot ragged them, matching `summarise()`.
+    """
+    body = "\n".join(f"{r.rank:<11}{r.surface.kind:<16}{prompt_safe(r.surface.path)}:{r.surface.line}"
+                     for r in ranked[:SURVEY_CANDIDATES_IN_REPORT])
+    fence = _fence_for(body)
+    return [fence, body, fence, ""]
+
+
+def _survey_trust(truncated: bool, partial_files: int) -> str:
+    """*Can I believe these counts* — the row a reader checks first, and it said yes over a floor.
+
+    **TWO CEILINGS, AND THIS ROW COULD ONLY SEE ONE.** `truncated` is the 4,000-FILE walk ceiling.
+    `survey.Survey.files_read_in_part` counts files the walk opened and did not finish, past
+    `MAX_FILE_BYTES` or past `MAX_HITS_PER_FILE` — a different ceiling, added when the first one was
+    found to hide a sample behind a total, and it reached the blind-spot list and not this row.
+
+    Measured 2026-09-02 on `facebook/zstd` and on `libgit2`: header row `| trust | complete scan |`,
+    and eight lines below it, in the same file, *"10 file(s) were read only in part … so every count
+    above is a floor for them"*. Both halves of one table, disagreeing, with the affirmative one on top.
+    Reproduced deterministically on one 336,043-byte `.c` file whose only `strcpy(` sits past 262,144:
+    `candidates 0`, `trust | complete scan`.
+
+    NO BYTE NUMBERS HERE. `MAX_FILE_BYTES` and `MAX_HITS_PER_FILE` belong to `shard/survey.py` and the
+    blind-spot line under this table already prints both; a second copy in this module is the
+    two-spellings drift `_survey_where` above records, over constants this file does not own.
+    """
+    if truncated and partial_files:
+        return (f"**TRUNCATED — every count below is a floor.** The scan hit its file ceiling before "
+                f"the repository ended, and {partial_files} of the files it did reach were read only "
+                f"in part")
+    if truncated:
+        return ("**TRUNCATED — every count below is a floor.** The scan hit its own limit before the "
+                "repository ended")
+    if partial_files:
+        return (f"**a floor for {partial_files} file(s), complete for the rest.** Those {partial_files} "
+                f"were read only in part — past the byte or the per-file candidate ceiling the scan "
+                f"stops, so a marker beyond it was never reached rather than absent. The blind spots "
+                f"below name both ceilings")
+    return "complete scan"
+
+
 def build_survey_markdown(summary: str, *, target: str = "", truncated: bool = False,
-                          report_ident: str = "",
+                          report_ident: str = "", ranked=(), partial_files: int = 0,
                           witness_entry: str = "") -> str:
     """The human artefact for SURVEY mode — the maintainers' notes STILL OPEN row 19.
 
@@ -1057,12 +1366,26 @@ def build_survey_markdown(summary: str, *, target: str = "", truncated: bool = F
     same code against different repositories and the difference in outcome — a gated build against
     *"no findings"* — is that one declared an entry point. A survey that names candidates and does not
     say what would turn them into proof has told the customer the less useful half.
+
+    **IT ANSWERED "HOW MANY" AND NEVER "WHERE", AND SAID SO NOWHERE.** Measured 2026-09-02 on
+    `facebook/zstd`: 515 candidates, a 1,907-byte report, and `grep -cE 'lib/|\\.c:|:[0-9]+'` over it
+    printed 0 — no path, no line. Naming `shard-survey.json` was the first half of that fix and the
+    same grep still printed 0, on libgit2's 744: a report that says where the locations are kept is
+    not a report that has any. `ranked` is the second half, and it is why this function takes the
+    candidates rather than only the string `summarise()` made of them.
+
+    `ranked` is a sequence of `survey.RankedSurface`, read STRUCTURALLY and never imported — this
+    module is below `shard/survey.py` and stays there. Empty is the honest default: a caller with no
+    assessment renders the report it rendered before.
+
+    `partial_files` is `Survey.files_read_in_part`, passed in for exactly the reason `truncated` beside
+    it is: the caller owns the scan and this module renders what it is handed. See `_survey_trust` for
+    what the row said while it could see only one of the two ceilings.
     """
     verdict = ("**survey only — nothing here is a finding.** A survey reads the source and names "
                "candidates; proving one takes a run that can execute something")
-    trust = ("**TRUNCATED — every count below is a floor.** The scan hit its own limit before the "
-             "repository ended" if truncated else "complete scan")
-    rows = [("verdict", verdict), ("trust", trust),
+    rows = [("verdict", verdict), ("trust", _survey_trust(truncated, partial_files)),
+            ("where", _survey_where(ranked)),
             ("witness", f"`{witness_entry}`" if witness_entry else
              "**none declared — nothing in this repository could be proven by execution**")]
 
@@ -1079,18 +1402,28 @@ def build_survey_markdown(summary: str, *, target: str = "", truncated: bool = F
     # blind-spot text. `_fence_for` sizes it so nothing in there can close it early.
     fence = _fence_for(summary)
     out += [fence, summary, fence, ""]
+    # THE LOCATIONS, below the counts they are a sample of. Its own fenced block rather than more rows
+    # in the header table: the header answers "what is this artefact", and a list of twenty file paths
+    # in it would bury the three sentences that do.
+    if ranked:
+        out += _survey_candidates(ranked)
     if not witness_entry:
+        # "EVERY CANDIDATE ABOVE" NAMED NOTHING. There is no candidate above — the block above is
+        # `summarise()`, which is counts. The sentence read as a reference to a list the artefact has
+        # never carried, and a reader who went looking for it found the table, the counts and the end
+        # of the file. It points at the file that does carry them now.
         out.append("**To make any of this provable, declare an entry point.** A file at "
                    "`.shard/entry.sh` that Shard may run against one untrusted input, and a "
                    "`.shard/entry.sh.benign/` directory of inputs containing no attack, one per "
-                   "branch the entry point can take. Without it every candidate above stays a "
-                   "candidate and nothing can fail a build.")
+                   "branch the entry point can take. Without it every candidate in "
+                   "`shard-survey.json` stays a candidate and nothing can fail a build.")
         out.append("")
     return "\n".join(out) + "\n"
 
 
 def build_markdown(findings, *, status: str, dropped: int = 0, target: str = "",
-                   gate_reasons=(), scope_reasons=(), run: RunFacts | None = None) -> str:
+                   gate_reasons=(), scope_reasons=(), run: RunFacts | None = None,
+                   bundle_names: dict[int, str] | None = None) -> str:
     """The short human report. Deliberately short — it is read in a pull request, not filed.
 
     A run with no findings gets a paragraph too, and it says what was DONE rather than what is true of
@@ -1107,8 +1440,16 @@ def build_markdown(findings, *, status: str, dropped: int = 0, target: str = "",
     # which explains why the number is passed in rather than returned from whichever write ran first.
     kept, _capped = cap(findings)
     ordered = rank(kept)
-    reproduced = [f for f in ordered if f.gate_eligible]
-    hypotheses = [f for f in ordered if not f.gate_eligible]
+    # THE BUNDLE DIRECTORY NAMES, from the one derivation, so the report can NAME the artefact it has
+    # been telling reviewers about. `finding_names`' own docstring sets the condition — *"pass the
+    # CAPPED list, and pass the same one to both readers"* — and `cliemit._emit` passes `cap(findings)`
+    # to it while `resultdoc` numbers the same list again. `rank` is a stable sort on a total key over
+    # a list `cap` already ranked, so all three number the same findings in the same order.
+    derived = finding_names(ordered)
+    named = [(f, (bundle_names or {}).get(id(f), name))
+             for f, name in zip(ordered, derived)]
+    reproduced = [pair for pair in named if pair[0].gate_eligible]
+    hypotheses = [pair for pair in named if not pair[0].gate_eligible]
 
     # Same heading rule as `build_markdown`, and the survey needs it MORE: it is the mode a customer
     # meets first, so it is the report most likely to be one of many.
@@ -1137,6 +1478,8 @@ def build_markdown(findings, *, status: str, dropped: int = 0, target: str = "",
     for reason in scope_reasons:
         out += [f"> **{reason}**", ""]
 
+    if run and run.inspection is not None:
+        out += inspection_markdown(run.inspection)
     if not ordered:
         out.append(_no_finding_paragraph(status, run.error_kind if run else ""))
         return "\n".join(out) + "\n"
@@ -1152,10 +1495,10 @@ def build_markdown(findings, *, status: str, dropped: int = 0, target: str = "",
     # thing — and the mutation sweep proved the duplicate was load-bearing in the WRONG direction:
     # blanking the verdict row changed no test, because the assertions were landing on this copy.
     # Trap 3, one file wide: two spellings of one fact, and the test graded whichever it found first.
-    for f in reproduced:
-        out += _finding_block(f, reproduced=True)
-    for f in hypotheses:
-        out += _finding_block(f, reproduced=False)
+    for f, name in reproduced:
+        out += _finding_block(f, reproduced=True, bundle=name)
+    for f, name in hypotheses:
+        out += _finding_block(f, reproduced=False, bundle=name)
 
     if dropped:
         # Stated, never absorbed. A silent truncation reads as "that was everything".
@@ -1181,10 +1524,7 @@ def _no_finding_paragraph(status: str, error_kind: str = "") -> str:
     # renderings of one piece of advice cannot answer differently. A `budget` run is stopped by a
     # ceiling, whatever a stale `error_kind` might still say.
     if status == "error" and error_kind in TRANSPORT_ERROR_ADVICE:
-        # STRIPPED OF ITS MARKDOWN EMPHASIS: the advice is written for a table cell where bold marks
-        # the phrase a scanning reader needs, and the same asterisks mid-sentence in a paragraph read
-        # as noise. One source of wording, two presentations.
-        because = " " + TRANSPORT_ERROR_ADVICE[error_kind].replace("**", "").capitalize() + "."
+        because = " " + _advice_sentence(TRANSPORT_ERROR_ADVICE[error_kind])
     return (f"Shard did not complete a full audit of this target (`{status}`), and produced no "
             f"reproducing input. Treat this as an incomplete run rather than a clean result.{because}")
 
@@ -1287,7 +1627,7 @@ def _quoted(text: str) -> list[str]:
     return [f"> {line}" if line.strip() else ">" for line in lines]
 
 
-def _finding_block(f: Finding, *, reproduced: bool) -> list[str]:
+def _finding_block(f: Finding, *, reproduced: bool, bundle: str) -> list[str]:
     # A HEADING IS ONE LINE, so the value in it must be one line. `title` is written by the model, which
     # has just read a pull request's source; an internal audit lists "model prose reaches
     # a PR comment unescaped" as a composition with its Finding 3, and this is the half of it where the
@@ -1301,7 +1641,7 @@ def _finding_block(f: Finding, *, reproduced: bool) -> list[str]:
     out = [f"### {prompt_safe(f.title, limit=300)}", ""]
     # **WHERE. The human report did not say, and for one whole configuration nothing else did either.**
     # This block emitted the heading, the replay count, the model's prose, the sanitizer, the evidence,
-    # the reproduce command and the doubts — and never `location` or `line`. The location reached the
+    # the bundle record and the doubts — and never `location` or `line`. The location reached the
     # SARIF alone, and `README.md` tells the customer `github_token` is optional: *"the run is still
     # correct and still gates — it simply produces no alerts"*. On that configuration the SARIF is a
     # file in an artefact zip and the report is what a reviewer reads, so the answer to "which file"
@@ -1363,8 +1703,43 @@ def _finding_block(f: Finding, *, reproduced: bool) -> list[str]:
             out.append(f"_Last {_EVIDENCE_IN_REPORT} characters; the bundle has the rest._")
         out.append("")
     if f.reproduce_command:
-        fence = _fence_for(f.reproduce_command)
-        out += ["Reproduce:", "", f"{fence}sh", f.reproduce_command, fence, ""]
+        # **THE REPORT USED TO TURN AN AUDIT RECORD INTO AN EXECUTION INSTRUCTION.** It printed
+        # `sh bundles/<name>/reproduce.sh`, and neither the downloaded directory nor the script inside
+        # it carries producer authentication — a direct shell invitation across the credential boundary,
+        # onto whichever host the reviewer happened to read the report on. The documentation verifier
+        # built around that command accepted deterministic input, script, product, and post-validation
+        # path swaps (an internal audit enumerates the four), so it
+        # was removed rather than patched into a second adjudicator. Naming the bytes and the
+        # observation keeps them visible without claiming that executing an untrusted bundle
+        # re-establishes the verdict.
+        #
+        # THE PROCEDURE IS NAMED AND ITS PATH IS NOT. The guide ships: `packaging/the design notes, and
+        # the free build script emits that whole directory as `docs/`. But this markdown is read in a pull
+        # request and out of an artefact zip, where a source-tree documentation path resolves to
+        # nothing, so the report names the guide and never a path to it.
+        #
+        # WHAT THE GUIDE OFFERS BOUNDS WHAT THIS BLOCK MAY ASK FOR. `replay.md` states that no trusted
+        # acquisition or replay command ships, and that a post-download checksum "does not prove who
+        # produced them": retention and inspection are what a reader can actually carry out, so the
+        # sentence below asks for those and does not tell anyone to authenticate a producer the
+        # shipped procedure cannot authenticate. Replay is the half that does NOT ship —
+        # `_bundle_metadata` records the observation class, the marker and the control NAMES, and
+        # nothing here adjudicates them — which is why this block stops at retention.
+        #
+        # The bundle path is exact rather than a guess, in the same way `_survey_where` naming its
+        # sibling is: `cliemit._emit` writes `shard-report.md` and `bundles/` into the one `out_dir`,
+        # and `resultdoc` derives `reproduction.bundle` from the same `finding_names` value, so the two
+        # artefacts name one directory.
+        out += ["Safe acquisition required", "",
+                "`reproduce.sh` is the command recorded for this finding, not an independent replay "
+                "verifier; do not execute it on a workstation or in a credentialed job. Keep the "
+                "bundle with the run that produced it and retain and inspect it as the "
+                "version-matched finding-bundle guide shipped with Shard directs; that guide also "
+                "states what retention can and cannot establish about the producer and the source "
+                "bytes. This build ships no independent replay verifier: stop after acquisition and "
+                "do not use this bundle as a gate.", "",
+                f"`bundles/{bundle}/` sits beside this report and holds `reproduce.sh`, `input`, "
+                f"`output.txt` when captured, and `metadata.json`.", ""]
     if f.doubts:
         # Advisory by construction — `Verdict.doubts` cannot change `reproduced`. Surfaced because a
         # human reviewer should see what the oracle was unsure of, not because it downgrades anything.
@@ -1375,31 +1750,80 @@ def _finding_block(f: Finding, *, reproduced: bool) -> list[str]:
 
 # --- the reproduction bundle -------------------------------------------------------------------------
 
-def write_bundle(finding: Finding, dest) -> pathlib.Path:
-    """The distinguishing artefact: the crashing input, the command, and what it was produced against.
+#: A full commit object name and nothing else. `head_revision`'s output is written into a file the
+#: reviewer EXECUTES, so what it returns is validated rather than trusted: git is a subprocess whose
+#: stdout this module does not own, and `shlex.quote` at the call site is the second layer, not the
+#: first. Full 40 hex and not an abbreviation — the design notes's own release note records what an
+#: abbreviated SHA cost when it was allowed to stand for a commit.
+_FULL_SHA = re.compile(r"[0-9a-f]{40}\Z")
 
-    the integration guide — *"it costs almost nothing to emit, because the oracle already produced
-    it"*. Written for a finding whether or not it reproduced, because a hypothesis with a candidate
-    input is still the fastest thing to hand a reviewer; `metadata.json` states which it is.
+
+def head_revision(repo) -> str:
+    """The commit `repo` is checked out at, or `""` when nothing here can say.
+
+    **The bundle promised this and did not carry it.** `README.md` ships the sentence *"Every reported
+    finding ships a reproduction bundle: the input, the exact command, and the revision it was produced
+    against"*, and `write_bundle`'s own docstring repeats the claim. Measured 2026-09-02 against the
+    rebuilt 2.4.1 artefact: `grep -roE '\\b[0-9a-f]{40}\\b' <ws>/shard-out/bundles/` exited 1 with no
+    output, and `metadata.json`'s twelve fields held no revision under any spelling. Two of the three
+    shipped.
+
+    **What the missing third costs is F3 restored by another route.** The bundle's program resolves the
+    checkout it was unpacked into and runs the entry point there, which is right — and it will run
+    whatever tree is checked out. A reviewer on another branch, or replaying a week later, gets rc=0
+    with no marker: *"indistinguishable from this finding does not reproduce"*, which is the signature
+    F3 was raised for, with nothing in the bundle to check against. Measured on the same artefact: the
+    unmodified bundle replayed against the pre-sink revision printed the entry point's ordinary output
+    at rc=0, marker absent, exit code identical to the successful reproduction.
+
+    **`git rev-parse HEAD` and not a read of `.git/HEAD`, deliberately.** The reviewer's half of the
+    check is `git -C "$root" rev-parse HEAD` inside `_REPRODUCE_SH` — a shell has no ref resolver — so
+    reading the plumbing here would answer the same question with a second, worse git: a symbolic
+    `HEAD`, `packed-refs`, a `.git` FILE in a worktree and a detached checkout are four shapes to get
+    right, and getting one wrong makes the two halves disagree about a tree that has not moved. One
+    command, both sides.
+
+    Silent on every failure, and that is the honest shape rather than a swallowed error: a tarball
+    export, a `docker build` context and a workdir copy all legitimately have no revision, and that capability's prepared workdir is VCS-stripped by construction. `""` records "nobody knows", which is what
+    `metadata.json` then says and what makes the script's check skip instead of firing on nothing.
     """
-    dest = pathlib.Path(dest)
-    dest.mkdir(parents=True, exist_ok=True)
+    if not repo:
+        # `None`, and it is a real caller rather than a defensive guard: `simple.adjudicate_all` is a
+        # public entry point whose `repo` is optional — a hand-built claim from a test, a replay, or
+        # the PR path may have no checkout — and `safe_directory_argv` would raise `TypeError` on it,
+        # which is neither `OSError` nor a `SubprocessError` and would escape the handler below.
+        return ""
+    try:
+        done = subprocess.run([*safe_directory_argv(repo), "-C", str(repo), "rev-parse", "HEAD"],
+                              capture_output=True, text=True, errors="replace", timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        # No git on PATH, or a `repo` that is not a directory. Both mean the same thing to a reader of
+        # the bundle: this run could not name the revision, so nothing downstream may claim it did.
+        return ""
+    revision = done.stdout.strip()
+    return revision if done.returncode == 0 and _FULL_SHA.match(revision) else ""
 
-    if finding.poc_path:
-        src = pathlib.Path(finding.poc_path)
-        try:
-            (dest / "input").write_bytes(src.read_bytes())
-        except OSError:
-            # A missing PoC must not take the whole report down. The metadata records its absence, so a
-            # bundle without an input is legible rather than mysterious.
-            pass
 
-    # WHAT WAS OBSERVED, in full. The reproduce command and the input say how to see it again; this is
-    # what we saw. A reviewer who cannot run the entry point themselves has nothing else.
-    if finding.evidence:
-        (dest / "output.txt").write_text(finding.evidence, encoding="utf-8")
+def _bundle_input_bytes(finding: Finding, require_input: bool) -> bytes | None:
+    if require_input and finding.poc_bytes is None:
+        raise FileNotFoundError(
+            "the demonstrated finding has no immutable reproducing input to attach")
+    if finding.poc_bytes is not None:
+        return finding.poc_bytes
+    if not finding.poc_path:
+        return None
+    try:
+        return pathlib.Path(finding.poc_path).read_bytes()
+    except OSError:
+        # A missing hypothesis input leaves a legible metadata-only bundle. Gate-eligible callers use
+        # immutable `poc_bytes`, so their missing input was refused before this read.
+        if require_input:
+            raise
+        return None
 
-    (dest / "metadata.json").write_text(json.dumps({
+
+def _bundle_metadata(finding: Finding, *, input_present: bool, output_present: bool) -> bytes:
+    return json.dumps({
         "rule_id": finding.rule_id,
         "title": finding.title,
         "reproduced": finding.gate_eligible,
@@ -1409,19 +1833,260 @@ def write_bundle(finding: Finding, dest) -> pathlib.Path:
         "crash_count": finding.crash_count,
         "container_digest": finding.container_digest,
         "reproduce_command": finding.reproduce_command,
-        "input_present": (dest / "input").is_file(),
-        "output_present": (dest / "output.txt").is_file(),
+        "input_present": input_present,
+        "output_present": output_present,
+        "witness_expectation": finding.witness_expectation,
+        "witness_marker": finding.witness_marker,
+        "witness_entry": finding.witness_entry,
+        "witness_controls": list(finding.witness_controls),
+        # Empty says this run could not name a revision; the acquisition procedure then refuses to
+        # authenticate the bundle. See `head_revision`.
+        "revision": finding.revision,
         "doubts": list(finding.doubts),
-    }, indent=2, sort_keys=True), encoding="utf-8")
+    }, indent=2, sort_keys=True).encode("utf-8")
 
+
+def _bundle_file_size(dest_fd: int, name: str) -> int:
+    """Inspect one bundle child through a no-follow descriptor, including zero-byte inputs."""
+    flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(name, flags, dir_fd=dest_fd)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise OSError("bundle child is not one regular single-link file")
+        return info.st_size
+    finally:
+        os.close(fd)
+
+
+def _write_bundle_fd(finding: Finding, dest_fd: int, *,
+                     require_input: bool = False) -> dict[str, bytes]:
+    """Write one bundle below a held directory and return the authoritative source bytes."""
+    source = _bundle_input_bytes(finding, require_input)
+    files: dict[str, tuple[bytes, int]] = {}
+    if source is not None:
+        files["input"] = (source, 0o644)
+    if finding.evidence:
+        # WHAT WAS OBSERVED, in full. A reviewer who cannot run the entry point has nothing else.
+        files["output.txt"] = (finding.evidence.encode("utf-8"), 0o644)
+    files["metadata.json"] = (
+        _bundle_metadata(finding, input_present=source is not None,
+                         output_present=bool(finding.evidence)),
+        0o644,
+    )
     if finding.reproduce_command:
-        (dest / "reproduce.sh").write_text(f"#!/bin/sh\n# {finding.title}\n{finding.reproduce_command}\n",
-                                           encoding="utf-8")
+        # The title is model prose. `_shell_comment` prevents an interior newline from turning a
+        # comment into a command; atomic creation with 0755 keeps the shebang's executable promise.
+        script = f"#!/bin/sh\n{_shell_comment(finding.title)}\n{finding.reproduce_command}\n"
+        files["reproduce.sh"] = (script.encode("utf-8"), 0o755)
+    for name, (data, mode) in files.items():
+        _atomic_write(dest_fd, name, data, mode=mode)
+    for name, (data, _mode) in files.items():
+        if _bundle_file_size(dest_fd, name) != len(data):
+            raise OSError(f"bundle file {name!r} changed during publication")
+    if require_input and "input" not in files:
+        raise OSError("the reproduction bundle was written without its required input")
+    return {name: data for name, (data, _mode) in files.items()}
+
+
+def write_bundle(finding: Finding, dest, *, require_input: bool = False) -> pathlib.Path:
+    """Write the crashing input, command, observation and target identity through a held directory.
+
+    The path API remains for direct hypothesis/replay callers. The Action emitter calls the descriptor
+    form above while it holds a private staging directory, so a same-run process cannot redirect a
+    child write through a symlink between files.
+    """
+    dest = pathlib.Path(dest)
+    with _trusted_directory(dest, create=True) as (_held_path, dest_fd):
+        _write_bundle_fd(finding, dest_fd, require_input=require_input)
     return dest
+
+
+def _shell_comment(text: str) -> str:
+    """`text` as `sh` comment lines that nothing in `text` can break out of.
+
+    **The class, and it is measured rather than assumed.** Probed 2026-09-02 with `# X<byte>echo
+    OWNED` against `sh`, `bash`, `dash` and `busybox sh`: of `\\n \\r \\v \\f \\t \\x00 \\x1c \\x1d
+    \\x1e \\x85 \\u2028 \\u2029 ; &`, **`\\n` alone ended the comment** and all four shells agreed.
+    So a title with no uncommented newline in it cannot reach executable position whatever else it
+    contains — `;`, `&` and `$(…)` included.
+
+    `str.splitlines` and not `text.split("\\n")`, knowing that: it ALSO breaks on the eight inert
+    bytes above, which costs an extra comment line and cannot admit one. Wrong in the safe direction
+    for a file the reader is told to run, and it survives a shell that disagrees with those four.
+    """
+    return "\n".join(f"# {line}" for line in (text.splitlines() or [""]))
 
 
 
 # --- shaping a solver result into findings, moved out of cli.py 2026-08-21 ------------------
+
+#: The token every other artefact of a bundle already uses for the reproducing input: `write_bundle`
+#: stores the payload as `input`, and `_REPRODUCE_SH` reads it as `"$here/input"` — the same one file,
+#: resolved from the script rather than from a cwd. Rewriting the staged path onto this token is what
+#: makes `output.txt` and `reproduce.sh` — two files in one directory — name one file rather than two.
+#:
+#: **`./input` STAYS THE SPELLING even though the script no longer uses it**, because this token is
+#: written into OBSERVED OUTPUT (`staged_relative` rewrites the runner's staging path out of what the
+#: entry point printed), not into a command. It is the reader's name for the file beside the evidence.
+STAGED_INPUT_TOKEN = "./input"
+
+#: The bundle's reproduce script, below an `entry=<shell-quoted path>` line the caller prepends.
+#: **ONE DEFINITION SINCE 2026-09-02, imported by `shard/simple.py`** — see the note under the
+#: program on why a pinned duplicate was the wrong end state.
+#:
+#: The defect it exists for was fixed on the free tier on 2026-09-02 and left standing here for a day.
+#: What shipped in a deep bundle was `bash <harness> ./input`: the harness is repo-root-relative
+#: (`target` declares it) and `input` is written INSIDE the bundle by `write_bundle`, so the one
+#: command resolves from no working directory at all. Measured 2026-09-02 through `_findings` and
+#: `write_bundle`, against a harness that crashes on the bundle's own bytes:
+#:
+#:     from the repository root      rc=0, no output      `./input` is not there; nothing was parsed
+#:     from the bundle directory     rc=127               `bash: harness/run.sh: No such file`
+#:     both paths resolved by hand   rc=-11, SHARD42      the reproduction itself is real
+#:
+#: The free tier's own three rows, on a bundle emitted through `simple._to_finding` against a
+#: parser-shaped entry point, are the same shape: rc=0 no output / rc=127 `.shard/entry.sh` / rc=139
+#: SHARD42. The first row is the defect; the second is only its symptom. rc=0 with no output is the
+#: exact signature of "this finding does not reproduce", in the artefact `README.md` calls the
+#: distinguishing one, handed to a reviewer looking at a build Shard has just failed.
+#:
+#: The walk up from the bundle is what lets it run from any directory without anyone being told a cwd,
+#: since `write_bundle`'s destination sits under the checkout. POSIX `sh`, because `write_bundle`
+#: writes a `#!/bin/sh` header over it; `bash` and `--` in the exec match the argv
+#: `witness.adjudicate` actually ran, so the command a reviewer executes is the one the verdict was
+#: reached on rather than a second spelling of it.
+#:
+#: **RESOLVING THE TWO PATHS WAS HALF THE FIX, and the missing half shipped for a day.** Absolute
+#: paths make the program find its own two files; they say nothing about the directory the ENTRY
+#: POINT resolves ITS paths from, and an entry point that reads a repo-relative sibling is ordinary —
+#: a config file, a build product under `./build/`, a sourced helper. The verdict was NOT reached in
+#: the reviewer's shell: `witness.adjudicate` runs the free entry point with `cwd=str(repo)` and
+#: the separate package` runs the harness with `cwd=str(workdir)`. Measured 2026-09-02 through
+#: this constant, over five cwd-sensitive entry points x six directories a reviewer can be in
+#: (the checkout root, the bundle, the bundle's parent, a checkout subdirectory, the checkout's
+#: parent, an unrelated directory): **25 of 30 rows did not reproduce, every one of them at rc=0 with
+#: no output** — F3's own signature, restored by the cwd alone. Only the checkout root worked, and it
+#: is the one place nothing tells the reviewer to stand.
+#:
+#: `cd -- "$root"` is not a preference: `$entry` is spelled repo-root-relative by whoever declared it,
+#: so the checkout root is the ONE directory in which that spelling is meaningful, in both tiers. No
+#: `CDPATH=` on it — measured with `CDPATH` exported and the run was unaffected, because `$root` is
+#: absolute and POSIX forbids the search for an absolute operand. The `here=` line one above needs it:
+#: `dirname -- "$0"` is relative whenever the reviewer invokes the script by a relative path.
+#:
+#: WHAT THE CLAIM ABOVE THIS ONE USED TO SAY, and what it may say now. `simple._REPRODUCE_SH` asserted
+#: "a half that does not resolve exits 2 with a sentence on stderr — so this can no longer look like a
+#: clean run when it has run nothing", and that was measured FALSE on 2026-09-02: both halves resolved,
+#: both guards passed, and the run was a silent no-op at rc=0 because the cwd was wrong. What holds
+#: after the `cd` is narrower and checkable: **each of the two things THIS PROGRAM LOOKS FOR — the
+#: entry point and the input — exits 2 with a sentence naming it when it cannot be had,** and 30 of 30
+#: rows of the matrix above now reproduce. It says nothing about the entry point's own
+#: preconditions: an unbuilt target, a missing environment variable or an absent container still decline
+#: however the customer wrote them to, and this program cannot build a checkout.
+#:
+#: **TWO AND NOT THREE, because the `cd` CARRIES NO SENTENCE — a measurement, not an omission.** It
+#: shipped for a day with one, *"$root is not enterable; the entry point resolves its own relative
+#: paths from there"*, and no state of any bundle can print it: `[ -f "$root/$entry" ]` two lines above
+#: cannot be true unless `$root` has the search bit, and the search bit is the only permission `cd`
+#: needs. Probed 2026-09-02 as uid 1000 over eleven modes on `$root` (000 100 200 300 400 500 600 700
+#: 111 444 555), a `$root` that is a symlink to the directory, and a `$root` under a parent without
+#: `x`: **the two agreed on all thirteen rows**, PASS with PASS and FAIL with FAIL. A diagnostic that
+#: cannot fire is worse than none, because the next reader takes the sentence as evidence the case was
+#: handled, and when this was found the phrase occurred exactly once in `shard/` and `tests/` — here,
+#: in the constant, with no test naming it.
+#:
+#: `|| exit 2` STAYS, and it is the same shape the `here=` line already uses. `sh` without `set -e`
+#: runs on after a failed `cd`, so a bare one would `exec` from `$here` and restore exactly the silent
+#: wrong-cwd no-op this line exists to close. Nothing a reviewer needs goes with the sentence: `cd`
+#: diagnoses itself, measured under `dash` as `<script>: 3: cd: can't cd to <path>` on stderr, and the
+#: program still exits on its own contract of 2. What went is the claim about a cause it cannot have
+#: observed, never the stop.
+#:
+#: **`$rev` IS THE THIRD GUARD AND IT IS THE ONLY ONE THAT WARNS INSTEAD OF STOPPING.** The two above
+#: fire when this program cannot find something it needs; this one fires when it found everything and
+#: the tree is not the tree the verdict was reached in. `head_revision` records the measurement — the
+#: bundle carried no revision at all, so replaying against the wrong checkout produced rc=0 with no
+#: marker, which is F3's own signature restored by the one route the `cd` fix cannot close.
+#:
+#: **REFUSING WAS REJECTED, and it is the obvious reading of "make the program refuse".** The single
+#: most valuable thing a reviewer does with a bundle is run it against their FIX branch to see the
+#: defect stop reproducing — a tree that deliberately does not match. `exit 2` there would refuse the
+#: one question the artefact exists to answer. What the failure needed was not a stop but a sentence
+#: the reviewer reads BEFORE the silence, which is why the echo sits above the `exec` rather than
+#: after the two `exit 2`s.
+#:
+#: `git -C "$root"` and not a read of `.git/HEAD`: `sh` has no ref resolver, and `head_revision` takes
+#: the same command on the recording side for that reason — see its docstring. An unset `$rev` skips
+#: the whole block, which is what a producer that never resolved one emits; `2>/dev/null` swallows
+#: git's own diagnostic, so a checkout with no VCS and a machine with no git both land on the same
+#: `$now` sentence rather than on a stray `fatal:` line above the entry point's output.
+_REPRODUCE_SH = "\n".join((
+    'here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 2',
+    "root=$here",
+    'while [ ! -f "$root/$entry" ] && [ "$root" != / ]; do root=$(dirname -- "$root"); done',
+    '[ -f "$root/$entry" ] || { echo "shard: $entry is in no directory above $here; unpack this'
+    ' bundle inside the repository it was produced from" >&2; exit 2; }',
+    '[ -r "$here/input" ] || { echo "shard: the reproducing input is missing from $here" >&2;'
+    ' exit 2; }',
+    'cd -- "$root" || exit 2',
+    'if [ -n "$rev" ]; then',
+    '    now=$(git -C "$root" rev-parse HEAD 2>/dev/null)',
+    '    [ -n "$now" ] || now="a revision nothing here could read"',
+    '    [ "$now" = "$rev" ] || echo "shard: this finding was produced against $rev and this checkout'
+    ' is at $now, so a run that shows nothing here may mean the tree moved rather than that the'
+    ' defect is gone" >&2',
+    "fi",
+    'exec bash -- "$root/$entry" "$here/input"',
+))
+
+# WHY THIS IS ONE CONSTANT AND NOT TWO PINNED COPIES. It shipped duplicated, verbatim, in this module
+# and in `shard/simple.py` for a day, with `test_both_tiers_emit_the_same_reproduce_program` asserting
+# byte-identity, because `simple` imports `report` at module scope and the reverse import would invert
+# the layering — a leaf renderer pulling in agentloop, budget, journal, llm, sandbox and witness to
+# format a string. That constraint bites in ONE direction only: `shard/simple.py` already imported
+# `Finding` and `staged_relative` from here, so the collapse is one NAME on an import edge that
+# exists, and it adds no node and no edge to the graph a maintenance script values for being
+# leaf-heavy. A third module for one string would have added both, to hold something that names no job
+# — "earn its place" forbids the abstraction with one member as squarely as the option nobody sets.
+#
+# THE PIN WAS NOT A SAFE STEADY STATE, and this is the measurement rather than the preference: a test
+# that two strings are equal cannot say WHICH is right. Both copies were byte-identical and both were
+# missing the `cd`, and 25 of 30 measured rows silently reproduced nothing while that test was green.
+# The equality held perfectly across the whole defect.
+
+
+def staged_relative(text: str, input_path: str) -> str:
+    """`_repo_relative` for the FREE tier: rewrite the runner's staging directory out of observed output.
+
+    `witness._stage_payload` writes the payload to `tempfile.mkdtemp(prefix="shard-witness-")` and hands
+    a path under it to the customer's entry point as argv. An entry point that echoes its argument, or a
+    parser that prints `cannot open <file>`, puts that path in `Finding.evidence` — and evidence is what
+    the SARIF message, `shard-result.json`'s `observed`, the markdown and `bundles/<fp>/output.txt` all
+    quote. Measured 2026-09-02 on a real emitted artefact: **8 lines across 4 files**, on the
+    demonstrated finding and the informational one alike.
+
+    That path does not exist on any machine after the job ends, is different on every run, and describes
+    OUR staging layout rather than the customer's code — the same three faults `_repo_relative` was
+    written for one tier up, on the tier every customer meets first.
+
+    TWO FILENAMES, ONE DIRECTORY. The payload is staged as `shard_witness_input` and EXECUTED through a
+    byte-identical copy at `shard_witness_run`, so the path a customer sees is not the one `input_path`
+    names. Both are rewritten, and the directory itself after them, so an entry point that printed
+    anything else from there is covered too.
+
+    A pure string rewrite over text already captured, like its sibling: it renames, it never invents,
+    and a path it does not recognise is left exactly as it was.
+    """
+    if not text or not input_path:
+        return text
+    root = str(pathlib.Path(input_path).parent)
+    if not root or root == "/":
+        return text
+    for name in ("shard_witness_input", "shard_witness_run"):
+        text = text.replace(f"{root}/{name}", STAGED_INPUT_TOKEN)
+    return text.replace(f"{root}/", "").replace(root, "")
+
 
 def _repo_relative(text: str, workdir: pathlib.Path) -> str:
     """Rewrite workdir-absolute paths in observed output into repository-relative ones.
@@ -1439,10 +2104,10 @@ def _repo_relative(text: str, workdir: pathlib.Path) -> str:
     root = str(workdir.resolve())
     return text.replace(f"{root}/repo/", "").replace(f"{root}/repo", "").replace(f"{root}/", "")
 
-def _findings(result, workdir: pathlib.Path, setup) -> list:
+def _findings(result, workdir: pathlib.Path, setup, *, revision: str) -> list:
     """Adapt a `SolveResult` into the mode-agnostic records `shard/report.py` writes.
 
-    the separate capability emits one finding per DISTINCT reproduced defect — one at the default `--max-findings 1`,
+    The separate capability emits one finding per DISTINCT reproduced defect — one at the default `--max-findings 1`,
     which is what it has always emitted, and up to that many on a sweep. Only reproduced defects
     appear: there is no hypothesis channel here, because the separate package has exactly one accepting
     branch for a finding and a non-reproduced run has nothing this function could honestly report as
@@ -1459,11 +2124,19 @@ def _findings(result, workdir: pathlib.Path, setup) -> list:
     harness = setup.fields.get("harness", HARNESS_NAME)
     verdicts = getattr(result, "all_verdicts", None) or [verdict]
     by_signature = getattr(result, "poc_by_signature", None) or {}
-
     findings = []
     for one in verdicts:
         sanitizer = getattr(one, "sanitizer", None)
         signature = getattr(one, "signature", "")
+        # The verdict and these bytes cross the report boundary together. A path is mutable state: a
+        # detached child replaced ``poc-findings/<signature>`` after `_findings` returned and the
+        # emitter delivered the replacement as a reproduced input. The sweep already owns immutable
+        # per-signature bytes, including restored verdicts. The report layer never reopens live
+        # ``./poc``: on a partial/malformed multi-verdict result that is the LAST finding's mutable
+        # path, not evidence for whichever signature is being adapted. `write_bundle` prefers these
+        # bytes, and their absence makes required delivery fail closed.
+        poc_bytes = by_signature.get(signature)
+        poc_path = _sweep_poc(workdir, signature, by_signature) if poc_bytes is not None else None
         # ONE reading, shared by the rule id and by the record. `_rule_id` needs the access line, and
         # the access line is in the evidence rather than on the sanitiser line — so computing it
         # twice would be two chances for the id and the alert's own classification to disagree.
@@ -1496,8 +2169,18 @@ def _findings(result, workdir: pathlib.Path, setup) -> list:
             # EVERY finding gets the bytes that produced IT, primary included. `./poc` is the fallback
             # and never the preference — see `_sweep_poc`, and see the measurement in its docstring for
             # what happens when the primary is allowed to keep `./poc`.
-            poc_path=_sweep_poc(workdir, signature, by_signature),
-            reproduce_command=f"bash {harness} ./input",
+            poc_path=poc_path,
+            poc_bytes=poc_bytes,
+            # WHAT THIS WAS PRODUCED AGAINST, on the record so `write_bundle` can put it in
+            # `metadata.json` and the program can check it. See `head_revision`.
+            revision=revision,
+            # A PROGRAM, NOT A LINE — `_REPRODUCE_SH` has the measurement. `harness` is SHELL-QUOTED
+            # because this string is executed by a reviewer's shell rather than through the argv
+            # `oracle` used, where a space or a `;` in a declared harness path is just a filename.
+            # `rev` is quoted on the same argument: it is git's stdout rather than ours, and
+            # `head_revision` validating the shape is the first layer, not the only one.
+            reproduce_command=(f"entry={shlex.quote(harness)}\nrev={shlex.quote(revision)}\n"
+                               f"{_REPRODUCE_SH}"),
         ))
     return findings
 
@@ -1525,10 +2208,9 @@ def _sweep_poc(workdir: pathlib.Path, signature: str, by_signature: dict) -> str
         # backup and adjudicates it directly, and there `./poc` genuinely holds that finding's bytes.
         live = workdir / "poc"
         return str(live) if live.exists() else None
-    out = workdir / "poc-findings"
-    out.mkdir(exist_ok=True)
-    path = out / (signature or "unsigned")
-    path.write_bytes(data)
+    root = workdir.resolve()
+    path = root / "poc-findings" / (signature or "unsigned")
+    rooted_write(root, path, data, create_parents=True)
     return str(path)
 
 def _crash_title(sanitizer: str | None) -> str:

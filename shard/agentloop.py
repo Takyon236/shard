@@ -28,7 +28,7 @@ from shard.diag import get_logger
 from shard.journal import Journal
 from shard.memory import fence
 from shard.reasoning import ensure_compute_runway, render_self_review
-from shard.tools import OBS_WINDOW_CHARS, ToolRegistry, ToolResult
+from shard.tools import OBS_WINDOW_CHARS, READ_MAX_FILE_BYTES, ToolRegistry, ToolResult
 from shard.toolvalidate import suggest_tool, validate_call_args
 
 # --- Loop hygiene: repeat-call circuit-breaker (LEVER 2) -------------------------------------------
@@ -165,8 +165,14 @@ AUTOPUSH_MIN_INTERVAL = CONSTRUCT_INTERVAL   # min steps between campaign-less a
 # only ends already-doomed grinds sooner (per-task budgets don't transfer) — it must NEVER cut a progressing task.
 STALL_PROGRESS_TOOLS = CONSTRUCT_PROGRESS_TOOLS | frozenset({"test_poc", "auto_fuzz"})
 # Stable outcome-class fields across the progress tools' real result dicts — test_poc (crashed/inner_exit/
-# sanitizer, the predecessor project), fuzz (found/n_crashes), instrument (reached/probes_hit/reached_sink/inner_exit),
-# batch_test (crashed/sanitizer). EXCLUDES the volatile content fields (``output``/``probe_output``/byte dumps).
+# sanitizer, the predecessor project), fuzz (found/n_crashes), instrument (reached/probes_hit/inner_exit),
+# batch_test (crashed/sanitizer/reached_sink). EXCLUDES the volatile content fields
+# (``output``/``probe_output``/byte dumps).
+# ``reached_sink`` was listed here against ``instrument``, which has never emitted it — the separate package
+# emits ``reached``, a different question (did the AGENT'S anchor fire, not did the DESCRIBED sink run).
+# The key was therefore projected out of no result dict at all until `batch_test` began emitting it on
+# 2026-08-31 (`deep/triage._reach_verdict`). Attributed to its real producer here; the stall lever itself
+# ships OFF, so the widened projection changes no shipped behaviour.
 STALL_OUTCOME_KEYS = ("crashed", "inner_exit", "sanitizer", "found", "n_crashes", "reached",
                       "probes_hit", "reached_sink", "build_ok", "rebuilt", "exhausted")
 
@@ -352,6 +358,27 @@ def clamp_observation(payload: dict, limit: int) -> str:
     return best
 
 
+def _source_read_fields(result: ToolResult) -> dict | None:
+    """Only reader-owned scalar bounds may establish that source reached an observation."""
+    metadata = result.source_read
+    if not isinstance(metadata, dict):
+        return None
+    path = metadata.get("path")
+    bounds = [metadata.get(key) for key in ("start_line", "end_line", "total_lines")]
+    partial = metadata.get("partial_line")
+    if not isinstance(path, str) or not path or len(path) > 4096 or type(partial) is not bool:
+        return None
+    if any(type(value) is not int for value in bounds):
+        return None
+    start, end, total = bounds
+    if not 0 <= start <= end <= total <= READ_MAX_FILE_BYTES:
+        return None
+    if start == 0 and (end != 0 or partial):
+        return None
+    return {"path": path, "start_line": start, "end_line": end,
+            "total_lines": total, "partial_line": partial}
+
+
 # --- Loop cadence: periodic FORCED self-review (Rule 3 — the trajectory-management surface) ---------
 # A general-agent metacognition turn injected every ``SELF_REVIEW_INTERVAL`` steps: the agent must assess,
 # in writing, where it stands vs the goal, what worked vs what it churned, whether to change trajectory, and
@@ -361,26 +388,6 @@ def clamp_observation(payload: dict, limit: int) -> str:
 # "task done but not properly concluded" re-check. The TEXT lives in ``reasoning``; the CADENCE lives here
 # beside MEASURE_INTERVAL because the loop enforces it. It never relaxes a finish gate.
 SELF_REVIEW_INTERVAL = 15   # steps between forced self-reviews the benchmark solver passes in (0 = off)
-
-# The exact strings `llm.py` puts on a TRANSPORT STALL, all of which arrive as a retryable 598:
-#   * `llm.py:501/505` — "idle/stall timeout after {idle}s: ..." (no bytes for `idle_timeout`)
-#   * `llm.py:556`     — "stream throughput ~{tps} tok/s < {floor} floor over {n}s (slow-drip → reroute)"
-#   * `llm.py:549`     — "absolute stream ceiling {n}s exceeded"
-# Matched on the error TEXT rather than a code because `chat()` returns a bare `ChatResult` and drops the
-# HTTP code its own `_chat_once` produced. That is the same substring test the `empty` path already uses,
-# and it is safe from model influence: `ChatResult.error` is written by the backend, never by the model.
-_STALL_MARKERS = ("idle/stall timeout", "stream throughput", "absolute stream ceiling")
-
-
-def _is_transient_stall(error: "str | None") -> bool:
-    """True for a provider-side throughput/idle stall — transient, and therefore worth one more turn.
-
-    Deliberately NARROW. A bad key, a 4xx, a hard refusal and a malformed body must all stay terminal;
-    widening this to "any error" would turn a permanently-misconfigured run into a bounded-but-pointless
-    retry storm on every one of its steps."""
-    e = (error or "").lower()
-    return any(m in e for m in _STALL_MARKERS)
-
 
 _log = get_logger(__name__)
 
@@ -396,7 +403,7 @@ _log = get_logger(__name__)
 #: matching again. The errored-run gate would have gone quietly back to returning a green check over a
 #: review that never ran, which is the defect it was added to close.
 #:
-#: the maintainers' suite pins the consumers against this tuple by AST, so a new status
+#: The maintainers' suite pins the consumers against this tuple by AST, so a new status
 #: that nothing handles, or a consumer comparing against a status nothing emits, is a failing test
 #: rather than a silent no-op.
 RUN_STATUSES: tuple[str, ...] = ("done", "budget", "error", "maxsteps", "repeat", "stall")
@@ -446,7 +453,7 @@ class LoopState:
     every docstring and comment, so in the artefact a paying customer maintains, this text does not
     exist and neither did the twenty-three comments these fields replaced — `run` opened with a wall
     of bare assignments (`stall_retries = 0`) whose meaning had been deleted at build time. A field
-    name is not deleted. a maintenance script is what measures the difference.
+    name is not deleted. A maintenance script is what measures the difference.
 
     Nothing here is derived and nothing here is a ceiling. Every field is a counter, a flag or a
     last-seen value that one iteration writes and a later one reads; the ceilings live on the loop.
@@ -515,6 +522,29 @@ class LoopState:
     #: landed. Zero whenever no call is outstanding, which is every state a reader of this record can
     #: observe from outside the turn.
     reserved_usd: float = 0.0
+
+
+@dataclass(frozen=True)
+class _CarriedUsage:
+    """The invoice for a forced call discarded before its unforced replacement."""
+
+    tokens: int = 0
+    cost_usd: float = 0.0
+    abandoned: int = 0
+    unpriced: int = 0
+    tokens_reported: bool = True
+    cost_reported: bool = True
+
+    @classmethod
+    def from_result(cls, result) -> "_CarriedUsage":
+        return cls(
+            tokens=int(getattr(result, "tokens", 0) or 0),
+            cost_usd=float(getattr(result, "cost_usd", 0.0) or 0.0),
+            abandoned=int(getattr(result, "abandoned_attempts", 0) or 0),
+            unpriced=int(getattr(result, "unpriced_attempts", 0) or 0),
+            tokens_reported=getattr(result, "tokens_reported", None) is not False,
+            cost_reported=getattr(result, "cost_reported", None) is not False,
+        )
 
 
 class ToolCallingLoop:
@@ -590,7 +620,8 @@ class ToolCallingLoop:
         # this way, each on its FIRST stall, discarding ~37.6M tokens of paid budget — one at 95% of its
         # budget unused, another at 91%. That is 6% of a benchmark run lost to a transport hiccup.
         #
-        # `chat()` already retries 598 at the HTTP layer (5 attempts, reroute on 2-5, ~30s of backoff), so
+        # `chat()` already retries the local timeout at the HTTP layer (5 attempts, reroute on 2-5,
+        # ~30s of backoff), so
         # reaching here means that ladder is exhausted. The evidence says exhausting it is NOT the same as
         # the provider being down: the nine kills were spread over eight hours (05:39 … 13:54, only one pair
         # inside five minutes) and reported 4-12 tok/s against the 40 floor — independent transient dips on
@@ -728,7 +759,7 @@ class ToolCallingLoop:
         self._enact_deny = ENACTMENT_DENY_TOOLS if enactment_deny_tools is None else frozenset(enactment_deny_tools)
         self._enact_rearm = ENACTMENT_REARM_TOOLS if enactment_rearm_tools is None else frozenset(enactment_rearm_tools)
 
-    def _meter(self, tokens: int, cost_usd: float = 0.0) -> str:
+    def _meter(self, tokens: int, cost_usd: float = 0.0, *, state: LoopState | None = None) -> str:
         """Spend a turn's tokens AND its dollars on the budget.
 
         Returns the NAME of the resource that crossed its cap, or "" to continue. A name
@@ -742,7 +773,7 @@ class ToolCallingLoop:
         passed on every run of 2026-08-08 and did nothing; a governor built from `--max-spend-usd 5` and
         charged 50,000,000 tokens still passes `check()`. The number the ceiling needs was already
         arriving on every response (`llm.py` accumulates `usage["cost"]`) and was simply never handed
-        over. the design notes
+        over. The design notes.
 
         Both resources are charged before either return, and that ordering is load-bearing for the same
         reason `BudgetGovernor.spend` commits before it raises: the tokens and the dollars of a
@@ -755,15 +786,43 @@ class ToolCallingLoop:
         # The FIRST resource to cross, not the last: both are charged either way (see above), but the
         # one a customer is told about should be the one that actually stopped them.
         stop = ""
+        exceeded: list[BudgetExceeded] = []
+        invalid: list[tuple[str, ValueError]] = []
         for resource, amount in (("tokens", tokens), ("usd", cost_usd)):
+            if resource == "usd" and state is not None and state.reserved_usd:
+                settled = False
+                try:
+                    self.governor.settle("usd", state.reserved_usd, cost_usd)
+                    settled = True
+                except BudgetExceeded as e:
+                    settled = True       # settle commits the crossing charge before it raises
+                    exceeded.append(e)
+                    stop = stop or e.resource
+                except ValueError as e:
+                    invalid.append((resource, e))
+                finally:
+                    # This loop no longer owns the claim once settlement committed it. Clear that
+                    # ownership before journal I/O: if recording the crossing fails, `run`'s outer
+                    # finally must not release another concurrent loop's still-live reservation.
+                    if settled:
+                        state.reserved_usd = 0.0
+                continue
             if not amount:
                 continue
             try:
                 self.governor.spend(resource, amount)
             except BudgetExceeded as e:
-                self._rec("budget_exceeded", detail=str(e))
+                exceeded.append(e)
                 stop = stop or e.resource
-        return stop
+            except ValueError as e:
+                invalid.append((resource, e))
+        # Charge every resource before writing either event. A journal failure must not make the
+        # provider's already-incurred token or dollar charge disappear from the run ledger.
+        for error in exceeded:
+            self._rec("budget_exceeded", detail=str(error))
+        for resource, error in invalid:
+            self._rec("budget_value_invalid", resource=resource, detail=str(error))
+        return "invalid_usage" if invalid else stop
 
     def _unaffordable_next_call(self, st: LoopState) -> float:
         """The dollar headroom a call needs and does not have, or 0.0 to proceed.
@@ -774,7 +833,7 @@ class ToolCallingLoop:
         that refused to record it would misreport the very run that blew the cap. That ordering is right
         and it is not what is being changed here. The consequence was that the cap stopped the call
         AFTER the one that crossed it, so the customer's ceiling was really "your ceiling, plus one
-        model call" — and `CI-INTEGRATION.md` sells the ceilings as the thing that makes cost
+        model call" — and the integration guide sells the ceilings as the thing that makes cost
         predictable. An approximate ceiling is a different product claim from a ceiling.
 
         So the enforcement point moves to BEFORE the call, where a refusal costs nothing: if the
@@ -869,82 +928,139 @@ class ToolCallingLoop:
         **ONE STEP CAN MAKE TWO PROVIDER CALLS, and until 2026-08-24 it metered one.** A forced
         `tool_choice` a provider rejects answers with an HTTP error or a refusal — `opus-4.8` burned
         9,003 prompt tokens refusing one, four attempts out of four — and the degrade-safe retry below
-        overwrote the result, dropping that charge on the floor. It is carried in locals rather than
-        folded onto the result object, because `backend` is an injection point and a double's result
-        need not be a dataclass this could rebuild.
+        overwrote the result, dropping that charge on the floor. It is carried in a local record
+        rather than folded onto the result object, because `backend` is an injection point and a
+        double's result need not be a dataclass this could rebuild.
 
         Extracted from `run` for the reason the maintainers' suite exists to reward: "send the turn
         and account for it" is a whole decision, and leaving it inline grew the largest function in the
         shipped tree past the ceiling its own ratchet defends.
         """
         sent_at = time.monotonic()
-        # Charges this STEP incurred on a call whose result is not the one returned. Zero on every
-        # ordinary step; the forced-tool rejection is the only path that makes two.
-        carried_tokens, carried_usd = 0, 0.0
+        res, carried = self._send_turn(messages, tools, step)
+        usage = self._turn_usage(res, carried)
+        identity = self._identity_fields(res)
+        step_tokens = usage["tokens"]
+        step_usd = usage["cost_usd"]
+        self._rec("llm_request", step=step, seconds=round(time.monotonic() - sent_at, 3),
+                  total_tokens=step_tokens, cost_usd=step_usd,
+                  abandoned=usage["abandoned"], unpriced=usage["unpriced"],
+                  tokens_reported=usage["tokens_reported"],
+                  cost_reported=usage["cost_reported"], **identity,
+                  ok=bool(getattr(res, "ok", True)),
+                  finish_reason=getattr(res, "finish_reason", "") or "")
+        st.spent += step_tokens
+        st.max_call_usd = max(st.max_call_usd, step_usd)
+        hit = self._meter(step_tokens, step_usd, state=st)
+        gaps = self._usage_gaps(usage)
+        for gap in gaps:
+            self._rec("llm_usage_gap", step=step, resource=gap.removeprefix("unreported_"),
+                      requested_model=identity["requested_model"],
+                      served_model=identity["served_model"],
+                      identity_verdict=identity["identity_verdict"])
+        return res, self._enforced_usage_gap(gaps) or hit
+
+    def _forced_choice(self, step: int):
+        """The forcing hook's choice, degrading a broken hook to the ordinary call."""
+        if self.force_tool_hook is None:
+            return None
+        try:
+            return self.force_tool_hook(step)
+        except Exception as e:            # a broken hook degrades to "auto", never traps the loop
+            self._rec("force_tool_hook_error", step=step, error=f"{type(e).__name__}: {e}")
+            return None
+
+    def _send_turn(self, messages: list, tools: list,
+                   step: int) -> tuple[object, _CarriedUsage]:
+        """Send once, or replace a rejected forced call while retaining its invoice."""
         # Per-turn tool_choice forcing (weak-model lever): the hook may force a tool call on early
         # turns. Only pass tool_choice when forcing is ACTIVE (non-None) — the default path keeps the
         # exact old chat() signature, so backends/mocks whose chat() predates tool_choice are
         # unaffected.
-        tc = None
-        if self.force_tool_hook is not None:
-            try:
-                tc = self.force_tool_hook(step)
-            except Exception as e:            # a broken hook degrades to "auto", never traps the loop
-                self._rec("force_tool_hook_error", step=step, error=f"{type(e).__name__}: {e}")
-                tc = None
-        if tc is not None:
-            self._rec("force_tool", step=step, tool_choice=tc)
-            res = self.backend.chat(messages, tools, model=self.model, timeout=self.timeout,
-                                    tool_choice=tc)
-            if not res.ok:
-                # DEGRADE-SAFE FORCING (Fable-review HIGH): a provider that REJECTS the forced
-                # tool_choice (OpenRouter 404 "no endpoint supports this tool_choice", or a named tool
-                # absent from the set) returns a terminal non-ok — which would otherwise kill the task
-                # and, on a forcing run, wipe every task on turn 1. Retry this turn ONCE with forcing
-                # DROPPED (auto) before it goes terminal.
-                self._rec("force_tool_rejected", step=step, error=(res.error or "")[:200])
-                carried_tokens = int(getattr(res, "tokens", 0) or 0)
-                carried_usd = float(getattr(res, "cost_usd", 0.0) or 0.0)
-                res = self.backend.chat(messages, tools, model=self.model, timeout=self.timeout)
-        else:
-            res = self.backend.chat(messages, tools, model=self.model, timeout=self.timeout)
+        choice = self._forced_choice(step)
+        if choice is None:
+            return (self.backend.chat(messages, tools, model=self.model, timeout=self.timeout),
+                    _CarriedUsage())
+        self._rec("force_tool", step=step, tool_choice=choice)
+        result = self.backend.chat(messages, tools, model=self.model, timeout=self.timeout,
+                                   tool_choice=choice)
+        if result.ok:
+            return result, _CarriedUsage()
+        self._rec("force_tool_rejected", step=step, error=(result.error or "")[:200],
+                  **self._identity_fields(result))
+        # Only a response that explicitly rejected the forced-choice field earns an unforced retry.
+        # Treating every generic failure as eligible duplicated expired credentials and policy 403s;
+        # treating an unknown backend result as eligible also hid its first failure behind a second.
+        if not getattr(result, "forcing_retry_safe", False):
+            return result, _CarriedUsage()
+        replacement = self.backend.chat(messages, tools, model=self.model, timeout=self.timeout)
+        return replacement, _CarriedUsage.from_result(result)
 
-        step_tokens = int(getattr(res, "tokens", 0) or 0) + carried_tokens
-        step_usd = float(getattr(res, "cost_usd", 0.0) or 0.0) + carried_usd
-        # WHERE THE TOKENS AND THE SECONDS WENT. A finished run reported one total in its cost line and
-        # could attribute none of it to a step; `shard/telemetry.py` said so in a `gaps` entry rather
-        # than emitting a zero, and this is the record that closes it.
-        #
-        # ONE RECORD PER TURN, and a forced turn the provider REJECTED makes two provider calls and
-        # still lands one record here — the rejected one is marked by its own `force_tool_rejected`
-        # event above. Stated because a reader counting `llm_request` events against a provider bill
-        # needs to know which they are counting.
-        #
-        # `abandoned` is the count of attempts inside the surviving call whose bill the transport never
-        # saw at all (`llm.chat`). It is zero on every route that does not stream, and a reader
-        # reconciling this journal against an invoice needs it to know the row is a floor, not a total.
-        self._rec("llm_request", step=step, seconds=round(time.monotonic() - sent_at, 3),
-                  total_tokens=step_tokens, cost_usd=step_usd,
-                  abandoned=int(getattr(res, "abandoned_attempts", 0) or 0),
-                  ok=bool(getattr(res, "ok", True)),
-                  finish_reason=getattr(res, "finish_reason", "") or "")
-        # Account the turn's tokens BEFORE metering. ``governor.spend()`` COMMITS the spend and then
-        # raises BudgetExceeded when the cap is crossed, so the tokens of the trip-wire turn are on the
-        # governor's ledger; incrementing first keeps this loop's local total and the governor's ledger
-        # in agreement on BOTH paths — result.tokens == governor.spent("tokens") whether the run ends
-        # normally or on a budget-exceed. (Counting after ``_meter`` would silently drop the final
-        # turn's tokens from result.tokens while the ledger still carried them.)
-        st.spent += step_tokens
-        # THE OBSERVED PRICE OF A CALL, which is what makes the pre-call ceiling self-calibrating.
-        # Recorded whether or not the turn was productive: a call that returned an error was still
-        # charged for, so it is evidence about what the NEXT one will cost.
-        #
-        # It is the price of the STEP, and since `llm.chat` began folding its discarded retries in,
-        # that price includes them. The guard and the ledger read one number, so a run whose provider is
-        # retrying reserves what a retrying call really costs rather than what its last attempt did —
-        # which is the half of the shortfall a fix to the ledger alone would leave.
-        st.max_call_usd = max(st.max_call_usd, step_usd)
-        return res, self._meter(step_tokens, step_usd)
+    def _turn_usage(self, result, carried: _CarriedUsage) -> dict:
+        """One step's known invoice and whether every request supplied each measurement."""
+        abandoned = int(getattr(result, "abandoned_attempts", 0) or 0) + carried.abandoned
+        unpriced = int(getattr(result, "unpriced_attempts", 0) or 0) + carried.unpriced
+        tokens_reported = getattr(result, "tokens_reported", None)
+        cost_reported = getattr(result, "cost_reported", None)
+        if not carried.tokens_reported:
+            tokens_reported = False
+        if not carried.cost_reported:
+            cost_reported = False
+        if abandoned:
+            tokens_reported = cost_reported = False
+        if unpriced:
+            cost_reported = False
+        return {
+            "tokens": int(getattr(result, "tokens", 0) or 0) + carried.tokens,
+            "cost_usd": float(getattr(result, "cost_usd", 0.0) or 0.0) + carried.cost_usd,
+            "abandoned": abandoned,
+            "unpriced": unpriced,
+            "tokens_reported": tokens_reported,
+            "cost_reported": cost_reported,
+        }
+
+    def _identity_fields(self, result) -> dict:
+        return {
+            "requested_model": getattr(result, "model", "") or self.model,
+            "served_model": getattr(result, "served_model", "") or "",
+            "identity_verdict": getattr(result, "identity_verdict", "") or "unreported",
+        }
+
+    @staticmethod
+    def _usage_gaps(usage: dict) -> tuple[str, ...]:
+        """Every missing measurement, independent of whether this run set that ceiling."""
+        gaps = []
+        if usage["tokens_reported"] is False:
+            gaps.append("unreported_tokens")
+        if usage["cost_reported"] is False:
+            gaps.append("unreported_usd")
+        return tuple(gaps)
+
+    def _enforced_usage_gap(self, gaps: tuple[str, ...]) -> str:
+        """The first gap that makes a configured finite ceiling unenforceable."""
+        if self.governor is None:
+            return ""
+        if self.governor.budget.tokens is not None and "unreported_tokens" in gaps:
+            return "unreported_tokens"
+        if self.governor.budget.usd is not None and "unreported_usd" in gaps:
+            return "unreported_usd"
+        return ""
+
+    def _meter_stop_result(self, hit: str, step: int, state: LoopState) -> AgentResult:
+        """Translate a metering stop token without adding branches to the main loop."""
+        errors = {
+            "invalid_usage": "the model endpoint returned a non-finite or negative usage value",
+            "unreported_tokens": (
+                "the model endpoint did not report token usage, so the finite token ceiling cannot "
+                "be enforced"),
+            "unreported_usd": (
+                "the model endpoint did not report cost, so the finite dollar ceiling cannot be "
+                "enforced"),
+        }
+        if hit in errors:
+            return self._result("error", step, state.n_calls, state.spent, errors[hit])
+        return self._result("budget", step, state.n_calls, state.spent, "run budget exhausted",
+                            limit_hit=hit)
 
     def _rec(self, type: str, **data) -> dict:
         """Journal an event stamped with THIS loop's ``role``.
@@ -952,6 +1068,22 @@ class ToolCallingLoop:
         Every event the loop records goes through here so identity can never be forgotten at one call
         site — which is the failure mode that made the shared journal's ``step`` field unattributable."""
         return self.journal.record(type, role=self.role, **data)
+
+    def _record_source_observation(self, name: str, args: dict, result: ToolResult, obs: str) -> None:
+        """Record passive inspection evidence after the same clamp that feeds the model."""
+        if name not in {"read_file", "grep"}:
+            return
+        if name == "read_file" and result.ok:
+            fields = _source_read_fields(result)
+            if fields is None:
+                return
+        else:
+            path = args.get("path", "." if name == "grep" else None)
+            if not isinstance(path, str) or not path or len(path) > 4096:
+                return
+            fields = {"path": path}
+        self._rec("source_read" if name == "read_file" else "source_search", **fields,
+                  ok=bool(result.ok), observation_complete=(obs == json.dumps(result.to_dict(), default=str)))
 
     def _campaign_and_push(self, st: LoopState, messages: list[dict], step: int) -> None:
         """Re-inject the campaign record when it changed, then fire the two auto-pushes.
@@ -1336,6 +1468,7 @@ class ToolCallingLoop:
             # (crash_rate / reliability / precision / sanitizer / crash_count) survives. A result that
             # already fits is serialized byte-for-byte as before. See ``clamp_observation``.
             obs = clamp_observation(result.to_dict(), self.max_obs_chars)
+            self._record_source_observation(tc.name, tc.arguments, result, obs)
 
             # A byte-identical call returns a byte-identical observation — the model is stuck in a
             # no-progress loop the campaign stall-detector (test_poc-only) can't see. First WARN once
@@ -1366,6 +1499,40 @@ class ToolCallingLoop:
             # observation. Capped: read-tool args are tiny; this only guards a pathological write.
             st.obs_args[idx] = json.dumps(tc.arguments, sort_keys=True)[:200]
         return None, progressed
+
+
+    def _cap_tool_calls(self, res, messages: list[dict], step: int) -> tuple[list, bool]:
+        """Bound one degenerate tool-call batch and keep its assistant message protocol-valid.
+
+        Normal batches pass through unchanged. Above the cap, identical calls are deduplicated before
+        the unique remainder is capped; the already-appended assistant message is trimmed by the same
+        indices so every retained call receives exactly one tool response on the next request.
+
+        Returns ``(calls_to_execute, was_capped)``. The caller owns the post-execution nudge because it
+        must be appended after the retained tool responses, not while this decision is made.
+        """
+        if len(res.tool_calls) <= MAX_TOOLCALLS_PER_TURN:
+            return res.tool_calls, False
+
+        sigs = [f"{tc.name}:{json.dumps(tc.arguments, sort_keys=True)}" for tc in res.tool_calls]
+        seen: set[str] = set()
+        kept_idx: list[int] = []
+        for i, sig in enumerate(sigs):
+            if sig in seen:
+                continue
+            seen.add(sig)
+            kept_idx.append(i)
+            if len(kept_idx) >= MAX_TOOLCALLS_PER_TURN:
+                break
+        exec_calls = [res.tool_calls[i] for i in kept_idx]
+        self._rec("toolcall_cap", step=step, original=len(res.tool_calls),
+                  executed=len(exec_calls), unique=len(set(sigs)))
+
+        assistant = messages[-1]
+        raw_calls = assistant.get("tool_calls") if isinstance(assistant, dict) else None
+        if isinstance(raw_calls, list) and len(raw_calls) == len(res.tool_calls):
+            assistant["tool_calls"] = [raw_calls[i] for i in kept_idx]
+        return exec_calls, True
 
 
     def run(self, goal: str) -> AgentResult:
@@ -1461,12 +1628,12 @@ class ToolCallingLoop:
 
             res, hit = self._send_and_bill(st, messages, tools, step)
             if hit:
-                return self._result("budget", step, st.n_calls, st.spent, "run budget exhausted",
-                                    limit_hit=hit)
+                return self._meter_stop_result(hit, step, st)
             if not res.ok:
                 # An empty-response streak is transient — retry the turn (same messages) rather than
-                # killing the attempt. Any other error (bad key, 4xx, hard refusal) is terminal.
-                if "empty" in (res.error or "").lower() and st.empty < self.max_empty:
+                # killing the attempt. This is an outcome bit from the parser, never a substring in
+                # provider-controlled error prose; any other error (bad key, 4xx, hard refusal) is terminal.
+                if res.empty_retry_safe and st.empty < self.max_empty:
                     st.empty += 1
                     self._rec("empty_retry", n=st.empty, error=(res.error or "")[:200])
                     continue
@@ -1474,7 +1641,7 @@ class ToolCallingLoop:
                 # fall straight through to the terminal return below — the measured cost of that is in
                 # `max_stall`'s note. Back off longer than the HTTP ladder already did (it is exhausted by
                 # now) and re-send the SAME messages, so a recovered turn resumes with no lost context.
-                if _is_transient_stall(res.error) and st.stall_retries < self.max_stall:
+                if res.stall_retry_safe and st.stall_retries < self.max_stall:
                     st.stall_retries += 1
                     self._rec("stall_retry", n=st.stall_retries, error=(res.error or "")[:200])
                     self._sleep(self.stall_backoff * st.stall_retries)
@@ -1487,20 +1654,25 @@ class ToolCallingLoop:
                                                     # while a SUSTAINED outage still terminates in bounded time
             self._rec("assistant", text=(res.text or "")[:2000],
                                 tool_calls=[tc.name for tc in res.tool_calls])
-            messages.append(res.raw_message or {"role": "assistant", "content": res.text})
 
-            # A reasoning turn CUT OFF at max_tokens (finish_reason="length") emits no tool_call before
-            # it runs out of room — that is a TRUNCATION, not a finish. Nudge it to continue and re-emit
-            # its next tool call rather than mis-reading it as done (and bouncing it through
-            # finish_gate). Bounded by max_truncated so a chronically-truncating model still terminates:
-            # once the cap is hit we stop nudging and fall through to the normal finish path.
-            if res.finish_reason == "length" and not res.tool_calls and st.truncated < self.max_truncated:
-                st.truncated += 1
-                self._rec("truncated_turn", n=st.truncated)
-                messages.append({"role": "user", "content": (
-                    "Your previous turn hit the token limit before finishing — continue and emit your "
-                    "next tool call.")})
-                continue
+            # ``finish_reason=length`` invalidates the WHOLE turn, including a tool call whose prefix
+            # happens to parse. Appending that assistant message leaves an unanswered partial call in
+            # the next request; dispatching it lets truncation turn a model's prefix into a side effect.
+            # Keep neither. The continuation is bounded, and exhausting the bound is an errored review,
+            # never a clean finish over content the provider explicitly said was incomplete.
+            if res.finish_reason == "length":
+                if st.truncated < self.max_truncated:
+                    st.truncated += 1
+                    self._rec("truncated_turn", n=st.truncated)
+                    messages.append({"role": "user", "content": (
+                        "Your previous turn hit the token limit before finishing — continue and emit your "
+                        "next tool call.")})
+                    continue
+                error = f"model hit the token limit {st.truncated + 1} consecutive times"
+                self._rec("llm_error", error=error)
+                return self._result("error", step, st.n_calls, st.spent, error)
+
+            messages.append(res.raw_message or {"role": "assistant", "content": res.text})
 
             if not res.tool_calls:
                 # No tools requested → the model is finishing. The gate may send it back to work.
@@ -1517,36 +1689,9 @@ class ToolCallingLoop:
                 self._rec("final", text=(res.text or "")[:4000])
                 return self._result("done", step, st.n_calls, st.spent, res.text or "")
 
-            # Per-turn tool_call CAP (in-turn degeneration guard). Bound a turn that degenerated into a
-            # huge batch of near-identical calls BEFORE executing hundreds of phantom tools: dedupe
-            # byte-identical (name,args) repeats — the degeneration signature — then cap the remainder to
-            # MAX_TOOLCALLS_PER_TURN and execute only that subset. See the module-level note for WHY. A
-            # normal (≤ cap) batch is passed through byte-for-byte unchanged (no dedupe, no nudge), so a
-            # legit small parallel batch is never disturbed.
-            capped_turn = len(res.tool_calls) > MAX_TOOLCALLS_PER_TURN
-            exec_calls = res.tool_calls
-            if capped_turn:
-                sigs = [f"{tc.name}:{json.dumps(tc.arguments, sort_keys=True)}" for tc in res.tool_calls]
-                seen: set[str] = set()
-                kept_idx: list[int] = []
-                for i, s in enumerate(sigs):
-                    if s in seen:               # a byte-identical repeat — the degeneration signature; drop it
-                        continue
-                    seen.add(s)
-                    kept_idx.append(i)
-                    if len(kept_idx) >= MAX_TOOLCALLS_PER_TURN:   # …and cap the unique remainder
-                        break
-                exec_calls = [res.tool_calls[i] for i in kept_idx]
-                self._rec("toolcall_cap", step=step, original=len(res.tool_calls),
-                                    executed=len(exec_calls), unique=len(set(sigs)))
-                # Keep the ALREADY-appended assistant message (messages[-1]) in sync with what we execute:
-                # drop the tool_calls we will not answer so the NEXT request is protocol-valid (no
-                # unanswered tool_calls). Align by INDEX (robust to missing/duplicate provider ids); guard
-                # on a shape/length match so a non-standard raw_message is left untouched.
-                asst = messages[-1]
-                raw_tcs = asst.get("tool_calls") if isinstance(asst, dict) else None
-                if isinstance(raw_tcs, list) and len(raw_tcs) == len(res.tool_calls):
-                    asst["tool_calls"] = [raw_tcs[i] for i in kept_idx]
+            # Bound a degenerate in-turn batch before executing it. The helper also trims the assistant
+            # protocol obligations to the retained subset; the nudge stays below, after their results.
+            exec_calls, capped_turn = self._cap_tool_calls(res, messages, step)
 
             st.truncated = 0                           # a productive (tool-emitting) turn resets the streak
             # Execute every requested tool call; feed each back as a role:"tool" result. The turn's

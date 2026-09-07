@@ -25,38 +25,59 @@ from __future__ import annotations
 
 import importlib
 
-# Public name → the submodule that defines it. This map IS the package's export surface; keep it in
+# Narrowed at build time to the names this artefact actually carries.
 _EXPORTS: dict[str, str] = {
-    # core — dependency-free
-    "Budget": "budget", "BudgetGovernor": "budget", "BudgetExceeded": "budget",
-    "Journal": "journal",
-    # reasoner backends — native tool calling is mandatory
-    "ClaudeCliBackend": "llm", "NativeClientBackend": "llm", "OpenRouterBackend": "llm",
-    "EchoBackend": "llm", "LLMResult": "llm",
-    # shared primitives
-    "ToolContext": "tools", "ToolRegistry": "tools",
-    # the containment floor — deliberately inspectable, per the design notes: the floor is a trust
-    # argument, and a trust argument that cannot be read is not one.
-    "ScopeManifest": "scope", "is_in_scope": "scope",
-    "run_containment_selftest": "containment",
-    # retrieval memory — ADVISORY ONLY. Measured at net zero (the design notes); retained, not
-    # promoted. Do not add a call site it did not already have.
-    "HybridRetriever": "memory", "SessionMemory": "memory", "build_context": "memory",
-    "fence": "memory",
+    'Budget': 'budget',
+    'BudgetGovernor': 'budget',
+    'BudgetExceeded': 'budget',
+    'Journal': 'journal',
+    'ClaudeCliBackend': 'llm',
+    'OpenRouterBackend': 'llm',
+    'EchoBackend': 'llm',
+    'LLMResult': 'llm',
+    'ToolContext': 'tools',
+    'ToolRegistry': 'tools',
+    'HybridRetriever': 'memory',
+    'SessionMemory': 'memory',
+    'build_context': 'memory',
+    'fence': 'memory',
 }
 
 __all__ = [
-    "Budget", "BudgetGovernor", "BudgetExceeded",
-    "Journal",
-    "ClaudeCliBackend", "NativeClientBackend", "OpenRouterBackend",
-    "EchoBackend", "LLMResult",
-    "ToolContext", "ToolRegistry",
-    "ScopeManifest", "is_in_scope",
-    "run_containment_selftest",
-    "HybridRetriever", "SessionMemory", "build_context", "fence",
+    'Budget',
+    'BudgetGovernor',
+    'BudgetExceeded',
+    'Journal',
+    'ClaudeCliBackend',
+    'OpenRouterBackend',
+    'EchoBackend',
+    'LLMResult',
+    'ToolContext',
+    'ToolRegistry',
+    'HybridRetriever',
+    'SessionMemory',
+    'build_context',
+    'fence',
 ]
 
-__version__ = "0.1.0.dev0"
+# THE THIRD MANIFEST, AND THE ONLY ONE A CUSTOMER CAN ASK THE ARTEFACT FOR. The two
+# `pyproject.toml` files are files in a tree; this is what
+# `python -c 'import shard; print(shard.__version__)'` answers inside the action container, which is
+# what an issue asking "which version produced this alert" gets answered with. It read `0.1.0.dev0`
+# from the W1 port until 2026-09-02 while both manifests read 2.3.0, and it ships verbatim in every
+# artefact this project builds.
+#
+# Nothing in the shipping code READS it — measured by RUNNING the code, not by grepping: the SARIF
+# driver carries a name and no version, the result document carries `"tool": "Shard"`, the survey
+# payload carries only `markers_pack_version`, there is no `--version` subcommand and no Dockerfile
+# sets a LABEL. So the disagreement was never a wrong verdict. It was the artefact giving the one
+# answer it had about itself, and giving a wrong one.
+#
+# THIS COMMENT SHIPS, so it names no development path and no withheld component. The free builder
+# deletes a comment line that names either and keeps the rest, which truncates the sentence around
+# it: the first draft of this block lost its own last line that way. Bump this in the release commit
+# alongside both manifests; the release gate refuses a cut where the three disagree.
+__version__ = "4.0.3"
 
 
 def __getattr__(name: str):

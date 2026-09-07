@@ -10,6 +10,7 @@ Pure + dependency-free + unit-testable.
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from dataclasses import dataclass
@@ -23,6 +24,18 @@ class BudgetExceeded(RuntimeError):
         self.resource = resource
         self.spent = spent
         self.limit = limit
+
+
+def _finite_nonnegative(value, label: str) -> None:
+    """Reject values that can poison every later ceiling comparison."""
+    if isinstance(value, bool):
+        raise ValueError(f"{label} must be a finite non-negative number")
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"{label} must be a finite non-negative number") from e
+    if not math.isfinite(number) or number < 0:
+        raise ValueError(f"{label} must be a finite non-negative number")
 
 
 @dataclass
@@ -143,11 +156,9 @@ _SWEEP_BACKSTOP = 100
 
 #: THE STEP COUNT THIS CODEBASE ALREADY SIZES ITS TOKEN CEILING AROUND, granted rather than implied.
 #:
-#: the separate package's `token_cap` was raised to 8,000,000 with the comment *"200 steps must be
+#: The separate package's `token_cap` was raised to 8,000,000 with the comment *"200 steps must be
 #: REACHABLE: at 2M the cap bound at ~40-60 steps"*, and `cli.py`'s token floor refuses a ceiling that
 #: would put 200 steps out of reach. Both defend a number that no profile ever handed to the loop.
-#:
-#: WRITTEN OUT RATHER THAN IMPORTED, deliberately. `budget.py` is core and imports nothing —
 _INITIAL_STEP_FLOOR = 200
 
 #: A first look at a target nobody has scanned. Coverage matters more than cost.
@@ -182,6 +193,13 @@ class BudgetGovernor:
     _RESOURCES = ("tokens", "usd", "wall_seconds", "subagents", "benchmark_task_runs")
 
     def __init__(self, budget: Budget, *, now: float | None = None) -> None:
+        for resource in self._RESOURCES:
+            limit = getattr(budget, resource)
+            if limit is not None:
+                _finite_nonnegative(limit, f"{resource} budget")
+        _finite_nonnegative(budget.degrade_at, "degrade threshold")
+        if now is not None and not math.isfinite(float(now)):
+            raise ValueError("budget clock origin must be finite")
         self.budget = budget
         self._spent: dict[str, float] = {r: 0.0 for r in self._RESOURCES}
         # Headroom CLAIMED by work in flight and not yet charged. Kept apart from `_spent` on purpose:
@@ -213,6 +231,7 @@ class BudgetGovernor:
         return max(0.0, limit - self.spent(resource))
 
     def can_afford(self, resource: str, amount: float) -> bool:
+        _finite_nonnegative(amount, f"{resource} amount")
         limit = self._limit(resource)
         if limit is None:
             return True
@@ -239,6 +258,7 @@ class BudgetGovernor:
         """
         if resource not in self._RESOURCES:
             raise ValueError(f"unknown budget resource: {resource}")
+        _finite_nonnegative(amount, f"{resource} spend")
         if resource == "wall_seconds":  # wall time is measured, not spent
             self.check()
             return
@@ -260,6 +280,7 @@ class BudgetGovernor:
         """
         if resource not in self._RESOURCES:
             raise ValueError(f"unknown budget resource: {resource}")
+        _finite_nonnegative(amount, f"{resource} spend")
         if resource == "wall_seconds":
             # Wall time is measured, never reserved — there is nothing to debit. Report the headroom so
             # a caller can branch on it uniformly.
@@ -279,7 +300,7 @@ class BudgetGovernor:
         replaces.** The dollar ceiling is enforced before a call rather than after it, because the
         provider bills whatever the ledger would have preferred — but the enforcement was a READ
         (`remaining("usd")`) with the spend arriving much later, at the far end of a model round-trip.
-        the separate package fans sub-loops out on a thread pool over ONE shared governor, so N loops all
+        The separate package fans sub-loops out on a thread pool over ONE shared governor, so N loops all
         read the same headroom, all conclude they can afford a call, and all make one. The cap is then
         crossed by up to N calls instead of the one the docstrings account for.
 
@@ -292,6 +313,7 @@ class BudgetGovernor:
         """
         if resource not in self._RESOURCES:
             raise ValueError(f"unknown budget resource: {resource}")
+        _finite_nonnegative(amount, f"{resource} reservation")
         if resource == "wall_seconds":
             return self.can_afford(resource, amount)
         with self._lock:
@@ -306,8 +328,37 @@ class BudgetGovernor:
         caller bug that must not manufacture budget out of arithmetic."""
         if resource not in self._RESOURCES or resource == "wall_seconds":
             return
+        _finite_nonnegative(amount, f"{resource} release")
         with self._lock:
             self._reserved[resource] = max(0.0, self._reserved[resource] - amount)
+
+    def settle(self, resource: str, reserved: float, actual: float) -> None:
+        """Atomically replace one in-flight reservation with the charge that actually landed.
+
+        Release-then-spend is not equivalent under fan-out: another loop can reserve the temporary
+        headroom between those operations and both calls then cross the cap. Keeping both mutations
+        under this lock also removes the opposite error—counting the real charge and the stale claim at
+        once—which made a concurrent loop stop while affordable money remained.
+
+        The spend commits before ``BudgetExceeded`` is raised, exactly like :meth:`spend`, because the
+        provider has already charged it. ``actual == 0`` is still a settlement: the unused claim is
+        returned immediately rather than held until the loop's next step.
+        """
+        if resource not in self._RESOURCES or resource == "wall_seconds":
+            raise ValueError(f"resource cannot settle a reservation: {resource}")
+        _finite_nonnegative(reserved, f"{resource} reserved settlement")
+        _finite_nonnegative(actual, f"{resource} actual settlement")
+        with self._lock:
+            if reserved > self._reserved[resource]:
+                raise ValueError(
+                    f"cannot settle {reserved:.4g} of {resource}; only "
+                    f"{self._reserved[resource]:.4g} is reserved")
+            self._reserved[resource] -= reserved
+            new = self._spent[resource] + actual
+            self._spent[resource] = new
+            limit = self._limit(resource)
+            if limit is not None and new > limit:
+                raise BudgetExceeded(resource, new, limit)
 
     def reserved(self, resource: str) -> float:
         """Headroom currently claimed by work in flight. Reported separately from `spent` because they
@@ -362,7 +413,7 @@ class BudgetGovernor:
 # A benchmark run is a fitness measurement, and its number only means "the solver's capability" if the
 # BACKEND actually ran the solver on every task. This session's #1 operational pain was the opposite: the
 # fp8 GLM-5.2 provider slow-dripped and FROZE the full-50 run — most tasks died in the transport (idle
-# stalls, empty bodies, unretried 503/598/599), not in the solver. Nothing tallied per-task backend
+# stalls, empty bodies, HTTP 5xx and local transport outcomes), not in the solver. Nothing tallied per-task backend
 # outcomes into a run verdict, so such a run reads back as a *clean* low solve-rate — a phantom capability
 # gap that misdirects the DIAGNOSE step into "fixing" a solver that never got to try. This tracker closes
 # that hole: it separates a genuine MISS (the solver ran, the target didn't fall) from a BACKEND_ERROR (the
@@ -381,7 +432,7 @@ class BudgetGovernor:
 #   solved        — a verified solve (the differential oracle credited a crash).
 #   miss          — a genuine done-with-no-crash: the solver ran to a terminal state, the target stood.
 #   backend_error — the infra died, not the solver: ``AgentResult.status == "error"`` OR a backend failure
-#                   (an ``LLMResult`` with ``ok=False`` on an unretried terminal 503/598/599 from llm.py).
+#                   (an ``LLMResult`` with ``ok=False`` after an unretried HTTP/local transport failure).
 # ``solved`` and ``miss`` are the PRODUCTIVE outcomes (the solver actually got a fair attempt); a run with
 # none of them measured nothing.
 _HEALTH_OUTCOMES = ("solved", "miss", "backend_error")
@@ -397,7 +448,8 @@ def classify_terminal(status: str, retried_ok: bool = False) -> str:
     (``_harness_status_outcome``); the two vocabularies are deliberately kept apart, not shared.
 
     ``status == "error"`` is the loop's own signal that a backend failure (an unretried terminal
-    503/598/599 from ``llm.py``) killed the turn — a ``backend_error`` unless ``retried_ok`` says the
+    HTTP or local transport result from ``llm.py``) killed the turn — a ``backend_error`` unless
+    ``retried_ok`` says the
     transport recovered and the solver still reached a real verdict. Every other terminal status
     (``done`` / ``budget`` / ``maxsteps`` / ``repeat``) means the solver *ran*; without a separate
     crash verdict the conservative reading is a genuine ``miss``. A caller that DOES hold a crash

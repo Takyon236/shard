@@ -45,7 +45,12 @@ shard-run.log
 .env.*
 !.env.example
 
-# Local agent-tooling session state. It is machine-local scratch — transcripts of coding
-# sessions against this checkout — and `git add -A` has already swept one of its JSON
-# files into a commit once. Nothing in it belongs to the product.
+# Local agent-tooling session state. Machine-local scratch — transcripts of coding sessions against
+# this checkout — and `git add -A` has already swept one of its JSON files into a commit once.
+# Nothing in it belongs to the product.
+#
+# Contributed on this repository by hand and carried upstream on 2026-09-02 so it survives. This
+# repository is GENERATED: an edit made here is replaced by the next release, so the change had to
+# move into the tree the generator reads. That is why it is now in every build rather than only in
+# one commit.
 .opencode/

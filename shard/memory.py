@@ -30,7 +30,7 @@ whole suite runs with an in-memory fake and no engine install.
      harnesses (the predecessor project's `maintenance tooling`,
      ``fused_retrieval.py``, ``run_benchmark_memory.py``). The hybrid BM25 × activation
      approach these symbols implement was rigorously measured and found net-zero-to-negative
-     (see ``MEMORY.md``); it is kept advisory-only. Their signatures are pinned by
+     (see the design notes); it is kept advisory-only. Their signatures are pinned by
      `the maintainers' suite::_EXTERNAL_CONTRACT``.
 
    LIVE-SOLVER half (used by the benchmark solver):
@@ -49,6 +49,12 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, Sequence, runtime_checkable
+
+from .artefactfs import append_file, read_file, trusted_directory
+
+# Only the newest ``max_recall`` (50 by default) notes can enter a prompt. 64 MiB is already orders
+# above that useful window and refuses a sparse or indefinitely accumulated file before allocation.
+_MAX_SESSION_MEMORY_BYTES = 64 * 1024 * 1024
 
 # --- context fence ----------------------------------------------------------
 FENCE_OPEN = "<memory-context>"
@@ -257,11 +263,27 @@ class SessionMemory:
         self._now = now
         self.max_recall = max_recall
         self.notes: list[SessionNote] = []
-        if self.path and self.path.exists():
-            self._load()
+        self._directory = None
+        self._parent_fd: int | None = None
+        if self.path:
+            directory = trusted_directory(self.path.parent.resolve(), create=True)
+            _path, self._parent_fd = directory.__enter__()
+            self._directory = directory
+            try:
+                try:
+                    raw = read_file(
+                        self._parent_fd, self.path.name, max_bytes=_MAX_SESSION_MEMORY_BYTES,
+                    )
+                except FileNotFoundError:
+                    raw = None
+            except Exception:
+                self.close()
+                raise
+            if raw is not None:
+                self._load(raw)
 
-    def _load(self) -> None:
-        for line in self.path.read_text(encoding="utf-8").splitlines():
+    def _load(self, raw: bytes) -> None:
+        for line in raw.decode("utf-8").splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -282,11 +304,23 @@ class SessionMemory:
         note = SessionNote(text=strip_fence(text).strip(), kind=kind, run_id=self.run_id,
                            tags=list(tags or []), ts=self._now())
         self.notes.append(note)
-        if self.path is not None:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self.path.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(note.to_dict(), default=str) + "\n")
+        if self._parent_fd is not None:
+            encoded = (json.dumps(note.to_dict(), default=str) + "\n").encode("utf-8")
+            append_file(self._parent_fd, self.path.name, encoded)
         return note
+
+    def close(self) -> None:
+        """Release the persistence-directory descriptor retained across hostile tools."""
+        if self._directory is not None:
+            directory, self._directory = self._directory, None
+            self._parent_fd = None
+            directory.__exit__(None, None, None)
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def recall(self, query_text: str, *, top_n: int = 5, kinds: Sequence[str] | None = None) -> list[SessionNote]:
         """Keyword recall over the scratchpad. Most-recent wins ties so fresh context surfaces."""

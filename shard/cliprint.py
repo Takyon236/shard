@@ -1,6 +1,6 @@
 """Rendering a run for a terminal. No decisions, no files — `print` and nothing else.
 
-Third cut of `BACKLOG.md` item 2, after `shard/cliargs.py` and `shard/cliemit.py`. The seam is the
+Third cut of the maintainers' backlog item 2, after `shard/cliargs.py` and `shard/cliemit.py`. The seam is the
 one a support session actually navigates by: "the preflight output should also say X" is a question
 about this file alone, and it used to mean reading past seven subcommands to find four `print`
 blocks scattered through `shard/cli.py` between the functions that decide things.
@@ -12,7 +12,7 @@ rather than one it introduces.
 ## Two of these ship nowhere
 
 `_print_deep` and `_print_fix` are the paid commands' renderings and
-`build_free_tree._FREE_EXCLUDED_FUNCTIONS` drops both. `_print_fix` was NOT dropped until
+the free build script drops both. `_print_fix` was NOT dropped until
 2026-08-28: `_cmd_fix` left the free artefact and its renderer stayed, defined and called by nothing,
 printing a verdict vocabulary and a patch that free build has no command to produce. Found by asking
 the emitted package which private functions nothing in it references — the same question
@@ -42,7 +42,6 @@ def _print_capability(payload: dict) -> None:
     # against a real repository on 2026-08-23, which is the only way it could have been found: this is
     # a runtime string, so neither the packaging gates nor the prose redaction can see it. Preflight
     # printed
-    #
     #
     # to every customer of an artefact built to contain no trace of that capability — naming it, twice,
     # in the one command people run before they spend anything. `available` is False exactly when the
@@ -113,24 +112,74 @@ def _print_gateability(payload: dict) -> None:
             print("             start from: shard preflight --repo . --entry-template > .shard/entry.sh")
 
 
+def _print_endpoint(payload: dict) -> None:
+    """The `--probe-endpoint` answer, which cost a real request and was printed nowhere.
+
+    **THE ONE FACT THIS COMMAND EXISTS TO ESTABLISH, AND ONLY `--json` CARRIED IT.** `shard/cli.py`
+    sets `payload["endpoint"]` and this file rendered every other key; run as the README documents it
+    — `shard preflight --probe-endpoint`, no `--json` — a dead endpoint spent a request, printed not
+    one word about itself and exited 0. Measured 2026-09-03 against `http://127.0.0.1:9/v1`: the
+    verdict was `unsupported`, and grepping the human output for `unsupported`, `tool calling` and
+    `refus` found only the unrelated `the separate capability` row. README.md sends a customer here from the row
+    *"the run finds nothing and looks clean"*, which is the failure this product cannot otherwise
+    detect: an endpoint without native tool calling completes a run and reports a clean repository.
+
+    Printed ABOVE `can gate` deliberately. Both rows say a run will be worth less than it looks, and
+    this one is the stronger claim: without a gateable entry point the findings are informational,
+    but without a tool-calling endpoint there are no findings at all.
+
+    The `endpoint` key is absent unless `--probe-endpoint` was passed, so this renders nothing on the
+    free profiling path it must not slow down or charge for.
+    """
+    ep = payload.get("endpoint")
+    if not ep:
+        return
+    print(f"endpoint     {ep['verdict']}")
+    obs = ep.get("observed") or {}
+    # WHICH WEIGHTS ANSWERED, ABOVE the reason and on its own row, because it is the fact
+    # the design notes's "the customer always supplies inference" makes the customer responsible
+    # for, and the reason sentence is long enough to bury it. `model` is empty when the provider named
+    # nothing — a real answer, and not the same as "it served what you asked", which is what this
+    # probe reported until 2026-09-03 by echoing the request back into a key called `observed`.
+    # Measured on the wire that day: `api/coding/paas/v4` answers a `glm-5.2` request with `glm-5.3`
+    # under HTTP 200, naming the substitute in every SSE chunk, and the probe called it
+    # `validated … the configuration this project has measured`.
+    if obs.get("substituted"):
+        print(f"             SERVED `{obs['model']}`, NOT the `{obs['requested']}` you asked for")
+    elif obs.get("model"):
+        print(f"             served by {obs['model']}, as asked")
+    elif obs.get("requested") and ep["verdict"] != "unsupported":
+        # ONLY WHERE A ROUND TRIP ACTUALLY HAPPENED. `unsupported` is every way the exchange failed —
+        # refused connection, HTTP error, prose instead of a tool call — and telling a customer whose
+        # endpoint was never reached that "it names no model in its replies" invents a reply. The
+        # verdict word is written out rather than imported because this module imports nothing: it
+        # takes a payload and prints, which is what keeps "the preflight output should also say X" a
+        # question about one file.
+        print(f"             asked for {obs['requested']}; this endpoint names no model in its "
+              f"replies, so which weights answered is unverifiable from here")
+    print(f"             {ep['why'].replace('**', '')}")
+
+
 def _print_price(payload: dict) -> None:
     """What a run costs on the customer's own inference bill, and which tier they are on."""
-    # THE MONEY, in the shell output and not only in the JSON. the integration guideb makes this
+    # THE MONEY, in the shell output and not only in the JSON. The integration guide makes this
     # the pricing instrument, and a number a human never sees is not one.
     cost = payload["cost"]
-    print(f"your cost    ${cost['usd_low']:.2f}–${cost['usd_high']:.2f} a pull-request run, on YOUR "
-          f"inference bill")
+    print(f"your cost    ${cost['usd_low']:.2f}–${cost['usd_high']:.2f} observed priced lower bound per "
+          f"pull-request run, on YOUR inference bill")
     print(f"             ${cost['per_month_at_100_runs']['low']:.0f}–"
-          f"${cost['per_month_at_100_runs']['high']:.0f}/month at 100 runs. "
+          f"${cost['per_month_at_100_runs']['high']:.0f}/month is the same lower-bound extrapolation "
+          f"at 100 runs. "
           f"This repository resembles {cost['resembles']}")
-    print(f"             band is wide on purpose: {cost['basis']}")
-    # THE TOKENS, BESIDE THE DOLLARS, because the dollars are a floor and the tokens are the half that
-    # has been re-measured since the product could execute. `target.CALIBRATION_TOKENS_ONLY` carries
-    # the runs; the point of printing it is that a customer on an endpoint that reports no price —
-    # a self-hosted vLLM, a subscription — can size a run at all, which they could not before.
+    # THE TOKENS, BESIDE THE DOLLARS. The full dated basis stays in the JSON and customer reference;
+    # printing those two paragraphs here made the first no-key onboarding command read like a release
+    # note. Keep the facts a customer needs to set a ceiling: the observed bounds, the measured scale of
+    # the understatement, and the mode this sample does not cover.
     print(f"             {cost['tokens_low']:,}–{cost['tokens_high']:,} tokens a run. "
-          f"{cost['tokens_basis']}")
-    print(f"             what drives it: {cost['driver']}")
+          f"Later unpriced runs used a median {cost['tokens_median_ratio']}x the tokens; no dollar "
+          f"conversion is valid")
+    print("             Pull-request runs only; excludes initial scans. Start report-only and calibrate "
+          "from your endpoint")
     free = payload["free_tier"]
     print(f"free tier    {free['verdict']} — {free['why']}")
     for need in free["needs"]:
@@ -155,6 +204,7 @@ def _print_preflight(payload: dict, profile) -> None:
     """
     _print_profile(payload, profile)
     _print_capability(payload)
+    _print_endpoint(payload)
     _print_gateability(payload)
     _print_price(payload)
     if "workdir" in payload:
@@ -183,13 +233,18 @@ def _cost_line(tokens: float, cost: dict) -> str:
     # an endpoint that omits `usage` gives us no measurement at all, and printing 0 asserts one. Worse,
     # `--max-tokens` cannot bind against a count that never arrives, so the line stating the ceiling was
     # exactly the line a customer would have used to notice it was inert.
-    if not tokens and cost["requests"]:
+    token_reported = cost.get("token_reported_requests")
+    if token_reported is None:
+        token_reported = cost["requests"] if tokens else 0
+    if not token_reported and cost["requests"]:
         parts = ["token count not reported by this endpoint"
                  + (f" (ceiling {cost['tokens_ceiling']:,.0f} could not be enforced)"
                     if cost["tokens_ceiling"] else "")]
     else:
         parts = [f"{tokens:,.0f} tokens" + (f" of {cost['tokens_ceiling']:,.0f}"
                                             if cost["tokens_ceiling"] else " (no token ceiling)")]
+        if token_reported < cost["requests"]:
+            parts.append(f"token counts on {token_reported} of {cost['requests']} requests — a floor")
     if cost["usd"] is None:
         parts.append("cost not reported by this endpoint" if cost["requests"]
                      else "no inference")

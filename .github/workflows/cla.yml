@@ -20,7 +20,27 @@
 # runs one published action against the pull request's metadata — author, commit
 # list, comments — and nothing from the fork is executed or evaluated here.
 #
-# `permissions` is scoped to the three things the action actually needs.
+# `permissions` grants THREE scopes, and each one is a call the pinned action actually makes. Read
+# out of its source at `ca4a40a7`, not out of its README: `contents: write` is
+# `repos.createOrUpdateFileContents` writing the signature file, `pull-requests: write` is
+# `issues.{create,update,list}Comment` on the pull request, and `actions: write` is the single
+# `actions.reRunWorkflow` call in `pullRerunRunner.ts` — reached only when everyone has signed, and
+# it is what turns the red `cla` check green after a signature arrives by COMMENT, since an
+# `issue_comment` run posts no check against the pull request's head.
+#
+# `statuses: write` was granted until 2026-09-02 and NOTHING USED IT. `createCommitStatus` appears
+# once in the action's 1.18 MB bundle, in octokit's endpoint routing table, and at no call site; the
+# check on the pull request is this job's own conclusion, which Actions reports without the scope.
+# The line above claimed it "sets the check", which is the kind of sentence a reader trusts instead
+# of the code. Dropping `actions: write` is NOT the same trade: the re-run is caught with
+# `core.error`, so the job stays green and the pull request's check stays red, which is the
+# merge-past-a-red-check habit the allowlist below was landed to avoid.
+#
+# THE THIRD-PARTY ACTION IS PINNED BY COMMIT, NOT BY TAG. This workflow runs on
+# `pull_request_target` from any fork and hands it `secrets.GITHUB_TOKEN` with those three scopes, so
+# a mutable `@v2.6.1` means whoever can move that tag can act on this repository with a token the
+# fork never had to earn. A tag is a pointer its owner may repoint; a commit sha is the artefact.
+# The version stays in a trailing comment so a reader still knows WHAT is pinned.
 
 name: cla
 
@@ -34,7 +54,6 @@ permissions:
   actions: write
   contents: write
   pull-requests: write
-  statuses: write
 
 jobs:
   cla:
@@ -47,7 +66,7 @@ jobs:
       || github.event_name == 'pull_request_target'
     steps:
       - name: Check or record the signature
-        uses: contributor-assistant/github-action@v2.6.1
+        uses: contributor-assistant/github-action@ca4a40a7d1004f18d9960b404b97e5f30a505a08 # v2.6.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:

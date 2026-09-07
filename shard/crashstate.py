@@ -4,7 +4,8 @@ SAME next run.
 **The defect this module exists for was measured, not suspected.** `report._sarif_result` writes
 `partialFingerprints.shardCrashSignature`, and its own comment states the job exactly: *"what makes
 an alert persist across runs instead of closing and re-opening on every push."* The value it writes
-is `oracle._behaviour_sig` — a sha1 over the WHOLE normalised harness output. Measured 2026-08-28,
+is a sha1 over the WHOLE normalised harness output, computed by the separate capability's
+adjudicator. Measured 2026-08-28,
 two runs of one cJSON heap-buffer-overflow READ in `parse_string`, differing only in what always
 differs between two runs:
 
@@ -65,7 +66,8 @@ CRASH_STATE_FRAMES = 3
 
 #: The sanitiser that reported, normalised to one word. `Leak` is separate from `Address` on purpose:
 #: LeakSanitizer runs inside ASan by default and reports a class with a different CWE and a different
-#: severity, and `oracle._SANITIZER_RE`'s own comment records a harness that leaked on EVERY input.
+#: severity: a harness that leaks on EVERY input is a measured shape, and reporting it as an
+#: `Address` finding would attach the wrong CWE to every row it produced.
 _ERROR_RE = re.compile(
     r"(?:ERROR|WARNING|SUMMARY):\s*"
     r"(?P<san>Address|HWAddress|UndefinedBehavior|Undefined Behavior|Memory|Thread|Leak)"
@@ -266,7 +268,7 @@ _CWE: dict[tuple[str, str], tuple[str, ...]] = {
 #:
 #: **A WRITE bumps one band and the cap stays HIGH**, which is upstream's rule and upstream's cap. A
 #: `critical` band assigned from the crash type alone would be an adjective this module has not
-#: measured — `.claude/banned.txt`'s register, in the numeric field a board reads. Confidence that
+#: measured — the maintainers' style guide's register, in the numeric field a board reads. Confidence that
 #: the finding is real is a DIFFERENT axis and rides on the rule's `precision`, which is where SARIF
 #: puts it: a Shard `error` always carries a reproducing input, so it is `very-high` there while
 #: staying `medium` here.
@@ -299,8 +301,8 @@ _BANDS = ("low", "medium", "high", "critical")
 
 @dataclass(frozen=True)
 class CrashState:
-    """One sanitiser report, classified. Frozen for the same reason `oracle.Verdict` is: a
-    classification a later stage can edit is not a classification.
+    """One sanitiser report, classified. Frozen for the same reason the separate capability's own
+    verdict record is frozen: a classification a later stage can edit is not a classification.
 
     ``parsed`` is the abstention flag and every consumer must read it. False means the output was not
     a sanitiser report this module recognises — which is the ordinary case for a free-tier
@@ -361,9 +363,10 @@ class CrashState:
         """One line for a human: the class, the access, and the frames that identify it.
 
         The frames are the part that was missing. `report.py`'s own header records it as a defect:
-        *"`sanitizer` — the error-type line — and the frames are not on it. `oracle._top_frames`
-        exists and is pure, but no field carries its output."* A reader of the markdown could see
-        WHAT crashed and never WHERE, in a report whose subject is a crash.
+        *"`sanitizer` — the error-type line — and the frames are not on it."* The separate
+        capability has had a pure frame extractor since before this module existed and no field
+        carried its output, so a reader of the markdown could see WHAT crashed and never WHERE, in a
+        report whose subject is a crash.
         """
         if not self.parsed:
             return ""

@@ -74,7 +74,7 @@ def _events(source: Any) -> list[dict]:
 
     Tolerant on purpose: a run that was killed leaves a truncated last line, and `json.loads` accepts
     a bare string or number as valid JSON — so a line that parses to a non-dict must be skipped rather
-    than reaching `.get` and raising. a maintenance script::marker_refusals` records the same defect
+    than reaching `.get` and raising. A maintenance script::marker_refusals` records the same defect
     and the same fix; this is the only other place that parses this file.
     """
     if isinstance(source, (list, tuple)) and (not source or isinstance(source[0], dict)):
@@ -114,8 +114,9 @@ def _safe_args(key: str) -> dict:
     is for — which tools ran, with how many arguments, how big — without putting any of it in a file
     the customer may forward to a third-party observability stack.
 
-    A customer who wants the values has them: the full journal ships behind the verbose flag, in the
-    same directory. This is the artefact that is safe by default, not the only artefact.
+    A customer who needs the values can retain the full journal on a direct CLI run with
+    ``shard diff --journal-path <private-path>``. It never enters ``--out-dir``. This is the artefact
+    that is safe by default, not the only artefact.
     """
     _, _, raw = (key or "").partition(":")
     if not raw:
@@ -254,6 +255,16 @@ def _llm_usage(events: list[dict], gaps: list[str]) -> dict:
             llm["output_per_request"] = round(out_tokens / len(reqs), 1)
         if isinstance(out_tokens, int) and secs and sum(secs) > 0:
             llm["output_per_second"] = round(out_tokens / sum(secs), 1)
+        token_gaps = sum(r.get("tokens_reported") is False for r in reqs)
+        cost_gaps = sum(r.get("cost_reported") is False for r in reqs)
+        if token_gaps:
+            llm["token_unreported_requests"] = token_gaps
+            gaps.append(f"token usage was not reported for {token_gaps} model request(s) — token "
+                        "totals are a floor")
+        if cost_gaps:
+            llm["cost_unreported_requests"] = cost_gaps
+            gaps.append(f"cost was not reported for {cost_gaps} model request(s) — dollar totals "
+                        "are a floor")
     else:
         gaps.append("no per-request token accounting in this journal (no `llm_request` events) — "
                     "the run's total is in the report's cost line, but it cannot be attributed to a step")
@@ -308,7 +319,7 @@ def _run_summary(events: list[dict], gaps: list[str]) -> dict:
                        ("simple_proposed", ("status",)),
                        ("simple_adjudicated", ("findings", "gate_eligible")),
                        ("simple_exec", ("armed", "calls", "entry_calls", "shell_calls", "network",
-                                        "budget", "refused", "exhausted"))):
+                                        "budget", "refused", "exhausted", "spent"))):
         found = next((e for e in events if e.get("type") == kind), None)
         if found is None:
             continue
@@ -474,9 +485,20 @@ def render_log(source: Any) -> str:
             out.append(f"      CUT SHORT: the execution ceiling refused {refused} call(s). Some claim "
                        f"here was reasoned about rather than checked — treat any finding that is not "
                        f"gate-eligible as unconfirmed. Raising --max-steps raises this budget too")
+        elif ex.get("spent"):
+            # **THE THIRD STATE, AND ITS ABSENCE WAS THE DEFECT.** `refused == 0` used to select the
+            # affirmative sentence below, which is true only if the model would have asked again. It
+            # would not: it is handed `executions_left` on every tool result, so it stops at 0 rather
+            # than being denied. Measured on a live run — 24 of 24 calls, `refused: 0`, the agent's
+            # own last turn opening "I have no tool budget left" at model turn 20 of 40 — and the
+            # customer was told the run was complete on all three surfaces.
+            out.append(f"      SPENT IN FULL: every one of the {ex.get('budget')} executions was "
+                       f"used and none was refused. The model is told how many remain, so it stops "
+                       f"asking rather than being denied — treat this as a ceiling that MAY have cut "
+                       f"the run short. Raising --max-steps raises this budget too")
         else:
-            out.append("      the execution ceiling refused nothing, so no claim here was cut short "
-                       "by it")
+            out.append("      the execution ceiling refused nothing and was not spent in full, so no "
+                       "claim here was cut short by it")
 
     out += ["", "TOOLS", "-" * 72]
     for name, row in sorted(doc.get("tools", {}).items(), key=lambda kv: -kv[1]["calls"]):
@@ -504,7 +526,8 @@ def render_log(source: Any) -> str:
 
     out += ["", "=" * 72,
             "Arguments and tool output are described, never quoted: this file is safe to forward.",
-            "For the full transcript, re-run with the verbose flag and read shard_journal.jsonl.", ""]
+            "Direct CLI only: retain a full transcript with "
+            "shard diff --journal-path <private-path>.", ""]
     return "\n".join(out)
 
 

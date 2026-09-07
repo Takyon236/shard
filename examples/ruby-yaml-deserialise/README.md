@@ -12,14 +12,17 @@ also restores object construction from attacker-controlled text.
 Needs `ruby` on your PATH. The action's container carries it.
 
 ```bash
+set -euo pipefail
 cd examples/ruby-yaml-deserialise
 
 bash .shard/entry.sh /dev/null                            # silent, exit 0   <- the baseline
 bash .shard/entry.sh .shard/entry.sh.benign/ordinary.yml  # silent, exit 0
 bash .shard/entry.sh .shard/entry.sh.benign/malformed.yml # silent, exit 0
 
-printf -- '--- !ruby/object:Gem::Requirement\n  requirements: []\n' > /tmp/attack.yml
-bash .shard/entry.sh /tmp/attack.yml                      # SHARD_SESSION_OBJECT_CONSTRUCTED
+attack_input="$(mktemp)"
+printf -- '--- !ruby/object:Gem::Requirement\n  requirements: []\n' > "$attack_input"
+bash .shard/entry.sh "$attack_input"                      # SHARD_SESSION_OBJECT_CONSTRUCTED
+rm -f -- "$attack_input"
 ```
 
 ## Not every `!ruby/object:` tag constructs something
@@ -45,6 +48,7 @@ it is the defence working.
 ## Then point Shard at it
 
 ```bash
-shard survey --repo examples/ruby-yaml-deserialise --out-dir /tmp/shard-out
-shard preflight --repo examples/ruby-yaml-deserialise --witness-entry .shard/entry.sh
+set -euo pipefail
+shard survey --repo . --out-dir /tmp/shard-out
+shard preflight --repo . --witness-entry .shard/entry.sh
 ```
