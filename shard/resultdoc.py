@@ -370,11 +370,6 @@ def limits(findings, *, status: str, run=None, gate_reasons=(), scope_reasons=()
     # docstring states for every other field and which this one code broke — by testing `is None`, the
     # exact opposite of the state its sentence describes.
     #
-    # Measured 2026-09-02 by running both emitters rather than by reading the branch: `clipaid` never
-    # sets `exec_calls`, so this fired on EVERY deep run — the one place the sentence "this run
-    # executed nothing in the checkout" is reliably false, since acquiring a workdir compiles and runs
-    # the target. Meanwhile `exec_calls == 0`, the state it exists to report, emitted nothing at all.
-    #
     # An unset counter is now silent. Saying "we executed nothing" because we did not count is the
     # false-clean direction, and this whole array exists to answer "how do I know your clean is clean".
     if getattr(run, "exec_calls", None) == 0:

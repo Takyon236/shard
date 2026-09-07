@@ -6,7 +6,7 @@ which was `["--help"]`. **So the shipped action printed the argparse help, exite
 and ignored every input.** Nothing read an `INPUT_*` variable anywhere in the package. Every measured
 number this project has ever produced came through `python -m shard` invoked by hand.
 
-That is the maintainers' notes's standing process rule at the layer that IS the product: correct code that never
+That is the maintainers' notes' standing process rule at the layer that IS the product: correct code that never
 executed. The design notes, "Found by wiring the budget".
 
 ## Why this is Python and not a shell entrypoint
@@ -14,7 +14,7 @@ executed. The design notes, "Found by wiring the budget".
 A fixed `args:` block cannot do the job: the three modes take different flags (`--base-ref` is diff's,
 `--harness` is deep's, `survey` takes neither), so one static argument list is wrong for two modes out
 of three. And `args:` cannot write `$GITHUB_OUTPUT`, which is where the declared outputs have to
-end up. That leaves a shell script or this. It is this because the maintainers' notes's quality bar asks for a
+end up. That leaves a shell script or this. It is this because the maintainers' notes' quality bar asks for a
 deterministic test with no LLM call for everything that ships, and `argv_for` is a pure function from a
 dict to a list of strings — the maintainers' suite proves every input reaches a flag, which is the guard
 the backlog asked for in the same commit as the fix.
@@ -51,9 +51,9 @@ gate refused — see `_describes_itself`, which is where the two are told apart.
 
 ## Simple-safe
 
-Imports `shard.cli` and nothing from the separate package. The separate capability reaches the solver the same way it always
-does — through the lazy import inside `_cmd_deep` — so this module ships in the free image with the
-mode split intact. The maintainers' suite measures it.
+Imports `shard.cli` and nothing from the separate package. Every route to the solver runs through a lazy
+import inside the handler that needs one, never from here, so this module ships in the free image with
+the mode split intact. The maintainers' suite measures it.
 """
 
 from __future__ import annotations
@@ -207,7 +207,7 @@ def _ceilings(env, argv: list[str]) -> None:
 
 
 def workdir_for(env) -> str:
-    """that capability's workdir. `RUNNER_TEMP` on a runner, and it is chosen because it is OUTSIDE the
+    """That capability's workdir. `RUNNER_TEMP` on a runner, and it is chosen because it is OUTSIDE the
     checkout — `--workdir` says it must be, and a path under `GITHUB_WORKSPACE` would put a
     materialised target inside the repository we promise never to write to."""
     root = env.get("RUNNER_TEMP") or "/tmp"
@@ -500,10 +500,6 @@ def _describes_itself(code: int, payload: dict, env, *, echo=print) -> bool:
     status = str(payload.get("status") or "")
     fail_on = _input(env, "fail_on") or "none"
     delivery = (payload.get("artefacts") or {}).get("delivery") or {}
-    # Bundle delivery happens after adjudication, and its EXIT_CONFIG is independent of the finding
-    # gate. The validated payload is the proof: status=error, a required failure, and delivery.ok=false.
-    # Recognising it through fail_on made the same completed run self-describing under `reproduced` and
-    # outputless under `none`, even though clidiff/clipaid deliberately return 2 in both cases.
     delivery_failed = (code == EXIT_CONFIG and status == "error" and delivery.get("ok") is False
                        and bool(delivery.get("failed_required")))
     refused_by_gate = code != EXIT_OK and code == exit_code(False, fail_on, status=status)

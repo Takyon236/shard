@@ -549,7 +549,7 @@ def introduced_line_index(files) -> dict[str, frozenset[int]]:
     lines as introduced.
 
     **The 0/4 was a fact about one diff, not a property of the rule.** The canary's only deletion sits
-    on an *introduced* defect, so that measurement could never have caught this. The maintainers' notes's trap
+    on an *introduced* defect, so that measurement could never have caught this. The maintainers' notes' trap
     holds: a gate measured only on the shape where it is safe has not been tested.
 
     So the recall loss is accepted and stated: **3/5 rather than 4/5** on the canary PR run. The

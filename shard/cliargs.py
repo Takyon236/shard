@@ -28,7 +28,7 @@ guards that already exist and REJECTED:
   count — the one guard standing between a nested `from the separate package import ...` and the published
   free artefact — would have passed by not running. That is the exact failure this repository
   recorded on 2026-08-26, when the same guard asserted only that the count was non-zero.
-* a maintenance script states that the free package is FLAT and that `FREE_PACKAGES` being
+* A maintenance script states that the free package is FLAT and that `FREE_PACKAGES` being
   empty is the statement. A subpackage is a deliberate decision needing its own argument; a sibling
   module needs none, because `FREE_MODULES` is already a list of exactly this shape.
 
@@ -46,10 +46,6 @@ import math
 
 from shard.budget import SCAN_PROFILES
 from shard.gate import FAIL_ON_CHOICES
-# ON ITS OWN LINE so the free build can remove it. `DEEP_FAIL_ON_CHOICES` is read by `_deep_parser`
-# and by nothing else here, and the free build script only rewrites single-name
-# `from` imports — a two-name line would survive the drop with one name unused, which is an F401 in
-# the published repository's own lint, over code it did not write.
 
 
 def _ceiling(value: str) -> float:
@@ -129,10 +125,10 @@ def build_parser(handlers: dict) -> argparse.ArgumentParser:
     and therefore free of a cycle. Each command's flags are declared by its own function below;
     `_DECLARE` at the foot of this file maps a name to one, and this walks the caller's table.
 
-    **DRIVEN BY THE HANDLERS, and that is what the free build rests on.** a maintenance script
-    drops `_cmd_deep`, `_cmd_mirror` and `_cmd_fix` from `shard/cli.py` and their three declarations
-    from this module; the commands then do not exist in the emitted parser because nothing supplied a
-    handler for them, with no third list of names to keep in step. Before the split the same cut was
+    **DRIVEN BY THE HANDLERS, and that is what the free build rests on.** A maintenance script
+    drops the handlers a build does not carry from `shard/cli.py`, and their declarations from this
+    module; those commands then do not exist in the emitted parser because nothing supplied a handler
+    for them, with no third list of names to keep in step. Before the split the same cut was
     a sweep over statements inside a 200-line `_build_parser` body, keyed on the LOCAL VARIABLE names
     `deep`, `mir` and `fixp` — which would have taken any other local that happened to be spelled
     that way, and which had no way to refuse a paid command nobody had thought to name.

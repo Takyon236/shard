@@ -17,7 +17,7 @@ in-flight tasks. On a customer's CI runner that is the job dying, and on a self-
 other job on the machine with it.
 
 **THIS DOES NOT NARROW THE CAPABILITY, and that is the constraint the design is under.**
-the design notes A6 records the honest tension that `run_bash` is why the separate capability
+The design notes A6 records the honest tension that `run_bash` is why the separate capability
 works. Every one of the 36 generators this product ships peaks between **8.4 and 9.7 MiB** (measured
 2026-08-31, all 36 run through `construction_assets.construction_registry()`). The default ceiling is
 400x the largest of them and 6x below the smallest observed failure, so it refuses only runs that

@@ -73,7 +73,7 @@ payload-independent output, where the baseline genuinely does refute a common ma
 generalise and nothing asked whether it had. `_marker_is_not_the_payload` is unaffected and still stops
 the agent reading its own text back — a different attack.
 
-The maintainers' suite::test_the_empty_baseline_does_NOT_make_output_marker_sound_on_a_dispatching_entry_point`
+The maintainers' suite
 pins it.
 
 ### CLOSED 2026-08-12, opt-in: the control the CUSTOMER declares (`benign_controls`)
@@ -181,7 +181,7 @@ The corpus could not show the failure, which is the trap the maintainers' notes 
 one afternoon, and it is recorded here rather than quietly discarded.
 
 This is LANGUAGE-NEUTRAL. Nothing in it is specific to node, so it governs the Python flip that W9 P1.3
-left open as well. The maintainers' suite::test_the_differential_baseline_does_NOT_make_nonzero_exit_sound`
+left open as well. The maintainers' suite
 pins it.
 
 Two levers still compose here, and **both are constants set to OFF**:
@@ -193,7 +193,7 @@ Two levers still compose here, and **both are constants set to OFF**:
   which is the managed-language statement closest to a fatal signal in spirit: the program did not
   intend to be here.
 
-Neither flips until it has a number against a canary with planted defects. That is the maintainers' notes's standing
+Neither flips until it has a number against a canary with planted defects. That is the maintainers' notes' standing
 rule — *a lever lands OFF until it is measured, because a default is a claim* — and the W9
 measure-then-flip stays a one-line change to the constant in the commit that carries the measurement,
 exactly as hunk scoping shipped.
@@ -226,10 +226,10 @@ CONTAINMENT_REFUSAL = "witness execution containment failed: "
 #: Fatal FAULT signals, as a shell reports them (128 + N): ILL, ABRT, BUS, FPE, SEGV. SIGKILL (137) and
 #: SIGTERM (143) are deliberately absent — those are how a timeout kills a hang, and counting a hang as
 #: a demonstration is the false positive this whole module exists to avoid. Identical reasoning, and
-#: identical membership, to `deep/oracle._FATAL_SIGNAL_CODES`.
+#: identical membership, to the fatal-signal table the separate package keeps.
 FATAL_SIGNAL_CODES = frozenset({132, 134, 135, 136, 139})
 
-#: A timeout kill is never a demonstration. Matches `deep/oracle._TIMEOUT_KILL_CODES`.
+#: A timeout kill is never a demonstration. Matches the kill-code table the separate package keeps.
 TIMEOUT_KILL_CODES = frozenset({124, 137, 143})
 
 #: Environment variable names whose VALUE is a credential, stripped before the customer's entry point
@@ -1248,7 +1248,7 @@ class WitnessSpec:
     declared, nor the adjudication below.
 
     **There is deliberately no `args` field.** One existed and was removed: no caller ever populated
-    it, so it was a dead option in the maintainers' notes's sense, and its own docstring claimed the agent
+    it, so it was a dead option in the maintainers' notes' sense, and its own docstring claimed the agent
     controlled it — a false statement about the code that would have read as a reviewed decision. If
     passing extra arguments is ever needed, adding it back is one line, and the commit that does it
     owns the question this one did not have to answer: extra argv elements land as positional
@@ -1542,7 +1542,7 @@ FIRST, LAST = 0, -1
 #:           the truth is 3. Measured on php 8.3.
 #:
 #: Both were verified against real stacks before being left out, which is the only way that claim is
-#: worth anything: the maintainers' suite::test_the_runtimes_with_no_row_still_resolve` pins them.
+#: worth anything: the maintainers' suite pins them.
 #:
 #: A runtime absent from this table is not broken: its frames still reach the generic `_PATH_LINE` arm
 #: below, which answers when exactly one in-repository location resolves and refuses otherwise. That is
@@ -1839,8 +1839,8 @@ def entry_digest(repo, entry: str) -> str | None:
     gets no baseline, so `adjudicate` refuses rather than scoring.
 
     Reads BYTES. A text read would normalise line endings on some platforms and a tamper that only
-    changes them is still a tamper — the same reasoning, and the same prefix length, as
-    `deep/permit.harness_digest`.
+    changes them is still a tamper — the same reasoning, and the same prefix length, as the digest
+    the separate package takes of a harness.
     """
     resolved = resolve_entry(repo, entry)
     if resolved is None:
@@ -1892,7 +1892,7 @@ def controls_digest(repo, entry: str | None) -> str:
     that writes into its own control directory while being adjudicated. No entry point under
     `corpora/entries/` or `targets/` does.
 
-    **THE BENCH IS NOT EVIDENCE ABOUT THIS FUNCTION, and saying so is the point.** a maintenance script
+    **THE BENCH IS NOT EVIDENCE ABOUT THIS FUNCTION, and saying so is the point.** A maintenance script
     is 199 ok either way — but traced, its 41 `controls_digest` calls see a benign control ZERO times,
     because no bench row declares one. The corpus that does (`corpora/entries/*.benign`) is
     a maintenance script's, which needs a model. So the bench establishes that the no-control path
@@ -2037,7 +2037,7 @@ def _adjudicate_pristine(spec: WitnessSpec, snapshot: SourceSnapshot, *,
         # demonstrates a memory-safety bug crashes — raw memory, sanitiser output and arbitrary bytes
         # on stdout are its EXPECTED output, not a corner case. `text=True` alone decodes strict utf-8
         # and raises UnicodeDecodeError, which is neither TimeoutExpired nor OSError, so it escapes
-        # every `except` here and kills the run. See the separate package`, which had already
+        # every `except` here and kills the run. See the separate package, which had already
         # settled this for the same reason.
         # `env=` and not the inherited environment — see `entry_env`. This script is written by whoever
         # opened the pull request, and its output is published back to them.
@@ -2194,7 +2194,7 @@ def _nothing_adjudicated(spec: WitnessSpec, proc, output: str, *, digest: str,
     or it reads as a clean result — the fail-open each arm's comment records being measured.
     """
     # **THE ENTRY POINT'S OWN INTERPRETER IS MISSING, and until 2026-08-13 that was SILENT.**
-    # an internal audit measured the earlier image before its current runtimes were
+    # An internal audit measured the earlier image before its current runtimes were
     # added. The refusal remains necessary for a runtime or build SDK the release image still lacks.
     #
     # A `.shard/entry.sh` that `exec`s a runtime the image does not carry makes bash exit **127**, and
@@ -2375,7 +2375,7 @@ def _controlled_verdict(spec: WitnessSpec, plan: _TrialPlan, *, proc, output: st
         # is `_adjudge`'s and belongs where it can be enforced: it returns "" exactly when it says
         # True, and the contradiction loop above only ever writes a reason in the same statement that
         # sets `demonstrated = False`. A guard here would be unreachable, and unreachable code that
-        # looks like a safety net is what the maintainers' notes's "earn its place" refuses — it would also have
+        # looks like a safety net is what the maintainers' notes' "earn its place" refuses — it would also have
         # made this file's own mutation sweep report a kill it did not make.
         why_not=why_not,
     )
@@ -2920,7 +2920,7 @@ def _adjudge(spec: WitnessSpec, rc: int | None, output: str) -> tuple[bool, str]
     **ONE function rather than a predicate plus an explainer, and that is the whole point of the
     shape.** The two would be separate implementations of the same rule, so they would drift, and the
     drift would be silent: a report naming a cause the adjudicator did not act on is worse than the
-    generic sentence this replaced. The maintainers' notes's trap 3, applied to a reason instead of to
+    generic sentence this replaced. The maintainers' notes' trap 3, applied to a reason instead of to
     evidence.
 
     **The sentence is written for a CUSTOMER, and its subject matters.** Two of these branches are
@@ -3037,7 +3037,7 @@ def _marker_is_not_the_payload(spec: WitnessSpec, output: str) -> bool:
 
     An entry point that echoes its input would otherwise let the agent supply the marker as the payload
     and read it straight back — the agent grading itself through a pipe. Subtracting the payload is the
-    same guard `deep/oracle._effective_exit` applies to a sanitizer banner, and for the same reason:
+    same guard the separate package applies to a sanitizer banner, and for the same reason:
     what matters is that the evidence was not supplied by the thing being judged.
 
     **The subtraction is over `payload_readings`, and that is load-bearing rather than defensive.** This
@@ -3091,7 +3091,7 @@ def _normalise(rc: int) -> int:
 
     Both spellings occur: `./target "$1"` yields 139 for SIGSEGV while `exec ./target "$1"` makes the
     target the runner's direct child and yields -11. Measured, and identical to the normalisation
-    `deep/oracle._effective_exit` performs — -11 maps to 139 and -6 to 134, while -9 (137) and -15 (143)
+    the separate package performs — -11 maps to 139 and -6 to 134, while -9 (137) and -15 (143)
     stay out of the fatal set and inside the timeout set.
     """
     return 128 - rc if rc < 0 else rc

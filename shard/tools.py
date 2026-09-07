@@ -10,8 +10,8 @@ What lives here: ``ToolContext``, ``ToolResult``, ``Tool``, the ``ToolRegistry``
 on large files.
 
 What USED to live here: ``Branch`` / ``BranchResult``, the structural sub-agent contract the
-orchestration primitives spoke. Removed as code and kept as the note below, because every module they
-named was severed and none exists in this tree.
+orchestration primitives spoke. Removed as code, because every module they named was severed and none
+exists in this tree.
 
 What does NOT live here: benchmark / scoring tools, engine cognitive-memory tools, the promotion
 gate, and the human-gated mutators. **None of them lives anywhere in this tree.** Until 2026-09-02
@@ -37,23 +37,6 @@ from shard.toolreads import (capture_refs, directory_entries, grep_refs,
                              immutable_directory_link, regex_hits, selected_path)
 
 
-# ── the severed ReAct contract, kept as the RECORD it is ────────────────────────────────────────────
-# `Branch` and `BranchResult` used to sit here: a structural sub-agent Protocol and its result record.
-# They are gone as CODE and kept as this note, because every module they described — `orchestrator`,
-# `loop.ShardLoop`/`LoopResult`, `policy`, `swarm.py` — was severed and does not exist in this tree.
-# A Protocol whose referenced types 404 is not documentation; it is a stub that reads as live API.
-#
-# THE TRAP THEY WERE BUILT TO CLOSE IS WORTH KEEPING, because it is the reason the severance was hard.
-# the maintainers' notes states the solver imports no part of the ReAct agent. That was true of the direct edge
-# and transitively FALSE: `the benchmark` lazy-imported `orchestrator`, which imported `loop` for
-# `ShardLoop`/`LoopResult`, which imports `policy` — so enabling `verify_n`, `oracle`, `specialist` or
-# the staged path loaded the agent's core into a solver run. Nothing caught it because IMPORT TIME
-# STAYED CLEAN; the edge only existed once a flag was on.
-#
-# The fix was to notice the dependency was on a NAME rather than a behaviour — `orchestrator` used
-# `ShardLoop` purely as an annotation — so a structural type removed it. The maintainers' notes now records the
-# outcome: "The two systems stay separate" and "the ReAct self-improve loop is retired here, not
-# carried over." The contract itself has no consumer left in this repository.
 
 #: What a root the caller did not set is worth: NOTHING. It has to be a real ``Path`` rather than
 #: ``None`` because ``ToolContext`` captures a canonical path for all three roots (verified: ``None``
@@ -67,10 +50,9 @@ class ToolContext:
     """Where the tools operate. **Every root must be set by the caller; the defaults are a trap.**
 
     ``_read_allowed_roots`` returns all three, so a caller that sets one silently gets the other two.
-    Both shipping call sites — ``simple.run_simple`` on this tier, and the separate capability's
-    solver entry point on the other — collapse all three onto the tree under review, and
-    `the maintainers' suite::test_every_shipping_ToolContext_sets_all_three_roots``
-    is what stops a fourth being written the short way. It exists because the short way SHIPPED: simple
+    Both shipping call sites collapse all three onto the tree under review, and
+    `the maintainers' suite` is what stops
+    a fourth being written the short way. It exists because the short way SHIPPED: simple
     mode set only ``engine_root`` and handed the free-tier agent read access to ``witness.py``, the
     module that decides ``gate_eligible`` (`an internal audit` Finding 2).
 
@@ -80,11 +62,11 @@ class ToolContext:
     quoting a fifth in this docstring. Measured 2026-08-19 on the tree
     `a maintenance script` emits: 17 occurrences across 6 modules, 6 of them here.
 
-    The literals bought nothing. Both shipping paths set all three roots explicitly — read at
-    ``shard/simple.py`` (``run_simple``) and, on the other tier, the solver's own constructor — whose
-    registry builder reuses that same context rather than building a second — and the three bench
-    contexts in `a maintenance script` never exercise a read tool through a defaulted root. So no shipping
-    behaviour depended on them, which is what made replacing them safe rather than delicate.
+    The literals bought nothing. Both shipping paths set all three roots explicitly — the one in this
+    distribution is read at ``shard/simple.py`` (``run_simple``), whose registry builder reuses that
+    same context rather than building a second — and the three bench contexts in `a maintenance script`
+    never exercise a read tool through a defaulted root. So no shipping behaviour depended on them,
+    which is what made replacing them safe rather than delicate.
 
     **``python`` and ``store_path`` are GONE, not neutralised.** Two more of the same literals with
     **zero readers repo-wide** — the check `the design notes` asks for before deleting them, re-run
@@ -98,9 +80,9 @@ class ToolContext:
     classified SENSITIVE by the policy and escalated rather than applied autonomously. It is computed
     from ``__file__`` rather than written down, which is why it was never part of the leak.
 
-    **It used to say "self-edit is in scope (the agent may improve its own code)". That system is
-    RETIRED** — the maintainers' notes, "the ReAct self-improve loop is retired here, not carried over" — and the
-    sentence outlived it as a live statement of intent about a capability nothing offers. Removed
+    **It used to say "self-edit is in scope (the agent may improve its own code)". No shipping
+    command offers that** — the maintainers' notes records the decision — and the sentence outlived it as a live
+    statement of intent about a capability nothing offers. Removed
     rather than rewritten, because the honest reading of a self-edit clause on a security gate running
     inside a customer's CI is that it should never have been inherited."""
 
@@ -321,7 +303,7 @@ def _file_index(lines: "list[str]", suffix: str = "") -> str:
 
 #: A FLOOR under the window the model asks `read_file` for, or 0 for "take it at its word".
 #:
-#: **SHIPS AT 0 — OFF — AND THE MEASUREMENT THAT WOULD TURN IT ON IS NAMED BELOW.** the maintainers' notes's rule
+#: **SHIPS AT 0 — OFF — AND THE MEASUREMENT THAT WOULD TURN IT ON IS NAMED BELOW.** The maintainers' notes' rule
 #: is that an unmeasured lever lands off, and this one has an argument rather than a number.
 #:
 #: The argument, from four real repositories on 2026-08-18. As context fills and old tool results are

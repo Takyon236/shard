@@ -208,7 +208,7 @@ def _report_finding(ctx: ToolContext, path: str, line: int, title: str, why: str
     anything, which is exactly the base64 case. The adjudicator asks the same question again after the
     run, so a marker that talks its way past this one gains nothing.
 
-    **This is the fix for the gate's variance**, the maintainers' notes's standing top item: two
+    **This is the fix for the gate's variance**, the maintainers' notes' standing top item: two
     consecutive runs of a pinned target found the same three defects and gated 2 then 0, and the whole
     difference was one proposal putting its marker inside its own payload.
     """
@@ -286,7 +286,7 @@ def build_simple_registry(ctx: ToolContext, state: FindingState, *,
     when called *"is not merely useless, it is corrosive"*. Advertising a witness route on a repository
     that has no entry point would manufacture exactly that.
 
-    **`exec_state` gates the execution tools by the same rule, one door along.** that capability's four
+    **`exec_state` gates the execution tools by the same rule, one door along.** That capability's four
     memory tools default to None because *"an agent must never be shown a tool whose backing state does
     not exist"* — `run` with no `ExecState` has no budget to charge, no scratch directory to name and
     nowhere to record what it ran. Passing one is what turns execution on; `run_simple` always does,
@@ -499,7 +499,7 @@ def adjudicate_all(state: FindingState, repo, *, witness_entry: str | None,
     `max_witnessed` and `wall_seconds` are the two ceilings on THIS phase — see their constants. They
     are parameters rather than literals for the reason `tampered` is: a test that has to wait twenty
     minutes to prove a ceiling exists is a test nobody runs, and a ceiling nothing exercises is the
-    class of mechanism the maintainers' notes's standing process rule was written about. `clock` is
+    class of mechanism the maintainers' notes' standing process rule was written about. `clock` is
     `time.monotonic` unless injected, and monotonic rather than wall so a clock step cannot hand a run
     an unbounded phase or cut a bounded one short.
     """
@@ -1133,7 +1133,7 @@ def run_simple(*, repo, backend, journal: Journal, scope: tuple[str, ...] = (),
     anything.
 
     It is a parameter rather than a constant because the maintainers' notes arm A needs a control, and
-    a control that has to be produced by editing the source is a control nobody runs. The maintainers' notes's
+    a control that has to be produced by editing the source is a control nobody runs. The maintainers' notes'
     rule against configuration nobody sets is satisfied by something setting it: a maintenance script
     --compare-execution` is the only caller that ever will, and `--no-execution` on the CLI is how it
     reaches here.
@@ -1251,7 +1251,7 @@ def _run_simple_captured(args, snapshots: SnapshotSet) -> SimpleRun:
         if status == "error" else ""
 
     # WHAT THE AGENT ACTUALLY EXECUTED. Recorded whether or not it executed anything, because "it
-    # never called the tool" is the answer the maintainers' notes's standing process rule demands be checkable —
+    # never called the tool" is the answer the maintainers' notes' standing process rule demands be checkable —
     # six mechanisms were once found built, tested, green and unreachable in production, and a lever
     # that fires zero times reads exactly like a lever that is not there.
     # RECORDED IN BOTH ARMS, and `armed` is why. A control run and a treatment run whose agent simply

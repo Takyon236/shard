@@ -443,7 +443,7 @@ def classify_terminal(status: str, retried_ok: bool = False) -> str:
     """Map an ``AgentResult.status`` to a :class:`DegradedRunTracker` outcome.
 
     STAGED / not yet wired: this is the IN-LOOP mapper (Shard's own ``AgentResult`` vocab), for the
-    planned path where ``loop.py`` DIAGNOSE feeds run_health from the journal. The live wiring today
+    planned path where the loop's DIAGNOSE step feeds run_health from the journal. The live wiring today
     reads the benchmark results file, whose SCORER vocab differs, so ``tools.py`` maps that directly
     (``_harness_status_outcome``); the two vocabularies are deliberately kept apart, not shared.
 

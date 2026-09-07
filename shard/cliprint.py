@@ -8,16 +8,8 @@ blocks scattered through `shard/cli.py` between the functions that decide things
 Everything here takes a PAYLOAD and returns None. The payload is the same dict `--json` prints, so
 the two renderings cannot disagree about a number — which is the property the split makes visible
 rather than one it introduces.
-
-## Two of these ship nowhere
-
-`_print_deep` and `_print_fix` are the paid commands' renderings and
-the free build script drops both. `_print_fix` was NOT dropped until
-2026-08-28: `_cmd_fix` left the free artefact and its renderer stayed, defined and called by nothing,
-printing a verdict vocabulary and a patch that free build has no command to produce. Found by asking
-the emitted package which private functions nothing in it references — the same question
-`_verify_no_unreachable_command_surface` now asks on every build.
 """
+
 
 
 
@@ -137,7 +129,7 @@ def _print_endpoint(payload: dict) -> None:
     print(f"endpoint     {ep['verdict']}")
     obs = ep.get("observed") or {}
     # WHICH WEIGHTS ANSWERED, ABOVE the reason and on its own row, because it is the fact
-    # the design notes's "the customer always supplies inference" makes the customer responsible
+    # the design notes' "the customer always supplies inference" makes the customer responsible
     # for, and the reason sentence is long enough to bury it. `model` is empty when the provider named
     # nothing — a real answer, and not the same as "it served what you asked", which is what this
     # probe reported until 2026-09-03 by echoing the request back into a key called `observed`.
@@ -219,9 +211,9 @@ def _print_preflight(payload: dict, profile) -> None:
 #: WHICH FUNCTION RUNS EACH SUBCOMMAND — the wiring `shard/cliargs.py` deliberately does not hold.
 #:
 #: One table rather than seven `set_defaults` lines buried in a 200-line parser body, so "what does
-#: `shard deep` actually call" is answered by reading four lines. `build_parser` checks this covers
+#: this subcommand actually call" is answered by reading four lines. `build_parser` checks this covers
 #: `cliargs.COMMANDS` exactly, in BOTH directions: a command with no handler cannot be run, and a
-#: handler no command dispatches to is a correct function nothing reaches — the shape the maintainers' notes's
+#: handler no command dispatches to is a correct function nothing reaches — the shape the maintainers' notes'
 #: standing process rule exists for, found six times in one session on the predecessor repository.
 
 

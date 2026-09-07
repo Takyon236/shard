@@ -8,6 +8,37 @@ an exact version or commit when updates need review.
 
 ## [Unreleased]
 
+## [4.0.4] — 2026-09-07
+
+**No behavioural change.** Apart from the version string, the package's code is identical to 4.0.3 —
+verified by parsing both emitted trees and comparing them with every comment and docstring removed.
+Everything below is prose: the comments the source ships and the documents shipped beside them.
+
+### Fixed
+
+- **Twenty-three references in the shipped source pointed at something a reader cannot reach.**
+  Fourteen named a Python file: seven a module of this project that the distribution does not carry,
+  five a module that exists in no version of Shard at all, and two a script in a different
+  repository. Each was written as a bare filename, which every reference rule missed because each
+  one expected a directory in front of it. The other nine had been rewritten as far as the path and
+  left a symbol name dangling off the end, so the sentence named a private symbol immediately after
+  saying its file cannot be reached.
+- **Comment paragraphs explaining functionality this package does not include have been removed.**
+  Twenty-one names — the functions and options behind it — survived in five shipped modules, with
+  the prose around them explaining what each was for. The rule that removes such paragraphs was
+  matching three literal names where the build's own tables hold eleven; it is now derived from
+  those tables, so a name added to either is covered by the commit that adds it. The package carries
+  76 fewer non-blank lines as a result.
+- **The security policy told a v4 reader to treat the controls it documents as unavailable.** That
+  paragraph was written for the v3 line and was never updated; v4 is published, installs
+  anonymously, and does establish the immutable source snapshot, execution boundary and Action
+  handoff the page describes. The README and the bug-report template also still warned that the
+  source repository needed granted access, and the template told a reporter that the workflow ref it
+  had just given them does not resolve.
+- Twenty-six mangled possessives (`the design notes's`) across twelve modules, and twenty-three
+  sentences that began in lower case where a rewritten reference opened a sentence whose full stop
+  sat underneath its own markup or on the line above it.
+
 ## [4.0.3] — 2026-09-07
 
 **Upgrade from 4.0.2. It could not demonstrate anything.** Measured against the published 4.0.2 image

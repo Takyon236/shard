@@ -22,7 +22,7 @@ Everything here is a pure function of the journal's events. Nothing in this modu
 recorder. Three things follow, and each of them is a defect this repository has already paid for
 somewhere else:
 
-* **One source of truth.** a maintenance script records the drift class in as many words: a rule
+* **One source of truth.** A maintenance script records the drift class in as many words: a rule
   transcribed a second time is a rule that agrees with the first by construction and then quietly
   stops. Telemetry that recorded its own events would be a second census of the same run, free to
   disagree with the journal about what happened.
@@ -74,7 +74,7 @@ def _events(source: Any) -> list[dict]:
 
     Tolerant on purpose: a run that was killed leaves a truncated last line, and `json.loads` accepts
     a bare string or number as valid JSON — so a line that parses to a non-dict must be skipped rather
-    than reaching `.get` and raising. A maintenance script::marker_refusals` records the same defect
+    than reaching `.get` and raising. A maintenance script records the same defect
     and the same fix; this is the only other place that parses this file.
     """
     if isinstance(source, (list, tuple)) and (not source or isinstance(source[0], dict)):
@@ -393,7 +393,7 @@ def summarise(source: Any) -> dict:
 
     Pure. Takes a path, a file, lines, or already-parsed events — the maintainers' suite drives it
     with a REAL journal from a real run, because a fixture that does not look like the real thing tests
-    the fixture (a maintenance script::payload_from` learned that the expensive way: both this project's
+    the fixture (a maintenance script learned that the expensive way: both this project's
     measurement scripts shipped a parser that could not read indented JSON, and both their tests passed
     because both fed compact JSON).
 

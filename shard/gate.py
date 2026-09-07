@@ -69,7 +69,7 @@ class ConfigError(Exception):
 #: location and a defect a DELETION introduced are both reachable — the two rows the line test could not
 #: see (an internal audit item 7, owner decision). Where it cannot, it falls back to the
 #: line test over the diff already in hand. The alert-history design the integration guide sketched is
-#: GitHub-only and therefore fails the maintainers' notes's GitLab requirement; the diff-derived rule generalises
+#: GitHub-only and therefore fails the maintainers' notes' GitLab requirement; the diff-derived rule generalises
 #: unchanged and builds none of the storage the maintainers' notes closes against. It is a NARROWING of
 #: `reproduced`, never a widening: new ⇒ demonstrated ∧ introduced-by-this-diff, so a hypothesis still
 #: cannot gate whatever this is set to.
@@ -83,7 +83,7 @@ def is_new_finding(finding, introduced) -> bool:
 
     A MODULE-LEVEL function rather than the closure it was for one afternoon, because
     a maintenance script scores this rule and a bench that re-implements the rule scores a COPY.
-    The maintainers' notes's trap 3 — copies of one value in files that cannot import each other WILL
+    The maintainers' notes' trap 3 — copies of one value in files that cannot import each other WILL
     drift — arrived here immediately: the bench was measured against a MUTATED `_cmd_diff` and did not
     notice, because it was grading its own transcription of the rule rather than the rule.
 

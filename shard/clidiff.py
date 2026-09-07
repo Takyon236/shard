@@ -25,7 +25,7 @@ which is also how every command in this package has always reached `shard.simple
 
 The alternative was a shared module holding those four. It was rejected: it would have been named for
 its position in the import graph rather than for a job, which is the definition of the junk drawer
-the maintainers' notes's "a module names one job" rule exists to prevent.
+the maintainers' notes' "a module names one job" rule exists to prevent.
 """
 
 from __future__ import annotations
@@ -477,7 +477,7 @@ def _cmd_diff(args, journal: Journal | None = None) -> int:
         # scope rather than against an assumption about it.
         "hunk_radius": radius,
         "windows": {p: [list(s) for s in spans] for p, spans in sorted(windows.items())},
-        # **WHICH ROUTES THE RUN COULD EVEN OFFER.** the design notes's cheaper sibling, and
+        # **WHICH ROUTES THE RUN COULD EVEN OFFER.** The design notes' cheaper sibling, and
         # an internal audit. Two levers decide this set —
         # `DIFFERENTIAL_NONZERO_EXIT` and `UNHANDLED_EXCEPTION`, both off — so two runs of the same
         # code against the same diff can offer different routes and neither artefact said which.

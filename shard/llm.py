@@ -1,6 +1,6 @@
 """LLM backend — single-shot completions (NOT an internal tool loop).
 
-Shard owns the ReAct loop itself (see loop.py): the model proposes ONE action as JSON,
+Shard owns the ReAct loop itself: the model proposes ONE action as JSON,
 Shard's policy gates it and Shard executes it. That is deliberate — if we let ``claude -p``
 run its own tool loop, Shard's human-gate would never see the individual tool calls. So this
 backend is a stateless `complete(system, user) -> text`; the loop re-sends the running
@@ -220,7 +220,7 @@ DEFAULT_ANTHROPIC_MODELS = {
 # switch providers without touching code.
 DEFAULT_OPENROUTER_MODELS = {
     # THE DEFAULT, and the model every test run uses. Open weights the customer controls, which is
-    # the maintainers' notes's first sentence rather than a preference. Pinned to the canonical slug on purpose:
+    # the maintainers' notes' first sentence rather than a preference. Pinned to the canonical slug on purpose:
     # OpenRouter does resolve the bare `glm-5.2` today (measured 2026-08-08), but a default that
     # depends on somebody else's shorthand resolution is a default that can change without us.
     "glm": "z-ai/glm-5.2",
@@ -2320,7 +2320,7 @@ def _strip_reasoning(text: str) -> str:
     the opener dangling, nothing matches, and the entire chain-of-thought flows into the object
     scanner below — which returns the LAST JSON object in it. Reasoning text ENUMERATES options
     before discarding them ("I could just call write_file … but that would be wrong; let me read
-    first"), so the loop would execute a hypothesis the model explicitly REJECTED. loop.py's
+    first"), so the loop would execute a hypothesis the model explicitly REJECTED. The loop's
     finish_reason=="length" branch cannot catch that: it runs only when extraction FAILS, and here
     extraction succeeded — wrongly. Dropping an unfinished thought instead yields no action, and the
     loop takes its truncation-specific re-prompt.

@@ -9,10 +9,10 @@ seven flags, the four refusals, and the two payloads that report back.
 
 `_spend`'s own docstring has said it since it was written: *"a ceiling nobody can reconcile against a
 reported number is as decorative as a ceiling nothing debits."* Both halves were measured missing on
-the same product. `shard deep` with no flags was completely unmetered on tokens, and `diff` reported
-no cost of ANY kind — the ≈$0.29 of the first real run had to be read off OpenRouter's billing API
-afterwards. Splitting them into two modules would put the ceiling and the only number that can check
-it in two places.
+the same product. The solve path took no token ceiling at all unless one was passed, and `diff`
+reported no cost of ANY kind — the ≈$0.29 of the first real run had to be read off OpenRouter's
+billing API afterwards. Splitting them into two modules would put the ceiling and the only number
+that can check it in two places.
 
 ## The four refusals, which are the reason this module is worth finding
 
@@ -25,13 +25,8 @@ would be offered as a configuration option.
 
 `_refuse_a_token_ceiling_below_the_floor` is the fourth, and it exists because it was got wrong by
 hand, on a real run, by somebody who had just spent the day reading the file it was in.
-
-## Where the tier line falls
-
-`_attempts` and `_max_findings` are deep-only and the free build script drops them from the free
-artefact; `shard/cli.py` imports each on its own line so the orphaned import goes with them. The
-other seven names are read by `_cmd_diff` and ship.
 """
+
 
 
 from shard.budget import SCAN_PROFILES, Budget
@@ -98,12 +93,13 @@ def _budget(args, *, default_tokens: float | None = None) -> Budget:
 
     `default_tokens` is what an UNSET `--max-tokens` means, and it exists because the previous answer
     was `None` — unmetered. `Solve.__init__` falls back to `Budget(tokens=plan.token_cap)` only when no
-    governor is supplied and `_cmd_deep` always supplies one, so the 8,000,000 that
+    governor is supplied and the solve handler always supplies one, so the 8,000,000 that
     the maintainers' suite pins as the measured configuration governed sub-agent loops and nothing
-    else. `shard deep` with no flags was completely unmetered on tokens (the design notes). The
-    caller passes the ceiling it can defend: deep passes `SolvePlan.token_cap`, which is a measured
-    number, and simple mode passes nothing, because no measurement of a diff-scoped run supports one and
-    a ceiling invented here would be a number nobody had ever checked against a real run.
+    else — the solve path itself took no token ceiling unless one was passed (the design notes).
+    The caller passes the ceiling it can defend: the solve path passes `SolvePlan.token_cap`, which is
+    a measured number, and simple mode passes nothing, because no measurement of a diff-scoped run
+    supports one and a ceiling invented here would be a number nobody had ever checked against a real
+    run.
     """
     profile = _scan_profile(args)
     if args.max_tokens:
@@ -151,10 +147,9 @@ def _max_steps(args) -> int:
     There is deliberately no "unmetered" spelling. An unbounded ReAct loop on a customer's runner is the
     thing the ceilings exist to prevent, and `--max-spend-usd` is the ceiling for "let it run".
 
-    **AN UNSET FLAG TAKES THE SCAN PROFILE'S FLOOR, the same precedence `_budget` gives `--max-tokens`
-    and `_max_findings` gives `--max-findings`.** Until 2026-08-21 `--scan initial` raised the token
-    ceiling to 6,000,000 and left this at 40, so the profile moved the ceiling that was not binding and
-    left the one that was. A measured run is the measurement: the first real
+    **AN UNSET FLAG TAKES THE SCAN PROFILE'S FLOOR, the same precedence `_budget` gives
+    `--max-tokens`.** Until 2026-08-21 `--scan initial` raised the token ceiling to 6,000,000 and
+    left this at 40, so the profile moved the ceiling that was not binding and left the one that was. A measured run is the measurement: the first real
     customer audit had to pass `--max-steps 200` by hand for a 300-file chunk, and a ceiling the
     operator must know to raise is not a profile — it is a trap with a default.
 

@@ -10,12 +10,11 @@ started](docs/getting-started.md) for availability and exact source and Action r
 
 ## Version scope
 
-This page describes the current `[Unreleased]` source tree. The intended v3.0.2 release bytes and its
-`@v3` major alias do not provide the immutable source snapshot, complete execution boundary, or Action
-handoff described below. The runnable v3.0.2 onboarding journey has its own narrower acceptance checks;
-a green v3.0.2 run is not evidence for any guarantee on this page. Treat these controls as unavailable
-to an installed Action until public availability is witnessed and a later major switches the install, Action and
-matching documentation together.
+This page describes the v4 release line, which is published and installs anonymously. The v3.0.2
+release and its `@v3` major alias do not provide the immutable source snapshot, complete execution
+boundary, or Action handoff described below; the v3.0.2 onboarding journey has its own narrower
+acceptance checks, and a green v3.0.2 run is not evidence for any guarantee on this page. Install a
+v4 release to get the controls described here.
 
 ## At a glance
 

@@ -27,7 +27,7 @@ layout itself.
 
 ## The name says WHOSE markers, and that is not decoration
 
-`markers` was already taken, one import away. A maintenance script::build_markers_pack` publishes
+`markers` was already taken, one import away. A maintenance script publishes
 an library pack of that name built out of `shard/target.py`'s `EXT_LANGUAGE`, `LANGUAGE_RUNTIME`
 and `_BUILD_MARKERS`, and `survey.to_payload` stamps every artefact with its `markers_pack_version`.
 Those are recognition tables of a different kind — extension to language — and **nothing in this
@@ -47,7 +47,7 @@ constantly, and a defect can sit somewhere no marker fires.
 Every rate below is a NOISE measurement — how often a pattern fires per thousand raw lines of
 ordinary code — and never precision against ground truth. It is stated on `#` comment lines and
 nowhere else, which is not a formatting habit:
-the maintainers' suite::test_every_NOISE_RATE_that_states_its_HITS_divides_by_a_TOTAL_in_the_SAME_ROW`
+the maintainers' suite
 reconciles each rate against a corpus total in its own comment block, and reads comment blocks
 only. A rate in a docstring is a rate that has stopped being checked, and this paragraph was
 refused by that guard on its first run for saying so with the unit in it.
@@ -217,7 +217,7 @@ MARKERS: tuple[tuple[str, frozenset[str] | None, re.Pattern[str]], ...] = (
     # A row is kept only if its narrow pattern FIRED AT LEAST ONCE on real code at <=0.20/KLOC. A
     # pattern scoring 0.00 with ZERO hits is not evidence it is well-shaped — it cannot be told apart
     # from a regex that matches nothing — and three such candidates were DEFERRED rather than kept.
-    # the maintainers' notes §9 has them with their numbers.
+    # The maintainers' notes §9 has them with their numbers.
 
     # C# had NO markers at all: detected by extension with nothing behind it, which
     # the design notes calls the sharpest hole. These four close it.
@@ -381,7 +381,7 @@ MARKERS: tuple[tuple[str, frozenset[str] | None, re.Pattern[str]], ...] = (
                 r"\[\s*[\"']constructor[\"']\s*\]\s*\[\s*[\"']prototype[\"']\s*\]")),
 
     # ---- XSS, CWE-79, RANK 1 on the 2025 CWE Top 25 and the largest gap this table had.
-    # the design notes has the analysis that found it. Three languages ship; two were
+    # The design notes has the analysis that found it. Three languages ship; two were
     # measured and REFUSED, and the reason is reachability rather than noise — see below.
     #
     # THE WRITE POSITION IS THE WHOLE MARKER. `innerHTML` is READ as often as written and

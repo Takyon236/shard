@@ -4,7 +4,7 @@ The integration guide is the output contract. Three artefacts, and the ranking r
 them inside GitHub's limits.
 
 
-**Simple-safe, and by explicit owner decision rather than by convenience.** the design notes's
+**Simple-safe, and by explicit owner decision rather than by convenience.** The design notes'
 compile-selectively table puts *"SARIF writer, reproduction bundler, CI glue"* in the leave-in-Python
 column, reason given: *"format work anyone can do"*. There is nothing here worth protecting, and both
 modes emit through it, so it must be importable from the free image.
@@ -85,7 +85,7 @@ _EVIDENCE_IN_REPORT = 1200
 
 #: The run statuses that mean **the audit finished**. Everything else — `error`, `budget`, `maxsteps`,
 #: `repeat` — means it stopped early, and a customer reading "no findings" is owed that difference.
-#: the design notes.
+#: The design notes.
 #:
 #: One declaration, read by the markdown paragraph AND by the SARIF's `executionSuccessful`, because
 #: two spellings of "did this run finish" is how the machine-readable channel and the human one come to
@@ -269,7 +269,7 @@ TOOL_NAME = "Shard"
 #: field as a link from the customer's Security tab, so shipping a placeholder puts a 404 next to every
 #: alert we raise, in the one place a security team goes to decide whether to trust us. The key is
 #: OPTIONAL in SARIF 2.1.0, so the honest answer is to omit it until there is a page to point at.
-#: the maintainers' suite fails if a URL reappears here without one.
+#: The maintainers' suite fails if a URL reappears here without one.
 
 
 def _utf8_safe(text: str) -> str:
@@ -564,7 +564,7 @@ def build_sarif(findings, *, limit: int = DEFAULT_SARIF_CAP, status: str = "done
     """SARIF 2.1.0 for upload to code scanning.
 
     **`invocations[].executionSuccessful` is how a run that did not finish stops looking like a clean
-    one.** the design notes: an errored run wrote `results: []` and reported `findings: 0`,
+    one.** The design notes: an errored run wrote `results: []` and reported `findings: 0`,
     byte-for-byte what a completed audit that found nothing reports. The markdown said so and nothing a
     CI consumer reads did — the check was green and code scanning showed nothing new.
 
@@ -925,7 +925,7 @@ class RunFacts:
     #: can be applied; `None` means the mode never established it.
     #:
     #: Carried for the RESULT DOCUMENT rather than for this header, which is why it prints no row.
-    #: the design notes A3 measured the gap it names — `--state-repo` exists on
+    #: The design notes A3 measured the gap it names — `--state-repo` exists on
     #: `diff` and is absent from `deep`, so every deep run starts from nothing — and the free tier has
     #: said so in its own step log since state existed (*"no state repository configured; nothing will
     #: accumulate between runs"*). A consumer of the artefacts could not read it anywhere, which is
@@ -1024,7 +1024,7 @@ def _observed(run: RunFacts) -> tuple[str, str] | None:
     `exec_refused`'s zero is skipped, because "the ceiling refused nothing" is the ordinary case and a
     row for it is one a skimmer learns to skip. This zero is the opposite: it says the agent COULD run
     code and never did, so every claim in the report was reasoned from reading alone — which is the
-    fact a reader weighing an unverified finding needs most, and the signal the maintainers' notes's standing
+    fact a reader weighing an unverified finding needs most, and the signal the maintainers' notes' standing
     process rule asks for by name. `None` remains not-armed, so the ablation arm in a maintenance script
     stays distinguishable from a review that declined to look.
     """
@@ -1753,7 +1753,7 @@ def _finding_block(f: Finding, *, reproduced: bool, bundle: str) -> list[str]:
 #: A full commit object name and nothing else. `head_revision`'s output is written into a file the
 #: reviewer EXECUTES, so what it returns is validated rather than trusted: git is a subprocess whose
 #: stdout this module does not own, and `shlex.quote` at the call site is the second layer, not the
-#: first. Full 40 hex and not an abbreviation — the design notes's own release note records what an
+#: first. Full 40 hex and not an abbreviation — the design notes' own release note records what an
 #: abbreviated SHA cost when it was allowed to stand for a commit.
 _FULL_SHA = re.compile(r"[0-9a-f]{40}\Z")
 
@@ -1962,7 +1962,7 @@ STAGED_INPUT_TOKEN = "./input"
 #: POINT resolves ITS paths from, and an entry point that reads a repo-relative sibling is ordinary —
 #: a config file, a build product under `./build/`, a sourced helper. The verdict was NOT reached in
 #: the reviewer's shell: `witness.adjudicate` runs the free entry point with `cwd=str(repo)` and
-#: the separate package` runs the harness with `cwd=str(workdir)`. Measured 2026-09-02 through
+#: the separate package runs the harness with `cwd=str(workdir)`. Measured 2026-09-02 through
 #: this constant, over five cwd-sensitive entry points x six directories a reviewer can be in
 #: (the checkout root, the bundle, the bundle's parent, a checkout subdirectory, the checkout's
 #: parent, an unrelated directory): **25 of 30 rows did not reproduce, every one of them at rc=0 with

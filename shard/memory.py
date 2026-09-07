@@ -27,11 +27,11 @@ whole suite runs with an in-memory fake and no engine install.
 
    EXTERNAL-CONTRACT half (advisory-only, net-zero measured):
      ``HybridRetriever`` and ``_record_text`` are consumed by the offline retrieval-memory
-     harnesses (the predecessor project's `maintenance tooling`,
-     ``fused_retrieval.py``, ``run_benchmark_memory.py``). The hybrid BM25 × activation
+     harnesses (three offline scripts under the predecessor project's
+     `maintenance tooling`, none of them in this tree). The hybrid BM25 × activation
      approach these symbols implement was rigorously measured and found net-zero-to-negative
      (see the design notes); it is kept advisory-only. Their signatures are pinned by
-     `the maintainers' suite::_EXTERNAL_CONTRACT``.
+     `the maintainers' suite`.
 
    LIVE-SOLVER half (used by the benchmark solver):
      ``SessionMemory``, ``fence``, and ``tokenize`` are imported directly by `the predecessor project`

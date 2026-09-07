@@ -135,7 +135,7 @@ def exec_budget(max_steps: int) -> int:
 #:
 #: **IT IS A HAND-SYNCHRONISED COPY, WHICH THIS REPOSITORY HAS ALREADY BEEN BITTEN BY, so it is held
 #: by a test rather than left to good intentions.** Commit `880f0f7` found the last one:
-#: `variance.py`'s `READ_DEFAULT_BYTES` drifted from the constant it was meant to mirror and would
+#: a maintenance script's `READ_DEFAULT_BYTES` drifted from the constant it was meant to mirror and would
 #: have mis-baselined an instrument silently. That fix derived by IMPORT, which is the better answer
 #: and is unavailable here — `simple.py` imports this module, so importing `DEFAULT_MAX_STEPS` back
 #: would be a cycle. So the relation is held the other way `880f0f7` used, an identity assertion:
@@ -248,7 +248,7 @@ def network_mode(state: ExecState, runner=None) -> str:
     """Probe the complete hostile-execution boundary and report whether it is available.
 
     **This is a real control where it works and an honest `unrestricted` where it does not**, which is
-    the shape `containment.py` already argues for: confirming containment is the burden of proof, and
+    the shape a module this build does not carry already argues for: confirming containment is the burden of proof, and
     ambiguity is failure — so ambiguity is REPORTED rather than resolved in our favour.
 
     PID-only and empty prefixes are both reported as "unrestricted" and are both refused at every
@@ -514,7 +514,7 @@ def _run_entry_point(ctx: ToolContext, state: ExecState, *, repo, entry: str, ru
     code = _normalise(rc) if isinstance(rc, int) else rc
     note = f"{entry} exited {rc}."
     # THE ONLY INTERPRETATION THIS TOOL OFFERS, and it is about the PROCESS, not about the finding.
-    # a measured run: four of five post-fix samples carried a
+    # A measured run: four of five post-fix samples carried a
     # payload built on `kill -9 $PPID`, two of them REAL exploits, and the run's status was still
     # `done`. Naming the kill is not a verdict on the claim — it is telling the agent that the thing it
     # is standing on collapsed underneath it.

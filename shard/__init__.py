@@ -5,9 +5,9 @@ Every public name is resolved LAZILY (PEP 562 module ``__getattr__``) rather tha
 package is. This is not a micro-optimisation; it is load-bearing twice over.
 
 **It keeps the core cheap.** Importing ANY submodule runs this file first. In the predecessor repo this
-file eagerly re-exported from every submodule including the 6,910-line solver, so
-``from the predecessor project import Budget`` — exactly what the external sweep driver does — constructed
-the entire solver to reach a dataclass. That is at odds with the dependency-free-core promise in
+file eagerly re-exported from every submodule including the 6,910-line solver, so importing
+``Budget`` from that package's `budget` module — exactly what the external sweep driver does —
+constructed the entire solver to reach a dataclass. That is at odds with the dependency-free-core promise in
 the maintainers' notes.
 
 **It is the first line of defence for the mode split.** The free image ships simple mode and must
@@ -77,7 +77,7 @@ __all__ = [
 # deletes a comment line that names either and keeps the rest, which truncates the sentence around
 # it: the first draft of this block lost its own last line that way. Bump this in the release commit
 # alongside both manifests; the release gate refuses a cut where the three disagree.
-__version__ = "4.0.3"
+__version__ = "4.0.4"
 
 
 def __getattr__(name: str):

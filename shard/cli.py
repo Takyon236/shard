@@ -2,23 +2,15 @@
 
 The integration guide flagged the problem this resolves: the GitHub Action was going to become
 a SECOND external consumer alongside the predecessor project's maintenance tooling, leaving the package
-with two entry points and the maintainers' notes's first-listed trap live in both. The benchmark driver and the
+with two entry points and the maintainers' notes' first-listed trap live in both. The benchmark driver and the
 product now run the same path, which is the only arrangement in which a green benchmark is evidence
 about the product rather than about itself.
 
     python -m shard preflight --repo .           what this repository is, and what we could do with it
-    python -m shard deep --repo . --workdir ...  acquire a workdir, run the solver, report
+    python -m shard diff --repo . --base-ref …   review a pull request and report what it demonstrates
 
-
-The separate package is imported inside the deep subcommand's function body and nowhere else. That is not a
-startup optimisation. The design notes, "Protecting the harness": the free image ships simple mode and
-must contain nothing of that capability, and if the two share an import closure the free tier gives
-the jewel away with no later protection recovering it. The maintainers' suite asserts this file's
-closure directly, so a convenient top-level `from the separate package import ...` fails the suite rather than
-shipping.
-
-`preflight` is therefore fully available in the free image, which is correct — it is the onboarding and
-pricing instrument (the integration guide) on every tier.
+Which commands `--help` offers depends on the build. `build_parser` walks the handler table below, so
+the parser is derived from what this artefact actually carries rather than declared beside it.
 
 ## The exit-code contract, which is the "does not break the build" promise
 
@@ -37,6 +29,7 @@ expressed as behaviour rather than as marketing, and it is enforceable only beca
 2 is deliberately distinct from 1. A customer whose repository cannot be acquired has a setup problem,
 and reporting it as a security finding would be a false positive of the most annoying kind.
 """
+
 
 
 import argparse
@@ -70,34 +63,6 @@ def _optional_probe(module: str):
         return importlib.import_module(f"{_PROBE_PACKAGE}.{module}")
     except ImportError:                                         # pragma: no cover - absent-build path
         return None
-# THE ARTEFACT WRITER, which is not the dispatcher's to own. `shard/cliemit.py` writes the SARIF, the
-# report, the result document, the telemetry and the bundles; every CALL SITE stays here, in
-# `_cmd_diff`, `_cmd_deep` and `_cmd_fix`. The module-scope reasoning that used to sit in this block
-# — the maintainers' suite's reachability probe, and the two modules that shipped as dead weight
-# because their imports sat inside `_emit`'s body — moved to `cliemit.py` with the code it is about.
-#
-# TWO LINES, NOT ONE, and that is load-bearing. The free build script removes a
-# module-scope `from x import y` whose name nothing uses any more, and it handles single-name,
-# unaliased lines ONLY. `_write_artefact`'s sole caller here is `_cmd_fix`, which the free build
-# drops — so sharing a line with `_emit` it would survive unused, which is an F401 in the published
-# repository's own lint, over code it did not write. The same reason splits the `shard.gate` import
-# in `shard/cliargs.py`.
-# THE TERMINAL RENDERING, which is not the dispatcher's either. Four separate lines for the reason
-# the two above are on two: `_print_deep` and `_print_fix` are dropped from the free artefact with
-# the commands they render, and `_drop_orphaned_imports` only removes single-name, unaliased lines.
-# THE CEILINGS AND THE SPEND — `shard/climeter.py`, the customer-facing half of `shard/budget.py`.
-# One name per line, and two of them are why: `_attempts` and `_max_findings` are read only by
-# `_cmd_deep`, which the free build drops, so their imports must be orphaned singly for
-# `_drop_orphaned_imports` to remove them. The other four ship. `_scan_profile` is NOT here:
-# nothing in this file calls it any more, only the four ceiling resolvers that moved with it.
-# THE SUBCOMMAND BODIES. `shard/clidiff.py` reviews a pull request; a module this build does not carry holds the three
-# commands that cross the tier line. This file keeps `preflight`, `survey` and `action`, the exit
-# contract, and the helpers all of them share.
-#
-# ONE NAME PER LINE, and the paid three are why. The free build script drops their `_HANDLERS` rows and
-# then `_drop_orphaned_imports` removes each now-unused single-name import — which is what lets
-# a module this build does not carry be absent from the free artefact ENTIRELY rather than shipped with its functions
-# cut out. A grouped import would survive the row drop with two of three names unused.
 from shard.clidiff import _cmd_diff
 from shard.cliprint import _print_preflight
 from shard.target import (cargo_fuzz_targets, demonstrability, entry_template, estimate_diff_cost,
@@ -201,7 +166,7 @@ def _cmd_preflight(args) -> int:
         "machine": _machine_payload() if deep_available else None,
         "runtimes": probe_runtimes(profile.languages),
         # **WHAT IT WILL COST THE CUSTOMER, and what tier they are on.**
-        # the integration guide designates preflight the pricing instrument — *"preflight
+        # The integration guide designates preflight the pricing instrument — *"preflight
         # becomes the pricing instrument"* — and it profiled the repository and said nothing about
         # money, which is the half the commercial model was built on
         # (an internal audit). COGS ≈ 0 is true and irrelevant to the buyer: they
@@ -337,7 +302,7 @@ def _machine_payload() -> dict | None:
 
 
 def _mode_verdict(profile, kinds: list[str], deep_available: bool) -> dict:
-    """that capability's verdict for this repository, in the vocabulary the integration guide fixed.
+    """That capability's verdict for this repository, in the vocabulary the integration guide fixed.
 
     `unsupported` and `degraded` are different answers and conflating them would be the free-target
     audit's §2 again: a repository we decline is not the same as one we can analyse with less leverage,
@@ -398,7 +363,7 @@ def _cmd_action(args) -> int:
     """The GitHub Action, which had no entry point at all until 2026-08-08.
 
     A subcommand rather than a second console script, because this module's opening line is that there
-    is ONE external consumer surface — the integration guide, and the maintainers' notes's first-listed
+    is ONE external consumer surface — the integration guide, and the maintainers' notes' first-listed
     trap is what a second entry point costs. The action is now a caller of the same argv the benchmark
     driver and a developer at a terminal use, which is the only arrangement in which testing one says
     anything about the others.

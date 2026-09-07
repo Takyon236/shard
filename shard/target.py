@@ -6,13 +6,13 @@ first half.
 ## The gap this closes
 
 The design notes, still open at the time of writing: *"no workdir-preparation code
-exists in this repository at all."* `replay.py` runs `bash test_poc.sh <poc>` in a workdir, the benchmark
+exists in this repository at all."* A module this build does not carry runs `bash test_poc.sh <poc>` in a workdir, the benchmark
 hands that workdir over pre-built, and a customer hands over a git checkout. Every one of the 770
 measured tasks satisfied the workdir contract by construction, so no measurement could have surfaced
 this.
 
 Audit §1 is sharper still, and it is the reason `validate_workdir` exists at all. The `__EXIT__`
-contract *"is documented — to the model, not to the customer."* `prompts.py` tells the AGENT to read the
+contract *"is documented — to the model, not to the customer."* A module this build does not carry tells the AGENT to read the
 marker line. Nothing told the human writing the harness, and **nothing checked**. A marker-less harness
 used to adjudicate as "did not crash" on every replay, whatever the target actually did. That specific
 false negative is closed in the oracle (`_effective_exit`), but the diagnosis still belongs BEFORE the
@@ -40,14 +40,14 @@ the grading below is the right way round for each audience now.
 They are the input and the output of the same pipeline stage, and both are read by the same caller.
 
 
-**Simple-safe.** the maintainers' suite lists this module's peers. Profiling and contract validation
+**Simple-safe.** The maintainers' suite lists this module's peers. Profiling and contract validation
 are commodity: the design notes puts CI glue and format work explicitly in the leave-in-Python
 column, and preflight is a product feature on the free tier as much as the paid one. Nothing here may
 ever import the separate package.
 
 ## What this module may never do
 
-**It may not repair a harness.** the separate package holds `test_poc.sh` read-only against `write_poc` and
+**It may not repair a harness.** The separate package holds `test_poc.sh` read-only against `write_poc` and
 `apply_patch`, because a writable harness is how an agent forges its own verdict — `write_poc(
 path="./test_poc.sh", text="echo __EXIT__=1\\n")` was once an accepted tool call that made every replay
 report a reliable 5/5 crash. This module REPORTS. Preparation happens in a harness entry, before the
@@ -79,7 +79,7 @@ from shard.witness import offered_expectations
 
 # --- the workdir contract ---------------------------------------------------------------------------
 
-#: The harness. `replay.py` runs exactly `["bash", "test_poc.sh", poc]` and nothing else in the chain
+#: The harness. A module this build does not carry runs exactly `["bash", "test_poc.sh", poc]` and nothing else in the chain
 #: reads any other file to decide ground truth.
 HARNESS_NAME = "test_poc.sh"
 
@@ -98,9 +98,9 @@ EXIT_MARKER = "__EXIT__="
 #: own copy and nothing pinned this one, so changing it to `echo __WRONG__=$?` broke NOTHING that the
 #: suite could see — measured.
 #:
-#: It matters more now than it did then. `instrument`, `deep/triage` and `deep/registry` build their
-#: in-container shell commands from these two constants rather than from copies of the string, so a
-#: drift here would put the wrong marker in three executors at once.
+#: It matters more now than it did then. THREE executors build their in-container shell commands from
+#: these two constants rather than from copies of the string, so a drift here would put the wrong
+#: marker in all three at once. The COUNT is the fact this comment is for.
 EXIT_MARKER_FIX = f'echo {EXIT_MARKER}$?'
 
 #: The shape a CUSTOMER's own harness is told to end in, quoted verbatim when it does not.
@@ -262,7 +262,7 @@ def _harness_text(workdir) -> str | None:
 # the design notes records that the benchmark harness writes the description only
 # `if level >= 1`, and that **16 of 16 the benchmark Level 0 tasks read `./description.txt` and got
 # `not a file`**. Every one of those workdirs names a masked image. So the grading arm and the
-# adjudication arm disagreed on exactly the path the maintainers' notes's trap 1 names, and nothing went red because
+# adjudication arm disagreed on exactly the path the maintainers' notes' trap 1 names, and nothing went red because
 # each half was tested with a different fixture for "known bug".
 #
 # The patterns are OBJECTS shared with the paid reader rather than a second copy of the same regex,
@@ -759,8 +759,8 @@ def _spread_sample(by_dir: dict[str, list[str]], limit: int) -> list[str]:
 
     **THE GATE SAMPLED EIGHT FILES FROM WHICHEVER DIRECTORY THE WALK ENTERED FIRST, and that decided
     whether the separate capability was offered at all.** `native_sources` is not only a name for a refusal to
-    print: `deep/harness._synth_applies` calls `synth.compilable_sources` on it, so a repository whose
-    eight sampled files happen not to compile standalone is REFUSED, however much of it does.
+    print: the harness synthesiser tries to COMPILE the sample, so a repository whose eight sampled
+    files happen not to compile standalone is REFUSED, however much of it does.
 
     Measured 2026-08-31 over twelve cloned C repositories, before this function existed:
 
@@ -776,13 +776,13 @@ def _spread_sample(by_dir: dict[str, list[str]], limit: int) -> list[str]:
 
     Round-robin and not a score: which directory a source sits in says nothing this repository has
     measured about whether it compiles standalone, and a `src`-over-`tests` preference would be the
-    unmeasured name heuristic that `deep/fuzzable` had to retract. Spread is structural. It makes the
+    unmeasured name heuristic that the separate package had to retract. Spread is structural. It makes the
     sample REPRESENTATIVE without claiming to make it good.
 
-    **What it buys, on the same twelve repositories, through `_synth_applies` itself:**
+    **What it buys, on the same twelve repositories, through that gate itself:**
 
-        _synth_applies      5 of 12  ->  7 of 12
-        compilable sources     18    ->     18
+        repositories offered   5 of 12  ->  7 of 12
+        compilable sources        18    ->     18
 
     The TOTAL DID NOT MOVE, and that is the finding rather than a caveat. The same eighteen
     compilable sources were there before; fourteen of them were piled into libpng and zlib, which
@@ -815,7 +815,7 @@ _BUILD_MARKERS: dict[str, str] = {
     "package.json": "npm", "Makefile": "make", "GNUmakefile": "make",
 }
 
-#: **THE library SEAM, and it is one function.** the library design: a pack is knowledge we
+#: **THE library SEAM, and it is one function.** The library design: a pack is knowledge we
 #: keep and lend, and the tables above are the `markers` pack — the three of them, measured, not
 #: re-typed (a maintenance script).
 #:
@@ -875,7 +875,7 @@ class TargetProfile:
 
     This is preflight's input and the discovery step's input, and it is deliberately small: every field
     is read by something today. The integration guide names further measurements — pull-request
-    frequency, monorepo detection — and they are not here because nothing consumes them yet. The maintainers' notes's
+    frequency, monorepo detection — and they are not here because nothing consumes them yet. The maintainers' notes'
     "earn its place" rule applies to a profile field exactly as it applies to a knob.
     """
 
@@ -1221,7 +1221,7 @@ def demonstrability(root, declared: str = "") -> dict:
     they need is present and what a run costs, and still get nothing that can gate, and only discover
     it afterwards.
 
-    **Measured, on the first real customer engagement.** a measured run: 13 chunks,
+    **Measured, on the first real customer engagement.** A measured run: 13 chunks,
     24 findings, and `gate_eligible = 0` on all thirteen, *because the target declares no entry point*.
     Every finding shipped informational. Nothing was wrong with the run; the precondition was absent
     and no surface had said so.
@@ -1446,7 +1446,7 @@ fi
 # --- what a run will cost the customer, an internal audit P6 ---------------------------------------------
 
 #: **EVERY LIVE DIFF RUN THIS PROJECT HAS METERED, and the calibration set is exactly this small.**
-#: the integration guide designates preflight the pricing instrument and preflight said nothing
+#: The integration guide designates preflight the pricing instrument and preflight said nothing
 #: about money; the audit's instruction is to ship an estimate *"labelled as calibrated on a small
 #: sample with a wide band, and narrow it as runs accumulate"*, because a wide honest band beats no
 #: number. Adding a row here is how it narrows — in the commit that takes the measurement.
@@ -1632,7 +1632,7 @@ def probe_runtimes(languages) -> dict:
 
     ## The wording rule this obeys, and what it cost to learn
 
-    **A statement about THIS machine, never about the product.** the maintainers' notes records a probe
+    **A statement about THIS machine, never about the product.** The maintainers' notes records a probe
     whose first wording said *"4 levers could not fire"*, which reads as *your runner cost you these
     tools* — and it was wrong, because the gate was the workdir's rather than the machine's. Telling a
     customer their machine cost them something it did not is a confident wrong number, so this reports

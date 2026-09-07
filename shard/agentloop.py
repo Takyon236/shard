@@ -1,5 +1,5 @@
-"""Native tool-calling agent loop — the SOTA reasoner path (vs the single-JSON-action ReAct in
-``loop.py``).
+"""Native tool-calling agent loop — the SOTA reasoner path, replacing the single-JSON-action
+ReAct loop that is retired and ships in no tree.
 
 Why this exists: the JSON-action loop serializes ONE action as text per turn and parses it back, which
 is exactly where weaker/reasoning models drift into prose and stall (sonnet bailed on prose, GLM
@@ -171,7 +171,7 @@ STALL_PROGRESS_TOOLS = CONSTRUCT_PROGRESS_TOOLS | frozenset({"test_poc", "auto_f
 # ``reached_sink`` was listed here against ``instrument``, which has never emitted it — the separate package
 # emits ``reached``, a different question (did the AGENT'S anchor fire, not did the DESCRIBED sink run).
 # The key was therefore projected out of no result dict at all until `batch_test` began emitting it on
-# 2026-08-31 (`deep/triage._reach_verdict`). Attributed to its real producer here; the stall lever itself
+# 2026-08-31 (the separate package). Attributed to its real producer here; the stall lever itself
 # ships OFF, so the widened projection changes no shipped behaviour.
 STALL_OUTCOME_KEYS = ("crashed", "inner_exit", "sanitizer", "found", "n_crashes", "reached",
                       "probes_hit", "reached_sink", "build_ok", "rebuilt", "exhausted")
@@ -398,7 +398,7 @@ _log = get_logger(__name__)
 #: `gate.exit_code` refuses to pass a build when `status == "error"`; `report._summary_table` renders
 #: the stopped-by row on `status == "maxsteps"`; `budget` reads `"error"` to tell a backend failure
 #: from a solver one. All three compare against a LITERAL. Until this constant existed the set they
-#: compare against lived in a `#` comment on the line below — which `build_paid_tree.py` deletes — so
+#: compare against lived in a `#` comment on the line below — which a maintenance script deletes — so
 #: renaming a status would have left every one of those comparisons compiling, passing, and never
 #: matching again. The errored-run gate would have gone quietly back to returning a green check over a
 #: review that never ran, which is the defect it was added to close.
@@ -449,7 +449,7 @@ def _context_chars(messages: list) -> int:
 class LoopState:
     """One ReAct run's bookkeeping, as a named record rather than as loose locals.
 
-    **THE NAMES ARE THE POINT, AND THEY ARE WHAT SURVIVES THE BUILD.** `build_paid_tree.py` strips
+    **THE NAMES ARE THE POINT, AND THEY ARE WHAT SURVIVES THE BUILD.** A maintenance script strips
     every docstring and comment, so in the artefact a paying customer maintains, this text does not
     exist and neither did the twenty-three comments these fields replaced — `run` opened with a wall
     of bare assignments (`stall_retries = 0`) whose meaning had been deleted at build time. A field
