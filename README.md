@@ -1,13 +1,23 @@
 # Shard
-<place to put image logo later>
+<!-- place to put image logo later -->
 
 ## What Shard is
 
-Shard is a security reviewer for all your pull requests and it runs inside your build system and it runs on a model endpoint you supply and pay for. Most importantly **it only reports a probelm when it attaches and input that makes the problem happen on demand**.
+Shard is a security reviewer for all your pull requests and it runs inside your build system and it runs on a model endpoint you supply and pay for. Most importantly **it only reports a problem when it attaches an input that makes the problem happen on demand**.
 
-Other tools like CodeRabbit etc. guess through your code and hand you a list, half full of false positives and unbased suggestions with no clear solution. Shard runs your program and uses an input that it custom-crafted and watches what happens, reporting what it actually saw.
+Other tools like CodeRabbit etc. guess through your code and hand you a list, half full of false positives and unfounded suggestions with no clear solution. Shard runs your program and uses an input that it custom-crafted and watches what happens, reporting what it actually saw.
 
-*Speaking truth, not a clean response designed to make you happy*. 
+*Speaking truth, not a clean response designed to make you happy*.
+
+> **Version:** These pages document `v4.0.3`. Existing v3 users should use the
+> [v3.0.2 documentation](https://github.com/Takyon236/shard/tree/v3.0.2).
+
+## Start here
+
+- [Install a same-repository pull-request review](docs/getting-started.md)
+- [Design and test a witness](docs/witnesses.md)
+- [Connect a model endpoint](docs/model-endpoints.md)
+- [Look up commands, outputs, limits, and runtimes](docs/reference.md)
 
 ## The idea behind it all
 
@@ -15,9 +25,9 @@ Prove it, or it didn't happen. The model says so, a heuristic checker proves it,
 
 Each real finding comes with a bundle (labelled with the input and the exact command and the version of your code it was produced against) you can reproduce it with. *If the bundle doesn't work and it can't prove it, it didn't exist.*
 
-The build never fails on a an unproven finding, no matter what you do. Guesses are for reference only
+The build never fails on an unproven finding, no matter what you do. Guesses are for reference only.
 
-The code stays yours. Code analysis runs on your own machine, analysed by your AI. Your source code, your binaries and your information never leave your own machine. There is no privacy clause because your information is your information and this project runs no model service of it's own and never sees your code.
+The code stays yours. Code analysis runs on your own machine, analysed by your AI. Your source code, your binaries and your information never leave your own machine. There is no privacy clause because your information is your information and this project runs no model service of its own and never sees your code.
 
 ## The three modes
 | mode | what it does | needs a model? |
@@ -28,9 +38,9 @@ The code stays yours. Code analysis runs on your own machine, analysed by your A
 
 There is a fourth hidden one called action. You never type it and it is what the GitHub Action runs, reading its settings from the environment that GitHub builds for it.
 
-Two modes need no model and no API key no secret and nothing other than the code. You can start there and answer these two questions for yourself. 
+Two modes need no model, no API key, no secret and nothing other than the code. You can start there and answer these two questions for yourself.
 
-What is in this repository and couild a finding here fail my build?
+What is in this repository and could a finding here fail my build?
 
 ## Try it in 5 minutes
 
@@ -51,20 +61,20 @@ cat shard-out/shard-report.md
 shard preflight --repo /path/to/your/project
 ```
 
-This creates the file that makes the findings provable and when you want to see a finished one look at examples/ with 5 small projects with no real defects in them that also need no key.
+When you want to see a finished one, look at [`examples/`](examples/) — five small projects, each with a real defect, that also need no key:
 
 ```bash
 cd examples/python-config-eval
 bash .shard/entry.sh .shard/entry.sh.benign/ordinary.conf   # silent: an ordinary input
 printf 'x = __import__("os")\n' > /tmp/attack.conf
-bash .shard/entry.sh /tmp/attack.conf       
+bash .shard/entry.sh /tmp/attack.conf                       # prints the marker: the defect, live
 ```
 
-An API key is needed only for the diff function which is the pull request review.
+An API key is needed only for `diff`, the pull-request review.
 
 ## The two files you write
 
-These decide whether anything Shard finds can fail your build and they live sid by side. 
+These decide whether anything Shard finds can fail your build and they live side by side.
 
 | path | what it is |
 |---|---|
@@ -85,25 +95,25 @@ bash .shard/entry.sh /dev/null        # must be SILENT and exit 0 before you go 
 
 Shard runs 'bash -- .shard/entry.sh <payload file>' and supplies the payload's contents.
 
-1. **Read the payload.**: A  program that ignores it's outputs cannot be evidence without it.
-2. **Print nothing but your marker.**: Echoing back what you were given demonstrastes your echo.
-3. **Empty input must be quiet**: Shard runs the script on an emptypayload as a baseline and compares, A script that prints its marker or die is pointless, the baseline does the same thing, and the finding is refused. This is a waste of time.
-4. **Put safe inputs beside it**: one per branch. Without them the only comparison is an empty input. Whatever your program prints on real input loosk like it was caused by the attack
+1. **Read the payload.**: A program that ignores its input cannot be evidence about it.
+2. **Print nothing but your marker.**: Echoing back what you were given demonstrates your own echo.
+3. **Empty input must be quiet**: Shard runs the script on an empty payload as a baseline and compares. A script that prints its marker or dies whatever it is given is pointless, the baseline does the same thing, and the finding is refused. This is a waste of time.
+4. **Put safe inputs beside it**: one per branch. Without them the only comparison is an empty input. Whatever your program prints on real input looks like it was caused by the attack.
 
 A run made without controls says so in the finding. A limit you can see rather than one you already know about.
 
 ## Two kinds of proof
 
-Your script proves a defect in one of two ways. Asking for a type in this build does not judge is a quiet failure and not an error.
+Your script proves a defect in one of two ways. Asking for a kind this build does not judge is a quiet failure, not an error.
 
 | kind | what it means | when to use it |
 |---|---|---|
 | `output_marker` | your script prints a string you chose | almost always; the only route in most languages |
 | `fatal_signal` | the program dies on a crash signal | memory bugs, and builds that abort on detection |
 
-Two other kinds exist in the code and were deliberately switched off. Both were measured and both fired on programs tht were merely rejecting bad input, as designed. If you failure mode is an exception or a non-zero exit, print a marker on that path and then use `output-marker`. The generated skeleton lists only what this build accepts, so it cannot drift away from this.
+Two other kinds exist in the code and were deliberately switched off. Both were measured and both fired on programs that were merely rejecting bad input, as designed. If your failure mode is an exception or a non-zero exit, print a marker on that path and then use `output_marker`. The generated skeleton lists only what this build accepts, so it cannot drift away from this.
 
-It can run without a network. Where the build machine allows it, your script and its controls run in a network space with no way out which is the same treatment the reviewers own shell has always had. On a standard GitHub runner this is not possible and nothing is isolated and the report says so. Regardless, a script that download something at proff time behaves differently depending on which machine it lands on.
+It can run without a network. Where the build machine allows it, your script and its controls run in a network space with no way out which is the same treatment the reviewer's own shell has always had. On a standard GitHub runner this is not possible and nothing is isolated and the report says so. Regardless, a script that downloads something at proof time behaves differently depending on which machine it lands on.
 
 ## What languages can fail a build
 
@@ -133,9 +143,9 @@ or Java entry script should run the assembly your build step already emits. C an
 exception: a compiler is present, so a script that compiles works as well.
 
 Absent on purpose: Go, Rust, Swift and every other toolchain. A script calling one exits with
-"command not found" (127) and `preflight` will have told you so first. This is on purpose and is a technical decision
+"command not found" (127) and `preflight` will have told you so first.
 
-The image is 934 MB, and about 810 MB of that is the runtimes. An intendd trade: one
+The image is 934 MB, and about 810 MB of that is the runtimes. A deliberate trade: one
 download per machine against languages that could otherwise never fail a build.
 
 ## Every setting, and what it does
@@ -212,7 +222,7 @@ Three numbers can define it all:
 |---|---|
 | **0** | pass. Either nothing was found, or nothing matched your `fail_on` rule |
 | **1** | a proven finding matched your `fail_on` rule — the review worked and this is its verdict |
-| **2** | a configuration problem: a missing key, a bad setting. Deliberately distinct, so an internal error can never masquerade as a security finding |
+| **2** | Shard could not perform the review you asked for: a missing key, a bad setting, a failed handoff. Deliberately distinct, so an internal error can never masquerade as a security finding |
 
 ## The files a run leaves behind
 
@@ -228,19 +238,19 @@ All in `out_dir` (default `shard-out/`):
 | `shard-survey.json` | survey mode's machine-readable output |
 
 Every run also writes its report to the job's step summary, which needs no tokens and no
-permission so even a minimal workflow is visible on the job page.
+permission, so even a minimal workflow is visible on the job page.
 
 ### The report's fixed header
 
-Every report opens the same way, because the two questions a reader arrives with are was anything
-found and did this run actually finish: verdict first, trust second, then what was
+Every report opens the same way, because the two questions a reader arrives with are *was anything
+found* and *did this run actually finish*: verdict first, trust second, then what was
 reviewed, the gate decision, whether a witness was declared, whether the agent executed things in
 your checkout, and the cost. A run cut off by a ceiling says so there, rather than rendering like a
 clean result. A fact the run does not know omits its row rather than printing a zero.
 
 ## Setting it up in GitHub Actions
 
-A complete workflow, and completeness is the whole point, the scan step alone produces a run whose
+A complete workflow, and completeness is the whole point — the scan step alone produces a run whose
 findings nobody sees, because the output lives on a machine that is destroyed when the job ends:
 
 ```yaml
@@ -263,7 +273,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: Takyon236/shard@v2
+      - uses: Takyon236/shard@v4
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}   # the secret itself, and the
                                                                   # only place it appears
@@ -353,12 +363,12 @@ The action wrapper is GitHub-specific; the product is not. It is a container wit
 and any CI that can run a container can run it. Pull the published image rather than building it:
 
 ```bash
-docker pull ghcr.io/takyon236/shard:v2
+docker pull ghcr.io/takyon236/shard:v4
 
 docker run --rm \
   -v "$PWD:/src" -w /src \
   -e OPENROUTER_API_KEY \
-  ghcr.io/takyon236/shard:v2 \
+  ghcr.io/takyon236/shard:v4 \
     diff --repo /src --base-ref "$BASE_SHA" \
          --witness-entry .shard/entry.sh \
          --model-endpoint https://your-endpoint/v1 \
@@ -485,7 +495,7 @@ the file wins. **Two doors, and you only need one of them:**
   relationship.
 - Change Shard itself and run the changed version, and one of two things follows: publish your
   changes under the same licence within 90 days, or buy a commercial licence and keep them
-  private. Your own source, configuration, entry scripts and findings are never covered** —
+  private. Your own source, configuration, entry scripts and findings are **never covered** —
   reviewing your code with Shard never obliges you to publish it.
 - Not permitted: offering Shard itself to others as a hosted, managed or embedded service.
   Using it to do your own work is not that.
@@ -560,6 +570,11 @@ Full detail in [CHANGELOG.md](CHANGELOG.md); the shape of it:
 | 2.1.x | 2026-08-25 | the two-door licence (public free always; private free under the size line); honest preflight costs (a stated floor, words re-measured); the report says what the review actually ran; generated-repository fixes |
 | 2.2.0 | 2026-08-27 | `shard-result.json` — the whole run as one versioned document with a `limits` array; deep mode gains generated C harnesses and tooling |
 | 2.3.0 | 2026-08-31 | findings carry a weakness class and a severity a dashboard can rank; alert identity stabilised on the crash state so alerts stop churning and losing their triage state |
+| 3.0.0 | 2026-09-03 | survey mode rejects model and scope inputs it used to discard silently (breaking) |
+| 3.0.1–3.0.2 | 2026-09-04 | a run that used its full execution allowance reports as incomplete; the three exit codes documented; input spelling and endpoint-check command corrected |
+| 4.0.0 | 2026-09-05 | the strictness release (breaking): failed handoffs end exit 2, an immutable source snapshot, bounded turns and tools, the key carried by one fixed internal name; docs rebuilt into focused pages |
+| 4.0.1–4.0.2 | 2026-09-06 | no customer-visible change to the distribution |
+| 4.0.3 | 2026-09-07 | the Action could not execute a witness in 4.0.2, so nothing could gate — fixed |
 
 Before the first release: 263 commits with no tags, not reconstructable here.
 
@@ -568,6 +583,7 @@ Before the first release: 263 commits with no tags, not reconstructable here.
 | question | the file that decides |
 |---|---|
 | the terms | [LICENSE](LICENSE) |
+| the guides | [docs/](docs/) |
 | every input and output, exactly | [action.yml](action.yml) |
 | what changed and when | [CHANGELOG.md](CHANGELOG.md) |
 | how to contribute | [CONTRIBUTING.md](CONTRIBUTING.md) |
