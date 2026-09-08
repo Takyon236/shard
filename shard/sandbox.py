@@ -1,59 +1,3 @@
-"""Execution tools for simple mode — the free tier's answer to "the agent cannot run anything".
-
-**WHY THIS MODULE EXISTS, in the numbers that bought it.**
-
-Until 2026-08-19 the free-tier registry held four tools (`read_file`, `grep`, `list_dir`,
-`report_finding`) and its system prompt said so: *"You have READ tools only."* The container it runs
-in ships node 22, a JRE, ruby, php-cli, dotnet 8, gcc/g++ and git — **209 MB -> 529 MB**, added
-2026-08-17 so that a demonstration could execute — and every one of those runtimes was reachable ONLY
-by `witness.adjudicate`, which runs AFTER the loop has ended. The agent that decides what to propose
-could not observe the thing it was proposing about.
-
-The cost is measured, not argued. A measured run, N=5 on a
-pinned target at temperature 0, byte-identical revisions:
-
-    findings        4 4 4 4 4     stdev 0.00     the report is PERFECTLY stable
-    gate_eligible   1 2 0 0 2     stdev 1.00     3 builds pass, 2 fail, same commit
-
-    cause, as the artefact printed it                          n     what ONE execution would have shown
-    the marker 'path: served 54 chars' is not present          4     `path: served 55 chars`
-    the entry point was KILLED (rc=137) rather than finishing   3     the program dying, producing nothing
-    it exited 1 rather than dying on a fatal signal            4     exit 1
-
-Seven of those fourteen are the agent betting on runtime behaviour it had no instrument to check, and
-the run doc says so in as many words: *"it has read tools only and by design cannot run the program
-once to look."* Two of the three `rc=137` losses were REAL exploits, refused because the payload
-(`kill -9 $PPID`, reproduced 8 of 8 on an idle machine) destroyed the evidence it was meant to produce.
-
-**The shipped mitigation for both was PROSE.** `simple.build_simple_registry` carries 1,421 characters
-of instruction inside `report_finding`'s description — *"Choose a marker you have READ"*, *"your
-payload must leave the program ALIVE"* — billed to the customer's endpoint on every pull request. That
-is a missing tool being paid for in tokens.
-
-**WHAT THIS MODULE DOES NOT DO, and the decision it keeps intact.**
-
-`simple.adjudicate_all` runs after the loop *"so no proposal can be revised in response to a verdict"*,
-and `simple._repo_relative` warns that telling the agent its witness was rejected *"invites it to try
-another until one sticks"*. **That rule is untouched.** These tools return an OBSERVATION — exit code,
-stdout, stderr — and never a verdict. Nothing here calls `witness.adjudicate`, imports `Witness`, or
-can tell the agent whether a finding will gate. The grader still re-runs independently after the loop,
-on the digest-pinned entry point, with `self_defeating_marker`, `_marker_is_not_the_payload`, the
-empty-payload baseline and the benign controls all firing exactly as before.
-
-The distinction is the whole design: **observation is not adjudication.** A marker READ from real
-output does not weaken the anti-forgery guard — it makes the guard fire on a proposal that was worth
-making.
-
-**THE PERIMETER, stated honestly rather than claimed away.**
-
-`run_entry` adds no new KIND of execution: it is `bash -- <entry> <input>` with `entry_env()`, in the
-checkout, which is byte-for-byte what `witness.adjudicate` already does post-loop. It adds instances.
-
-`run` DOES add a new kind — arbitrary argv. The library design: *"an agent whose context
-includes attacker-influenced text, holding a tool that can address a network, is a prompt-injection
-primitive"*. It therefore runs only behind the same verified private PID, network, procfs and
-allowlisted-root boundary as adjudication; unavailable containment makes the tool refuse.
-"""
 
 from __future__ import annotations
 
@@ -74,130 +18,38 @@ from .witness import (CONTAINMENT_REFUSAL, DEFAULT_TIMEOUT, FATAL_SIGNAL_CODES,
                       resolve_entry)
 from .witnessfs import SnapshotError, SourceSnapshot
 
-#: Seconds one `run` / `run_entry` call may take. DERIVED from the adjudicator's own timeout
-#: (`witness.DEFAULT_TIMEOUT`) rather than restating a number: this file claims `run_entry` is
-#: "byte-for-byte what `witness.adjudicate` does", and an entry point that only just finishes for the
-#: agent must be one that only just finishes for the grader — a smaller value here would let a run
-#: "hang" for the agent while it still demonstrates under adjudication.
 DEFAULT_EXEC_TIMEOUT = DEFAULT_TIMEOUT
 
-#: Hard ceiling on the timeout the model may ask for. The model controls this argument and the loop has
-#: no wall clock of its own; the maintainers' notes records the same gap on `run_bash`'s timeout.
 MAX_EXEC_TIMEOUT = 120
 
-#: What fraction of a run's MOVES may be executions. The relation the ceiling below was always meant
-#: to express, written as the relation rather than as its value at one particular default.
-#:
-#: **0.6 IS CHOSEN TO PRESERVE 24 AT THE DEFAULT. It is NOT the 0.5 the old comment claimed.** That
-#: comment read *"24 is roughly max_steps/2"*, and 24/40 is 0.6, not 0.5 — the prose and the arithmetic
-#: disagreed by twenty percent and the prose is the half a reader believes. Naming the true ratio is
-#: the point of writing it as a relation: 0.5 would ship 20 and quietly cut every default run's
-#: execution budget by a sixth, which is a behaviour change nobody asked for and no measurement
-#: supports. So the value is back-solved from the shipping number deliberately, and said so here rather
-#: than dressed up as a principle.
-#:
-#: What IS a judgement is the shape: above half, because a review that only reads cannot check what it
-#: claims; below one, because a run whose every move is a subprocess has stopped reviewing and started
-#: fuzzing. 0.6 satisfies both and happens to be what shipped.
 EXEC_CALLS_PER_STEP = 0.6
 
 
 def exec_budget(max_steps: int) -> int:
-    """Executions a run of `max_steps` moves may pay for.
-
-    **THE CEILING WAS A LITERAL SIZED AGAINST A DEFAULT THAT CALLERS OVERRIDE, and it produced a false
-    positive on the first real customer audit.** `--max-steps` is a customer flag;
-    a measured run records a 1,960-file engagement run at 200, where the fixed
-    24 was **12% of the run's moves** rather than the 60% the comment above claims. It bound twice. Once
-    it merely stopped a confirmation. The second time the agent could not reach the backend that
-    constructs `onboarding_url`, could not clear a candidate, and **shipped a finding that was not a
-    defect** — a false positive on a customer report, which is the exact outcome the
-    reproducing-input doctrine exists to prevent.
-
-    So the ceiling now tracks the run it is bounding. A run given 200 moves gets 120 executions; a run
-    given 40 still gets 24. `--max-tokens` is the bound that actually costs money and it is unchanged —
-    this one only stops execution from crowding out the rest of the loop.
-
-    Never below 1: a run permitted zero executions inside a container shipping seven language runtimes
-    is the four-tool agent that the design notes — *"Simple mode can run the program it reviews"* —
-    was written to end, reintroduced by arithmetic.
-    """
     return max(1, int(max_steps * EXEC_CALLS_PER_STEP))
 
 
-#: Executions one RUN may pay for, across both tools, WHEN NO STEP COUNT IS SUPPLIED. Not a safety
-#: control — the env scrub and the digest check are — but a COST control: each call is a subprocess
-#: plus a full transcript re-send, and the maintainers' notes records a run that retrieved 206,732
-#: bytes for 1,479,494 tokens by repeating a cheap call.
-#:
-#: THE VALUE AT THE DEFAULT, kept as a constant because `ExecState` must be constructible without a
-#: step count — a maintenance script and the maintainers' suite both do it.
-#:
-#: **IT IS A HAND-SYNCHRONISED COPY, WHICH THIS REPOSITORY HAS ALREADY BEEN BITTEN BY, so it is held
-#: by a test rather than left to good intentions.** Commit `880f0f7` found the last one:
-#: a maintenance script's `READ_DEFAULT_BYTES` drifted from the constant it was meant to mirror and would
-#: have mis-baselined an instrument silently. That fix derived by IMPORT, which is the better answer
-#: and is unavailable here — `simple.py` imports this module, so importing `DEFAULT_MAX_STEPS` back
-#: would be a cycle. So the relation is held the other way `880f0f7` used, an identity assertion:
-#: the maintainers' suite asserts `exec_budget(DEFAULT_MAX_STEPS) == MAX_EXEC_CALLS`, the same shape
-#: as the maintainers' suite's identity test over the observation-window sites.
 MAX_EXEC_CALLS = 24
 
-#: Characters of combined stdout+stderr returned to the model per call. The loop clamps a serialized
-#: observation with a head-slice (`agentloop` `[:max_obs_chars]`), so this is cut here, at the tail,
-#: where the loss is visible and announced — not there, where it is silent. Derived as half the
-#: observation window (`tools.OBS_WINDOW_CHARS`) so the "must stay below max_obs_chars" relation this
-#: comment asserts is STRUCTURAL: it cannot drift above the window it has to sit under.
 MAX_OUTPUT_CHARS = OBS_WINDOW_CHARS // 2
 
 
 @dataclass
 class ExecState:
-    """What this run has executed, and under what containment. One per `run_simple`.
-
-    Threaded into the tools by CLOSURE, never by `functools.partial`. The maintainers' notes and
-    the separate package's `harness_contract` note record why: **a partial keyword is a DEFAULT, not a
-    binding.** `toolvalidate` never flags unknown args, `agentloop` passes `tc.arguments` verbatim, and
-    `ToolRegistry.call` does `tool.fn(self.ctx, **args)` — so a model emitting `state=` or `entry=`
-    replaces the injected value. That chain was executed end to end on this repository once already.
-    """
 
     calls: int = 0
     entry_calls: int = 0
     shell_calls: int = 0
     max_calls: int = MAX_EXEC_CALLS
-    #: "isolated" (a network namespace was entered), "unrestricted" (the kernel refused), or "unknown"
-    #: (never probed). Reported, never assumed — see `network_mode`.
     network: str = "unknown"
-    #: `None` means unprobed, `()` means the complete hostile-execution boundary is unavailable.
-    #: PID-only containment is deliberately not a runnable state.
     isolation: tuple[str, ...] | None = None
-    #: Where the model may write. Outside the checkout, so the ordinary case leaves no trace in the
-    #: tree the findings point at.
     scratch: str = ""
-    #: Exact environment-variable names the caller configured as inference credentials.
     secret_env_names: tuple[str, ...] = ()
-    #: Credential-free, regular-file-only source captured before the model receives a shell. Tests and
-    #: direct callers may omit it; the execution seam then owns a one-call snapshot and still never
-    #: binds the live checkout.
     source_snapshot: SourceSnapshot | None = None
-    #: Every command line the shell tool ran, for the journal. The agent's own moves are evidence about
-    #: the run and the artefact could not previously say whether it executed anything at all.
     log: list[str] = field(default_factory=list)
-    #: How many executions the ceiling DENIED. Not a duplicate of `calls >= max_calls`, and the
-    #: difference is the whole point: a run that spent its last call and then stopped asking is a run
-    #: that finished, while a run that asked again and was refused is a run that was CUT OFF. Only the
-    #: second is evidence about the ceiling.
-    #:
-    #: **It was invisible everywhere but the model's own transcript.** `spend` returned the refusal
-    #: sentence to the agent and told nothing else — not the journal, not the payload, not the report,
-    #: not either instrument — and `status` stayed `done`. So a run that could not finish verifying
-    #: reported as a clean one. On a customer engagement that silence is what let a candidate the agent could not
-    #: clear reach a customer's report as a finding (a measured run).
     refused: int = 0
 
     def spend(self) -> str:
-        """Charge one execution, or return the refusal sentence when the ceiling is reached."""
         if self.calls >= self.max_calls:
             self.refused += 1
             return (f"execution budget exhausted ({self.max_calls} calls). Report what you have; "
@@ -207,60 +59,18 @@ class ExecState:
 
     @property
     def exhausted(self) -> bool:
-        """Did the ceiling actually stop this run doing something it tried to do?
-
-        Read off `refused` rather than off `calls`, because "spent every call" and "was denied a call"
-        are different claims and only the second one indicts the ceiling. A run that used all 24 and
-        had nothing further to ask was not constrained by anything.
-
-        **THAT LAST SENTENCE IS FALSE FOR THIS LOOP, and `spent` below is why it needed a companion
-        rather than a correction.** It assumes the model learns the ceiling by hitting it. It does
-        not: every tool result carries `executions_left`, so the model reads 0 and stops asking BEFORE
-        it is ever refused. The ceiling then binds in perfect silence — `refused` stays 0, `exhausted`
-        stays False, and every completeness field describes a truncated run as a whole one.
-        """
         return self.refused > 0
 
     @property
     def spent(self) -> bool:
-        """Did this run use every execution it was given?
-
-        **Measured 2026-09-03 on a live diff against a real repository.** The agent's own last turn
-        opened "I have no tool budget left, so let me consolidate what I established", at model turn
-        20 of an allowed 40, with `calls == budget == 24` and `refused == 0`. The report's trust row
-        said `complete run`, `shard-result.json` said `"complete": true, "limit_hit": ""`, and the run
-        log said "the execution ceiling refused nothing, so no claim here was cut short by it".
-
-        A SECOND SIGNAL RATHER THAN A WIDER `exhausted`, because the distinction that docstring draws
-        is real and worth keeping: being denied a call is evidence the ceiling CUT the run off, and
-        spending the last one is evidence it may have. What was wrong was reporting the second as no
-        constraint at all. Three states, three sentences — see `telemetry.execution_lines`.
-        """
         return self.calls >= self.max_calls
 
     def remaining(self) -> int:
         return max(0, self.max_calls - self.calls)
 
 
-# ── network containment ─────────────────────────────────────────────────────────────────────────────
 
 def network_mode(state: ExecState, runner=None) -> str:
-    """Probe the complete hostile-execution boundary and report whether it is available.
-
-    **This is a real control where it works and an honest `unrestricted` where it does not**, which is
-    the shape a module this build does not carry already argues for: confirming containment is the burden of proof, and
-    ambiguity is failure — so ambiguity is REPORTED rather than resolved in our favour.
-
-    PID-only and empty prefixes are both reported as "unrestricted" and are both refused at every
-    execution seam. PID-only hides processes but retains network access; neither state satisfies the
-    boundary this field records.
-
-    The probe itself is `witness.isolation_prefix`, so the answer the AGENT's tools get and the answer
-    the ADJUDICATOR gets come from one implementation. They were two, and the second one did not
-    exist: the model's shell was wrapped and the customer's entry point never was. This function keeps
-    its own cache because `ExecState.network` is journalled — the word in the record has to be the word
-    this run acted on.
-    """
     if state.isolation is None:
         state.isolation = isolation_prefix(runner or subprocess.run)
     state.network = "isolated" if network_isolated(state.isolation) else "unrestricted"
@@ -268,19 +78,12 @@ def network_mode(state: ExecState, runner=None) -> str:
 
 
 def _isolation(state: ExecState, runner) -> tuple[str, ...]:
-    """The probed argv prefix; callers accept only `network_isolated` results."""
     network_mode(state, runner)
     return state.isolation or ()
 
 
 @contextmanager
 def _source_view(state: ExecState, repo):
-    """Yield source without VCS credentials, special files or escaping links.
-
-    Production owns one snapshot for the whole model run. Keeping the fallback here is deliberate:
-    ``build_exec_tools`` is public, and a caller that did not pre-capture source must become slower,
-    never less contained.
-    """
     owned = state.source_snapshot is None
     snapshot = state.source_snapshot or SourceSnapshot.capture(repo)
     try:
@@ -292,7 +95,6 @@ def _source_view(state: ExecState, repo):
 
 
 def _execution_scratch(state: ExecState, repo) -> pathlib.Path:
-    """Return the writable execution root, refusing an alias into the live checkout."""
     scratch = pathlib.Path(state.scratch or tempfile.mkdtemp(prefix="shard-exec-"))
     live = pathlib.Path(repo).resolve(strict=True)
     resolved = scratch.resolve(strict=False)
@@ -303,45 +105,14 @@ def _execution_scratch(state: ExecState, repo) -> pathlib.Path:
 
 
 def _source_entry(source: pathlib.Path, entry: str) -> pathlib.Path:
-    """Resolve the declared entry inside captured source, or fail before execution."""
     resolved = resolve_entry(source, entry)
     if resolved is None or not resolved.is_file():
         raise SnapshotError("the declared entry point is absent from safe source")
     return resolved
 
 
-# ── tamper detection ────────────────────────────────────────────────────────────────────────────────
 
 def scope_digest(repo, paths) -> str:
-    """A digest over the files a finding may point at, taken before the loop and re-checked after.
-
-    Hostile executions now receive the checkout through a read-only bind inside an allowlisted root.
-    This digest remains the independent detection layer: if another path or a containment regression
-    changes the tree the findings describe, `run_simple` refuses to gate.
-
-    It mirrors `witness.entry_digest`, which has protected the entry point the same way since the loop
-    could not touch it — the difference being that a shell CAN, so the surface has to widen to the
-    changed files as well.
-
-    A path that does not exist contributes its absence rather than being skipped: a run that DELETED a
-    changed file must not digest the same as one that left it alone. It took two mutation passes to
-    get a bench row that actually scores this — rewriting a file never reaches the branch, and deleting
-    a NON-empty one is caught by the vanished content regardless, so only an EMPTY file deleted tells
-    the two implementations apart.
-
-    **TWO LIMITS, stated because a control that over-claims is worse than one that is narrow.**
-
-    * **It covers the paths it is GIVEN.** `run_simple` passes the diff scope plus the entry point,
-      which is where a diff-scoped mode's findings live — but a claim naming a file outside the scope
-      has no baseline here, because the "before" digest must be taken before the loop and the claim
-      arrives during it. Widening to the whole checkout was rejected on cost, not on principle.
-    * **Modify-then-restore digests clean.** An agent that edited a file, observed it, and put it back
-      leaves this quiet. **That is load-bearing on the SECOND control rather than a hole**: the gate
-      re-executes the entry point after the loop, against the tree as it finally stands, so a
-      demonstration obtained from code that no longer exists does not reproduce and does not gate. This
-      digest is the belt over that brace — it catches the case where the tree was left changed, which
-      is the one the brace cannot speak to.
-    """
     root = pathlib.Path(repo).resolve()
     h = hashlib.sha256()
     for rel in sorted(set(paths or ())):
@@ -356,16 +127,8 @@ def scope_digest(repo, paths) -> str:
     return h.hexdigest()
 
 
-# ── payload staging ─────────────────────────────────────────────────────────────────────────────────
 
 def payload_bytes(payload: str = "", payload_base64: str = "") -> bytes:
-    """The bytes the model meant, or ValueError.
-
-    Deliberately the same contract as `simple.witness_payload_bytes` — one field or the other, never
-    both — so the agent learns ONE rule and uses it at both the observation and the reporting end. A
-    payload that runs here and is then re-encoded differently for `report_finding` would make this tool
-    actively misleading, which is worse than not having it.
-    """
     if payload and payload_base64:
         return _raise("pass witness-style payload OR payload_base64, never both")
     if payload_base64:
@@ -381,11 +144,6 @@ def _raise(msg: str):
 
 
 def _capped(stdout: str, stderr: str) -> tuple[str, str]:
-    """Split `MAX_OUTPUT_CHARS` across the two streams, announcing any cut IN the stream it happened to.
-
-    stderr is favoured when both are large: a traceback, a sanitiser report and `command not found` all
-    arrive there, and they are what the agent is usually looking for.
-    """
     out, err = stdout or "", stderr or ""
     if len(out) + len(err) <= MAX_OUTPUT_CHARS:
         return out, err
@@ -398,26 +156,8 @@ def _capped(stdout: str, stderr: str) -> tuple[str, str]:
     return out, err
 
 
-# ── the tools ───────────────────────────────────────────────────────────────────────────────────────
 
 def _observation(rc, stdout: str, stderr: str, note: str, state: ExecState) -> ToolResult:
-    """One execution, as the model sees it. **An observation, never a verdict.**
-
-    `note` leads, for the reason `_grep` puts its markers first: the loop head-slices a serialized
-    observation, so anything appended last is the first thing dropped — and the note is what says the
-    run was killed, or truncated, or that the budget is nearly gone.
-
-    There is deliberately no `demonstrated`, no `expectation` and no `why_not` here. Those words belong
-    to `witness.Witness`, which is built after this loop has ended and which this module never imports
-    a verdict from.
-
-    **REDACTED HERE TOO, and this site is worse than the adjudicator's.** `witness.redact_secrets`
-    explains why `entry_env` alone does not hold: the child is root in our container and
-    `/proc/1/environ` still carries the block the kernel copied at exec time. Everything this function
-    returns goes into the model's message history, and from there into the journal, the transcript and
-    any artifact that carries them — so a `cat /proc/1/environ` through `run` would publish the key
-    even on a run that never reached adjudication at all.
-    """
     out, err = _capped(
         redact_secrets(stdout, secret_env_names=state.secret_env_names),
         redact_secrets(stderr, secret_env_names=state.secret_env_names),
@@ -433,27 +173,10 @@ def _observation(rc, stdout: str, stderr: str, note: str, state: ExecState) -> T
 
 def _run_entry_point(ctx: ToolContext, state: ExecState, *, repo, entry: str, runner,
                      payload: str = "", payload_base64: str = "") -> ToolResult:
-    """Execute the DECLARED entry point on the model's input and hand back what happened.
-
-    **Byte-for-byte the adjudicator's invocation**, and that is the requirement rather than a
-    convenience: `witness.adjudicate` runs `bash -- <resolved entry> <staged input>` with `cwd=repo`,
-    `env=entry_env()`, `text=True, errors="replace"` and a timeout. Any difference here would let the
-    agent observe one program and be graded on another, which is a worse instrument than none.
-
-    `errors="replace"` is load-bearing for the same reason it is there: this executes the CUSTOMER'S
-    script, and a witness that demonstrates a memory-safety bug puts raw memory and sanitiser output on
-    stdout. Strict utf-8 would raise `UnicodeDecodeError`, which is neither `TimeoutExpired` nor
-    `OSError` and would escape every handler here.
-
-    **The input is staged OUTSIDE the checkout** (`state.scratch`), so a run that observes a payload
-    leaves the tree the findings point at unchanged and `scope_digest` stays quiet.
-    """
     if refusal := state.spend():
         return ToolResult(False, error=refusal)
     resolved = resolve_entry(repo, entry)
     if resolved is None or not resolved.is_file():
-        # Registration already gates on this, so reaching it means the entry point moved DURING the
-        # run. Refusing beats executing something else under its name.
         return ToolResult(False, error=f"the declared entry point {entry} no longer resolves in the checkout")
     try:
         data = payload_bytes(payload, payload_base64)
@@ -474,9 +197,6 @@ def _run_entry_point(ctx: ToolContext, state: ExecState, *, repo, entry: str, ru
             "and network boundary, so the customer-authored entry point was not executed",
         )
     state.entry_calls += 1
-    # THE SAME PREFIX THE ADJUDICATOR USES, for the same reason the timeout and the environment are
-    # the same: this function's whole worth is that what the agent observes is what the grader will
-    # observe. `()` is a refusal at both hostile-execution seams.
     try:
         with _source_view(state, repo) as source:
             safe_entry = _source_entry(source, entry)
@@ -502,22 +222,8 @@ def _run_entry_point(ctx: ToolContext, state: ExecState, *, repo, entry: str, ru
         return ToolResult(False, error=stderr.strip())
 
     rc = proc.returncode
-    # **NORMALISE BEFORE COMPARING, and this was a live bug in this function for its first hour.**
-    # `witness._normalise`: *"`128 + N` is what a shell reports; `subprocess` reports a DIRECT child's
-    # signal as `-N`"*. The membership tests below were written against the shell's form and the smoke
-    # run produced `-9` — so the single most valuable note this tool has, the one that closes the
-    # measured `kill -9 $PPID` loss, silently did not fire on the commonest shape of it.
-    #
-    # The constants and the normaliser are IMPORTED from `witness` rather than restated. This tool's
-    # whole worth is that what the agent observes is what the grader will observe; two copies of the
-    # signal table are two chances for them to disagree.
     code = _normalise(rc) if isinstance(rc, int) else rc
     note = f"{entry} exited {rc}."
-    # THE ONLY INTERPRETATION THIS TOOL OFFERS, and it is about the PROCESS, not about the finding.
-    # A measured run: four of five post-fix samples carried a
-    # payload built on `kill -9 $PPID`, two of them REAL exploits, and the run's status was still
-    # `done`. Naming the kill is not a verdict on the claim — it is telling the agent that the thing it
-    # is standing on collapsed underneath it.
     if code in TIMEOUT_KILL_CODES:
         note += (" It was KILLED rather than finishing, so it produced no exit status and no complete "
                  "output for anything to observe. A payload that kills or hangs the program destroys "
@@ -529,14 +235,6 @@ def _run_entry_point(ctx: ToolContext, state: ExecState, *, repo, entry: str, ru
 
 def _run_shell(ctx: ToolContext, state: ExecState, *, repo, runner,
                command: str, timeout: int = DEFAULT_EXEC_TIMEOUT) -> ToolResult:
-    """Run a model-authored command inside the complete hostile-execution boundary.
-
-    `entry_env` removes credentials and control-socket addresses; `MAX_EXEC_TIMEOUT` and `ExecState`
-    bound time and count. The private root exposes the checkout read-only, one writable scratch and
-    the runtime distribution, while omitting every other host path and pathname socket. Private PID,
-    procfs and network namespaces close process discovery, descendants and egress. There is no
-    PID-only or raw subprocess fallback: a kernel that refuses any part returns a containment refusal.
-    """
     if refusal := state.spend():
         return ToolResult(False, error=refusal)
     cmd = (command or "").strip()
@@ -558,8 +256,6 @@ def _run_shell(ctx: ToolContext, state: ExecState, *, repo, runner,
     state.log.append(cmd)
     argv = [*prefix, "bash", "-c", cmd]
     env = entry_env(secret_env_names=state.secret_env_names)
-    # Keep cwd in the checkout because every other tool speaks repo-relative paths. The private root
-    # makes that checkout read-only and exposes this scratch as the only durable writable host path.
     try:
         scratch = _execution_scratch(state, repo)
     except (OSError, SnapshotError) as exc:
@@ -583,10 +279,6 @@ def _run_shell(ctx: ToolContext, state: ExecState, *, repo, runner,
     stderr = redact_secrets(proc.stderr or "", secret_env_names=state.secret_env_names)
     if proc.returncode == 125 and stderr.startswith(_CONTAINMENT_ERROR):
         return ToolResult(False, error=stderr.strip())
-    # THE MEMORY CEILING, reported as an OBSERVATION rather than a refusal — this tool's whole contract
-    # is "you are told what happened, never whether it would count", and the run DID happen. What the
-    # agent must not conclude is that its program is wrong: `memcap.refusal` says which of the two it
-    # was. `run_entry` is deliberately NOT capped; see `shard/memcap.py` and the design notes A6.
     if capped := memcap.refusal(proc):
         return _observation(proc.returncode, proc.stdout or "", proc.stderr or "", capped, state)
     return _observation(proc.returncode, proc.stdout, proc.stderr,
@@ -594,19 +286,6 @@ def _run_shell(ctx: ToolContext, state: ExecState, *, repo, runner,
 
 
 def _outline(ctx: ToolContext, path: str) -> ToolResult:
-    """The definitions in a file with their line numbers — the map, without the file.
-
-    The machinery is `tools._file_index` and it already ships; until now it was only ever APPENDED to a
-    partial `read_file`, so the only way to obtain a map was to pay for a window of source you did not
-    want. `tools.py`'s own measurement over 29 real runs is the case for making it callable: 831 of
-    1,022 `read_file` calls carried an offset — the agent PAGES — and the paging thrashes, re-fetching
-    windows it had already seen. The maintainers' notes has the worst observed instance: one 3,339-line
-    file read 64 times in windows about six lines apart, 206,732 bytes retrieved for 1,479,494 tokens,
-    the run still hitting its step ceiling with nothing proposed.
-
-    Same confinement as every read tool, same heuristic labelling: unknown extensions get NO index
-    rather than a guessed one, because a confidently wrong map is worse than none.
-    """
     from .tools import _is_within, _read_allowed_roots
 
     p = pathlib.Path(path)
@@ -624,13 +303,7 @@ def _outline(ctx: ToolContext, path: str) -> ToolResult:
     return ToolResult(True, data=f"[{len(lines)} lines]{index}")
 
 
-# ── registration ────────────────────────────────────────────────────────────────────────────────────
 
-#: `run_entry` is listed ABOVE `report_finding`, and that is the point of the ordering rather than a
-#: detail. `tools.ToolRegistry.openai_tools` cites the measurement — on a weak open model the
-#: first-listed of two comparable tools wins 76.7% to 0.0% — and the whole reason this module exists is
-#: that the agent reported witnesses it had never run. Unmeasured on THIS registry and recorded as such:
-#: simple mode's measured configuration is the four-tool one, which adding these tools already changes.
 _RUN_ENTRY_PRIORITY = 2
 
 _RUN_ENTRY_DESC = (
@@ -651,37 +324,7 @@ _RUN_DESC = (
 
 def build_exec_tools(state: ExecState, *, repo, witness_entry: str | None = None,
                      runner=None) -> list[Tool]:
-    """The execution half of the simple-mode toolset, as a list the registry builder registers.
-
-    Every tool is a CLOSURE over exactly the model's own parameters. `functools.partial` is not used
-    and must not be: `ToolRegistry.call` does `tool.fn(self.ctx, **args)` and `toolvalidate` never
-    flags an unknown argument, so a partial keyword is a default the model can overwrite — the chain
-    that let a model redirect `harness_contract`'s endpoint and post the customer's harness source to
-    an address of its choosing. A closure taking only `payload`/`payload_base64`/`command`/`timeout`
-    makes `state=`, `repo=`, `entry=` and `runner=` a `TypeError` the registry reports as bad args.
-
-    `run_entry` is registered ONLY when an entry point is declared AND resolves. That is
-    the separate package's capability rule, measured: a tool that fails when called *"is not merely
-    useless, it is corrosive"* — `instrument` failed 56% of its calls and the agent rationally stopped
-    reaching for the tools that could have helped it.
-    """
-    # `bounded_run` and NOT `subprocess.run`, and it is the SAME default `witness.adjudicate` took on
-    # 2026-09-01. That is what keeps this identical rather than what breaks it: the rule below is that
-    # `run_entry` must be byte-for-byte what the grader re-runs, so the two have to move together, and
-    # they now share one function. What is bounded is OUR reading of the pipe, not the child's argv,
-    # its environment or its exit status.
     run = runner or bounded_run
-    # TWO DEFAULTS, AND THE ASYMMETRY IS THE POINT. `run` executes MODEL-AUTHORED argv, so it gets
-    # `memcap`'s resident ceiling over the whole process tree. `run_entry` executes the CUSTOMER's
-    # declared entry point, and its entire justification is that it is byte-for-byte what
-    # `witness.adjudicate` re-runs after the loop — a ceiling on the tool but not on the grader would
-    # make this module's "what you see here is what it will see" claim false.
-    #
-    # **`memcap` NEVER COVERED THE OUTPUT DIRECTION, on either side.** It watches the child tree's
-    # RESIDENT SET; a child running `cat /dev/zero` uses almost none itself while the reader
-    # accumulates every byte. `capture_output=True` reads to EOF before any truncation happens, so
-    # both defaults held an unbounded stream in this process. The design notes A6 is about the memory
-    # ceiling on the entry point, which is still deliberately absent; this is the other axis.
     capped = runner or memcap.run
     tools: list[Tool] = []
 

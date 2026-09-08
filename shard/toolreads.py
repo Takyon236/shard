@@ -1,9 +1,3 @@
-"""Descriptor-confined traversal and isolated regex evaluation for model-facing read tools.
-
-The tool registry types stay in :mod:`shard.tools`; this leaf holds the filesystem walk and regex
-worker so the shared registry module does not become another monolith.  It is free-tier code and uses
-only the standard library plus :mod:`shard.artefactfs`.
-"""
 
 from __future__ import annotations
 
@@ -60,7 +54,6 @@ class RegexResult:
 
 def selected_path(roots: tuple[pathlib.Path, ...], immutable: bool, path: str
                   ) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path] | None:
-    """Select a captured root without resolving a path in a hostile-writable tree."""
     supplied = pathlib.Path(path)
     display = supplied if supplied.is_absolute() else roots[0] / supplied
     try:
@@ -150,7 +143,6 @@ def _walk_refs(directory_fd: int, root: pathlib.Path, relative: pathlib.Path,
 def grep_refs(root: pathlib.Path, relative: pathlib.Path, display: pathlib.Path, *,
               selector: Selector | None, max_files: int, max_entries: int, max_depth: int,
               vcs_dirs: frozenset[str]) -> tuple[list[ReadRef], WalkState] | None:
-    """Collect a bounded set of regular-file references beneath one captured root."""
     refs: list[ReadRef] = []
     state = WalkState()
     policy = _WalkPolicy(selector, max_files, max_entries, max_depth, vcs_dirs)
@@ -173,7 +165,6 @@ def grep_refs(root: pathlib.Path, relative: pathlib.Path, display: pathlib.Path,
 
 def capture_refs(refs: list[ReadRef], *, max_file_bytes: int,
                  max_total_bytes: int) -> ReadBatch:
-    """Capture bounded stable bytes and frame them for the isolated regex worker."""
     payload = bytearray()
     unreadable = partial_files = byte_skipped = total = 0
     for index, (root, target, shown) in enumerate(refs):
@@ -235,7 +226,6 @@ print(json.dumps({"hits": hits, "capped": capped}, separators=(",", ":")))
 
 def regex_hits(pattern: str, batch: ReadBatch, *, max_matches: int,
                timeout: float, max_pattern_bytes: int) -> RegexResult:
-    """Evaluate a bounded regex in a memory-capped child, safe from any caller thread."""
     encoded = pattern.encode("utf-8")
     if len(encoded) > max_pattern_bytes:
         raise ValueError(f"grep pattern exceeds its {max_pattern_bytes}-byte ceiling")
@@ -261,7 +251,6 @@ def regex_hits(pattern: str, batch: ReadBatch, *, max_matches: int,
 
 def directory_entries(root: pathlib.Path, relative: pathlib.Path, *, max_entries: int
                       ) -> tuple[list[tuple[str, int]], bool]:
-    """List a held directory without following an entry and stop before fan-out allocation."""
     names: list[tuple[str, int]] = []
     truncated = False
     with trusted_directory(root) as (_root, root_fd):
@@ -277,7 +266,6 @@ def directory_entries(root: pathlib.Path, relative: pathlib.Path, *, max_entries
 
 
 def immutable_directory_link(selector: Selector, path: pathlib.Path) -> bool:
-    """Classify a captured in-tree directory link without reopening the link itself."""
     selected = selector(str(path))
     if selected is None:
         return False

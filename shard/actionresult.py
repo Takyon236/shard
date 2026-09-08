@@ -1,10 +1,3 @@
-"""Validate a CLI result before the GitHub Action publishes any part of it.
-
-The CLI payload is the Action's authority for outputs, uploads, summaries and comments. Defaults are
-therefore forbidden here: applying them before proving this is a complete result turns ``{}`` into a
-clean run. This module names one boundary and imports only the standard library so it ships on the
-free tier with the Action that calls it.
-"""
 
 from __future__ import annotations
 
@@ -30,8 +23,6 @@ _FILE_ARTEFACTS = tuple({**_REQUIRED_FILES["diff"], **_REQUIRED_FILES["survey"],
                          **_OPTIONAL_FILES})
 _MODE_STATUSES = {
     "survey": frozenset({"done"}),
-    # `stall` exists in agentloop's experimental vocabulary but every shipping construction leaves
-    # its breaker at zero. The Action must accept what this build can emit, not every dormant word.
     "diff": frozenset({"done", "budget", "error", "maxsteps", "repeat"}),
     "deep": frozenset({"done", "audited", "budget", "error", "maxsteps", "repeat"}),
 }
@@ -39,7 +30,6 @@ _BUNDLE_FILES = frozenset({"metadata.json", "input", "output.txt", "reproduce.sh
 
 
 def _control_text_error(value, label: str = "payload") -> str:
-    """Reject control characters anywhere in the producer-controlled JSON tree."""
     if isinstance(value, str):
         if any(unicodedata.category(character) == "Cc" for character in value):
             return f"{label} contains control text"
@@ -61,7 +51,6 @@ def _control_text_error(value, label: str = "payload") -> str:
 
 
 def _failure_error(artefacts: dict) -> tuple[str, set[str]]:
-    """Validate the emitter's paired failure account; return its names when complete."""
     failed = artefacts.get("failed", [])
     details = artefacts.get("failed_artefacts", [])
     if not isinstance(failed, list) or not all(isinstance(name, str) and name for name in failed):
@@ -196,7 +185,6 @@ def _delivery_consistency_error(mode: str, payload: dict, artefacts: dict) -> st
 
 
 def payload_error(mode: str, payload) -> str:
-    """Return why stdout is not a complete result for ``mode``, or an empty string."""
     if not isinstance(payload, dict):
         return "the payload is not a JSON object"
     if mode not in _MODE_STATUSES:
@@ -244,12 +232,10 @@ def payload_error(mode: str, payload) -> str:
 
 
 def _absolute(path) -> pathlib.Path:
-    """A lexical absolute path: normalise dots without following a symlink."""
     return pathlib.Path(os.path.abspath(os.fspath(path)))
 
 
 def _relative_claim(path: str, root: pathlib.Path, *, label: str) -> tuple[str, pathlib.PurePath | None]:
-    """Turn one lexical claim into a confined name; filesystem resolution happens only by dirfd."""
     if not isinstance(path, str) or not path:
         return f"{label} is not a non-empty path", None
     raw = pathlib.Path(path)
@@ -290,7 +276,6 @@ def _bound_read(parent_fd: int, relative, label: str) -> tuple[str, bytes | None
 
 def _file_error(artefacts: dict, mode: str, root: pathlib.Path, root_fd: int,
                 captured: dict[str, bytes]) -> str:
-    """Bind every single-file role to its fixed name and descriptor-read its bytes."""
     allowed = dict(_REQUIRED_FILES[mode])
     if mode in ("diff", "deep"):
         allowed.update(_OPTIONAL_FILES)
@@ -322,7 +307,6 @@ def _file_error(artefacts: dict, mode: str, root: pathlib.Path, root_fd: int,
 
 def _bundle_map_error(artefacts: dict, root: pathlib.Path,
                       by_name: dict[str, pathlib.PurePath]) -> str:
-    """Prove the optional name map is a second spelling of the descriptor-opened directories."""
     bundle_map = artefacts.get("bundle_map")
     if bundle_map is None:
         return ""
@@ -371,7 +355,6 @@ def _read_bundle(bundle_fd: int, name: str, delivered: bool,
 
 def _bundle_error(mode: str, artefacts: dict, root: pathlib.Path, root_fd: int,
                   captured: dict[str, bytes]) -> str:
-    """Open every claimed bundle below the held root and capture every published child file."""
     claims: list[tuple[str, pathlib.PurePath]] = []
     for index, claimed in enumerate(artefacts.get("bundles", [])):
         label = f"artefacts.bundles[{index}]"
@@ -413,16 +396,12 @@ def _bundle_error(mode: str, artefacts: dict, root: pathlib.Path, root_fd: int,
 
 def validated_artefacts(mode: str, payload: dict,
                         out_dir: str) -> tuple[str, dict[str, bytes]]:
-    """Validate every filesystem claim and bind delivery to bytes read from held descriptors."""
     control_error = _control_text_error(payload)
     if control_error:
         return control_error, {}
     artefacts = payload["artefacts"]
     captured: dict[str, bytes] = {}
     try:
-        # This is deliberately the FIRST filesystem operation. Every later name is resolved below
-        # this held descriptor, so renaming the public root and installing a same-named directory
-        # cannot move a single read to the replacement.
         with _trusted_directory(out_dir) as (root, root_fd):
             file_error = _file_error(artefacts, mode, root, root_fd, captured)
             if file_error:
@@ -441,7 +420,6 @@ def validated_artefacts(mode: str, payload: dict,
 
 
 def artefact_error(mode: str, payload: dict, out_dir: str) -> str:
-    """Return why the payload's filesystem claims are not confined, surviving artefacts."""
     error, _captured = validated_artefacts(mode, payload, out_dir)
     return error
 

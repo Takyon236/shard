@@ -1,9 +1,3 @@
-"""Publish validated Action artefacts without reopening producer-controlled paths.
-
-Validation captures bytes from held descriptors.  The paths GitHub exposes must survive this process
-for later workflow steps, so those bytes are republished below a private runner-owned directory and
-the payload is rewritten to name only that snapshot.
-"""
 
 from __future__ import annotations
 
@@ -66,7 +60,6 @@ def _publish(payload: dict, captured: dict[str, bytes],
 
 def ingest_artefacts(mode: str, payload: dict, out_dir: str,
                      destination_root: str) -> tuple[str, dict[str, bytes], dict, dict[str, bytes]]:
-    """Validate, capture and republish one payload before any Action consumer sees it."""
     error, captured = validated_artefacts(mode, payload, out_dir)
     if error:
         return error, {}, payload, {}

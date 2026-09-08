@@ -8,7 +8,7 @@ endpoint you configure. Shard operates no inference or storage service. Containe
 execution runs without network or configured Shard credentials; [Security](SECURITY.md) defines the
 complete boundary.
 
-> **Version:** These pages document `v4.0.6`. Existing v3 users should use the
+> **Version:** These pages document `v4.0.7`. Existing v3 users should use the
 > [v3.0.2 documentation](https://github.com/Takyon236/shard/tree/v3.0.2).
 
 ## Start here
@@ -24,9 +24,9 @@ This profiles the Shard checkout without a model call or API key:
 
 ```bash
 set -euo pipefail
-demo_dir='shard-v4.0.6'
+demo_dir='shard-v4.0.7'
 test ! -e "$demo_dir"
-git clone --branch v4.0.6 --depth 1 https://github.com/Takyon236/shard "$demo_dir"
+git clone --branch v4.0.7 --depth 1 https://github.com/Takyon236/shard "$demo_dir"
 cd "$demo_dir"
 python3 -m venv .venv
 . .venv/bin/activate

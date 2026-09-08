@@ -1,13 +1,3 @@
-"""Pristine source trees for witness execution.
-
-The model and the witness entry point are both allowed to write.  Neither is therefore a trustworthy
-place to keep the program that grades a finding.  ``SourceSnapshot`` takes one byte-for-byte copy before
-the model runs and materialises a new writable tree for every attack, control and attribution trial.
-
-This module is free-tier policy code.  It intentionally uses only the standard library: the free image
-pip-installs nothing, and a snapshot guard that imports an optional package is a guard that disappears on
-the customer's runner.
-"""
 
 from __future__ import annotations
 
@@ -21,7 +11,7 @@ from dataclasses import dataclass
 
 
 class SnapshotError(RuntimeError):
-    """The pristine tree could not be captured, verified or materialised."""
+    pass
 
 
 @dataclass(frozen=True)
@@ -32,21 +22,10 @@ class _Entry:
     value: str
 
 
-# Git's administrative trees are not program input and can contain credentials, alternates and object
-# stores outside the checkout. This includes a nested submodule's ``.git`` file/directory: recursively
-# binding a superproject exposed both. Names such as ``shard-out``, ``__pycache__`` and ``.coverage``
-# are not structural: a customer program may read any of them, and removing one from the trial changes
-# the program this adjudicator executes.
 _STRUCTURAL_ROOTS = frozenset({".git"})
 
 
 class SourceSnapshot:
-    """A manifested source copy and one stable, replaceable trial path.
-
-    Trial paths are stable within a snapshot so attack and control argv are byte-identical.  The tree
-    behind that path is replaced between calls, which is the part that prevents an attack run from
-    planting state for a benign control.
-    """
 
     def __init__(self, original: pathlib.Path, root: pathlib.Path, source: pathlib.Path,
                  trial: pathlib.Path, manifest: tuple[_Entry, ...]):
@@ -58,7 +37,6 @@ class SourceSnapshot:
 
     @classmethod
     def capture(cls, repo) -> SourceSnapshot:
-        """Copy ``repo`` without VCS administration and bind every retained entry to a manifest."""
         try:
             original = pathlib.Path(repo).resolve(strict=True)
             if not original.is_dir():
@@ -84,7 +62,6 @@ class SourceSnapshot:
             raise SnapshotError(f"could not capture the source snapshot: {e}") from e
 
     def verify_source(self) -> None:
-        """Refuse a snapshot whose storage no longer contains the bytes it manifested."""
         try:
             got = _manifest(self.source, self.source)
         except OSError as e:
@@ -93,18 +70,11 @@ class SourceSnapshot:
             raise SnapshotError(_difference(self.manifest, got, "source snapshot"))
 
     def verify_original(self) -> None:
-        """Verify every captured entry in the live checkout; new build output is harmless.
-
-        Additions are deliberately ignored.  They are absent from every materialisation, so they cannot
-        affect a verdict; refusing them would make an ordinary compiler output look like source tamper.
-        A changed, removed or retyped captured entry is a different program and is refused.
-        """
         changed = _expected_difference(self.original, self.manifest, "reviewed checkout")
         if changed:
             raise SnapshotError(f"reviewed source changed after the pristine snapshot: {changed}")
 
     def materialize(self) -> pathlib.Path:
-        """Replace the stable trial path with a verified writable copy of pristine source."""
         self.verify_source()
         try:
             _remove_tree(self.trial.parent)
@@ -123,12 +93,6 @@ class SourceSnapshot:
         return self.trial
 
     def materialize_input(self, data: bytes) -> pathlib.Path:
-        """Replace the stable execution-input parent and stage exactly ``data`` inside it.
-
-        Attack and control runs need a byte-identical argv, so the path is stable. The directory
-        behind it is not: replacing the whole parent before every trial prevents files planted by an
-        attack from becoming hidden inputs to a later benign control.
-        """
         parent = self.root / "input"
         try:
             _remove_tree(parent)
@@ -146,18 +110,15 @@ class SourceSnapshot:
         return staged
 
     def verify_trial(self) -> None:
-        """Verify captured entries after execution, ignoring files the program generated."""
         changed = _expected_difference(self.trial, self.manifest, "witness trial")
         if changed:
             raise SnapshotError(f"witness execution changed pristine source: {changed}")
 
     def close(self) -> None:
-        """Remove storage and every disposable trial.  Cleanup failure cannot affect a verdict."""
         _discard_tree(self.root)
 
 
 class SnapshotSet:
-    """The head/base pair a review captures, including ownership and a fail-closed error."""
 
     def __init__(self, source: SourceSnapshot | None, base: SourceSnapshot | None, *,
                  own_source: bool, own_base: bool, failure: str = ""):
@@ -193,7 +154,6 @@ class SnapshotSet:
             self.base = None
 
     def repository(self, fallback):
-        """The pristine head tree, or ``fallback`` when no witness execution was requested."""
         return self.source.source if self.source is not None else fallback
 
     def refusal(self, prefix: str) -> str:
@@ -201,7 +161,6 @@ class SnapshotSet:
 
 
 def original_paths(text: str, snapshot: SourceSnapshot) -> str:
-    """Render disposable trial paths as the checkout path customer tools already report."""
     return text.replace(str(snapshot.trial), str(snapshot.original))
 
 
@@ -211,7 +170,6 @@ def _safe_name(name: str) -> str:
 
 
 def _remove_tree(path: pathlib.Path) -> None:
-    """Remove even a trial whose entry point made its own directories read-only."""
     def retry(function, name, _error):
         os.chmod(name, 0o700, follow_symlinks=False)
         function(name)
@@ -223,22 +181,15 @@ def _discard_tree(path: pathlib.Path) -> None:
     try:
         _remove_tree(path)
     except Exception:
-        # Cleanup runs from refusal and exception paths. A hostile trial can make deletion fail in
-        # more ways than the platform promises as `OSError`; none may replace the adjudication result.
         pass
 
 
 def _excluded(relative: pathlib.PurePath, *, is_dir: bool) -> bool:
-    # Keep the kind at this traversal seam so a future structural exclusion cannot be guessed by
-    # basename; Git administration applies to both directory and worktree-file forms at every nested
-    # repository boundary.
     parts = relative.parts
     return any(part in _STRUCTURAL_ROOTS for part in parts)
 
 
 def _copy_tree(source: pathlib.Path, destination: pathlib.Path, boundary: pathlib.Path) -> None:
-    # Populate through a private writable mode, then restore the customer's mode. A read-only source
-    # directory is valid input; creating its child under 0555 would otherwise make capture fail midway.
     destination.mkdir(mode=0o700, parents=False)
     for item in os.scandir(source):
         src = pathlib.Path(item.path)
@@ -306,7 +257,6 @@ def _digest(path: pathlib.Path) -> str:
 
 
 def _require_single_link(status: os.stat_result, relative: pathlib.PurePath) -> None:
-    """Refuse regular files whose inode has another name outside the manifested tree."""
     if status.st_nlink != 1:
         raise SnapshotError(
             f"source snapshot refuses a regular file with more than one hard link: {relative}"
@@ -314,7 +264,6 @@ def _require_single_link(status: os.stat_result, relative: pathlib.PurePath) -> 
 
 
 def _expected_difference(root: pathlib.Path, manifest: tuple[_Entry, ...], label: str) -> str:
-    """First changed captured entry.  Extra generated files are intentionally outside the question."""
     try:
         for expected in manifest:
             if _entry_at(root, expected.path) != expected:

@@ -1,8 +1,3 @@
-"""Render the source-read inventory without turning source exposure into an audit verdict.
-
-The JSON inventory keeps every scoped file. The human table puts missing source first and caps its
-rows, because a large diff must not bury findings beneath thousands of file names.
-"""
 
 from __future__ import annotations
 
@@ -15,14 +10,11 @@ _STATUS = {"full": "full source returned", "partial": "partial source returned",
 
 
 def summary(inspection: dict) -> str:
-    """The same counts in the CLI and in the persisted human report."""
     return (f"{inspection['files_with_source']} of {inspection['scope_files']} scoped file(s) "
             f"returned source; {inspection['files_without_source']} with no source recorded")
 
 
 def _cell(value) -> str:
-    # A filename can contain markdown delimiters, HTML and terminal controls. This table reports
-    # those bytes as a name; it never lets them create a second row or an active link.
     plain = "".join(c if c.isprintable() else f"\\x{ord(c):02x}" for c in str(value))
     escaped = html.escape(plain)
     for char in "|`[]*_\\":
@@ -52,7 +44,6 @@ def _activity(row) -> str:
 
 
 def markdown(inspection: dict) -> list[str]:
-    """A bounded table, with its measurement limit visible even on a finding-free run."""
     out = ["### Source inspection", "", summary(inspection) + ".", "",
            inspection["measurement"], "",
            f"Full files: **{inspection['files_fully_returned']}**. "

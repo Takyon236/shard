@@ -1,16 +1,3 @@
-"""Authenticate Action files across the untrusted-container-to-runner boundary.
-
-The process that reviews a repository cannot make a path immutable: repository code has the same uid
-inside the container and can keep a writable descriptor to a temporary file across its atomic rename.
-The launcher therefore sends a one-run key over stdin before repository code starts.  The Action binds
-the bytes it captured, and the exact GitHub command-file bytes it intended, into a keyed manifest.  A
-second read-only container checks that manifest after the reviewing container and all its descendants
-have exited.  Only then may the launcher relay a path to another workflow step.
-
-The key is deliberately never an environment variable or argv value.  Linux exposes a process's
-initial environment through ``/proc/<pid>/environ`` even after ``unsetenv``; popping an environment
-secret would look erased to Python while leaving it readable to a same-uid descendant.
-"""
 
 from __future__ import annotations
 
@@ -59,7 +46,6 @@ def _relative_name(value, *, one_component: bool = False) -> pathlib.PurePosixPa
 
 
 def read_launch_key(stream=None) -> bytearray:
-    """Consume the one key line, including EOF, before any repository-controlled process starts."""
     source = sys.stdin.buffer if stream is None else stream
     line = source.readline(66)
     trailing = source.read(1)
@@ -70,19 +56,15 @@ def read_launch_key(stream=None) -> bytearray:
 
 
 def _make_nondumpable() -> None:
-    """Keep later same-uid target processes out of the Action parent's memory."""
     import ctypes
 
     libc = ctypes.CDLL(None, use_errno=True)
-    # PR_SET_DUMPABLE=4, SUID_DUMP_DISABLE=0.  The Action is Linux-only; silently omitting this on a
-    # different libc would turn the stdin boundary into a key stored in readable parent memory.
     if libc.prctl(4, 0, 0, 0, 0) != 0:
         error = ctypes.get_errno()
         raise OSError(error, os.strerror(error))
 
 
 class ActionHandoff:
-    """One in-memory authority for snapshot and command-file bytes."""
 
     def __init__(self, key: bytearray, publication_root: str, relays=()):
         if len(key) != 32:
@@ -101,7 +83,6 @@ class ActionHandoff:
 
     @classmethod
     def begin(cls, env, *, stream=None):
-        """Return an authenticated session only when the composite launcher requested one."""
         marker = env.pop(_HANDOFF_ENV, "")
         if not marker:
             return None
@@ -118,7 +99,6 @@ class ActionHandoff:
         return cls(key, env.get("SHARD_ACTION_SNAPSHOT_ROOT", ""), relays)
 
     def bind_snapshot(self, files: dict[str, bytes]) -> None:
-        """Bind the names and original bytes republished by ``actionsnapshot`` exactly once."""
         if self._files or self._snapshot:
             raise ValueError("the Action handoff snapshot was bound twice")
         snapshots = set()
@@ -133,13 +113,11 @@ class ActionHandoff:
         self._files = dict(files)
 
     def append_relay(self, name: str, data: bytes) -> None:
-        """Record bytes only after the Action successfully appended them to a command file."""
         if name not in self._relays or not isinstance(data, bytes):
             raise ValueError("the Action handoff received an unknown relay append")
         self._relays[name].extend(data)
 
     def seal(self) -> str:
-        """Write the keyed manifest; return a controlled error and erase the key on failure."""
         if self._sealed:
             return "the Action handoff was sealed twice"
         self._sealed = True
@@ -161,7 +139,6 @@ class ActionHandoff:
             self.discard()
 
     def discard(self) -> None:
-        """Erase the mutable key buffer when a run raises before it can be sealed."""
         for index in range(len(self._key)):
             self._key[index] = 0
 
@@ -308,7 +285,6 @@ def _verify_records(root_fd: int, records: dict, actual_names: set[str],
 
 def _verified_bytes(publication_root: str, relay_root: str, key: bytearray,
                     emit: str = "") -> tuple[str, bytes]:
-    """Verify both trees and return one relay from the descriptor that was actually checked."""
     try:
         if emit and emit not in _RELAYS:
             return "the Action handoff was asked to emit an unknown relay", b""
@@ -338,13 +314,11 @@ def _verified_bytes(publication_root: str, relay_root: str, key: bytearray,
 
 
 def verify(publication_root: str, relay_root: str, key: bytearray) -> str:
-    """Verify exact publication and relay trees after the untrusted container has exited."""
     error, _unused = _verified_bytes(publication_root, relay_root, key)
     return error
 
 
 def main(argv=None) -> int:
-    """Read the key from stdin and verify the two read-only mounts used by ``action.yml``."""
     args = sys.argv[1:] if argv is None else argv
     if len(args) not in (2, 4) or (len(args) == 4 and args[2] != "--emit"):
         print("shard: action handoff verifier requires publication and relay roots", file=sys.stderr)

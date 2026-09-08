@@ -1,10 +1,3 @@
-"""Source returned during one review, separated from the scope of its request.
-
-Measured through the CLI: a two-file diff, one line read from the first file, then a deliberate
-finish printed ``reviewed: 2 changed files``. The journal held the distinction and the report did
-not. This collector consumes passive source observations; it never reads the checkout or changes
-what the agent sees. A returned line establishes access to that text, not security coverage.
-"""
 
 from __future__ import annotations
 
@@ -24,11 +17,8 @@ _COUNTERS = (
 
 
 def _relative(path, root: str) -> str | None:
-    """Lexical identity only: the producer already bound its read to an immutable source tree."""
     if not isinstance(path, str) or not path or "\0" in path:
         return None
-    # A display spelling containing ``link/../file`` need not name the file that lexical
-    # normalization picks. Successful reads carry the reader's selected identity; attempts do not.
     if ".." in path.split(os.sep):
         return None
     absolute = os.path.normpath(path if os.path.isabs(path) else os.path.join(root, path))
@@ -124,16 +114,6 @@ def _finish(row: dict) -> dict:
 
 
 def build(scope, events, *, repo, windows=None) -> dict:
-    """Summarise this run's ``source_read`` and ``source_search`` journal events.
-
-    The caller selects the current run before passing events. Missing observations do not borrow
-    totals from today's checkout: the source snapshot may already be gone. All returned paths come
-    from the declared scope; other reads are counts only. Ranges are inclusive and one-based.
-
-    An observation clamped before delivery contributes no source lines. A single character-clipped
-    line establishes partial source access but contributes no complete line. Empty and past-EOF
-    responses have their own counter, so successfully reading nothing never becomes full coverage.
-    """
     root = os.path.abspath(os.fspath(repo))
     hints = windows if isinstance(windows, dict) else {}
     paths = {_relative(path, root) for path in scope}

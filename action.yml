@@ -209,7 +209,7 @@ runs:
 # `Dockerfile` beside this file still ships and still builds the same image: it is what you
 # read to audit what executes in your pipeline, and what you build if you would rather run
 # your own. The build-context paragraph above applies to that path rather than to this one.
-        SHARD_ACTION_IMAGE: "docker://ghcr.io/takyon236/shard@sha256:c3fa4b1f478c2a601f61c2aa6545c88774bafbef83e821a76b6829d8f0ea8769"
+        SHARD_ACTION_IMAGE: "docker://ghcr.io/takyon236/shard@sha256:2c9ee936c7fd28d22a1302aa186c65f1c6387ec5c02493533188716fc94a90e3"
         INPUT_MODE: ${{ inputs.mode }}
         INPUT_MODEL_ENDPOINT: ${{ inputs.model_endpoint }}
         INPUT_MODEL: ${{ inputs.model }}

@@ -1,10 +1,3 @@
-"""Bind mutable Action output paths to the byte digests carried on CLI stdout.
-
-A same-run process has the same uid as the producer and can retain a writable descriptor across an
-atomic rename.  The output path is therefore not an authority for what Shard decided.  The CLI's
-captured stdout is separate from that filesystem race; this module validates its digest map against
-the bytes the Action captured through held descriptors before any delivery occurs.
-"""
 
 from __future__ import annotations
 
@@ -13,7 +6,6 @@ import hmac
 
 
 def shape_error(artefacts: dict) -> str:
-    """Validate the stdout authority's SHA-256 map before any filesystem work."""
     digests = artefacts.get("sha256")
     if not isinstance(digests, dict):
         return "artefacts.sha256 is not a role-to-digest object"
@@ -28,7 +20,6 @@ def shape_error(artefacts: dict) -> str:
 
 
 def captured_error(artefacts: dict, captured: dict[str, bytes]) -> str:
-    """Bind every descriptor-captured byte string to the separate stdout digest map."""
     expected = artefacts.get("sha256")
     invalid = shape_error(artefacts)
     if invalid:

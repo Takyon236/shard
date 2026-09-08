@@ -1,15 +1,3 @@
-"""Descriptor-bound filesystem operations for emitted Action artefacts.
-
-The producer and the Action consumer share one trust boundary: an artefact path is a name that a
-same-run process can replace.  Opening each directory component with ``O_NOFOLLOW`` binds work to the
-directory that was checked; atomic replacement publishes new bytes without ever opening an existing
-symlink or hardlink; reading through one held descriptor gives delivery the bytes validation saw. A
-same-uid process can retain a writable descriptor across rename, so the producer also binds original
-bytes into its stdout digest map and the Action verifies that separate authority before publication.
-
-Linux is not an optional implementation detail here.  Shard's published GitHub Action is a Linux
-container, and silently dropping ``O_NOFOLLOW`` on another platform would restore the vulnerability.
-"""
 
 from __future__ import annotations
 
@@ -31,7 +19,6 @@ def _directory_flags() -> int:
 
 @contextlib.contextmanager
 def trusted_directory(path, *, create: bool = False):
-    """Yield ``(absolute_path, fd)`` after opening every component without following links."""
     absolute = pathlib.Path(os.path.abspath(os.fspath(path)))
     flags = _directory_flags()
     current = os.open(absolute.anchor, flags)
@@ -52,7 +39,6 @@ def trusted_directory(path, *, create: bool = False):
 
 @contextlib.contextmanager
 def child_directory(parent_fd: int, name: str, *, create: bool = False):
-    """Yield a held immediate child directory, refusing a link in its place."""
     if pathlib.PurePath(name).name != name or name in ("", ".", ".."):
         raise ValueError("an artefact directory name must be one basename")
     if create:
@@ -69,7 +55,6 @@ def child_directory(parent_fd: int, name: str, *, create: bool = False):
 
 @contextlib.contextmanager
 def relative_directory(parent_fd: int, relative, *, create: bool = False):
-    """Hold a relative descendant directory without following any component."""
     path = pathlib.PurePath(os.fspath(relative))
     if path.is_absolute() or any(part in ("", ".", "..") for part in path.parts):
         raise ValueError("an artefact directory must be a confined relative path")
@@ -91,7 +76,6 @@ def relative_directory(parent_fd: int, relative, *, create: bool = False):
 
 @contextlib.contextmanager
 def private_directory(parent_fd: int, prefix: str):
-    """Create and hold an unpredictable mode-0700 child without reopening its public path."""
     if pathlib.PurePath(prefix).name != prefix or prefix in ("", ".", ".."):
         raise ValueError("an artefact directory prefix must be one basename")
     for _attempt in range(100):
@@ -110,7 +94,6 @@ def private_directory(parent_fd: int, prefix: str):
 
 
 def atomic_write(parent_fd: int, name: str, data: bytes, *, mode: int = 0o644) -> None:
-    """Publish bytes without opening an old destination; callers separately bind mutable final bytes."""
     if pathlib.PurePath(name).name != name or name in ("", ".", ".."):
         raise ValueError("an artefact file name must be one basename")
     temporary = f".shard-{name}-{secrets.token_hex(12)}.tmp"
@@ -141,7 +124,6 @@ def atomic_write(parent_fd: int, name: str, data: bytes, *, mode: int = 0o644) -
 
 
 def append_file(parent_fd: int, name: str, data: bytes, *, mode: int = 0o644) -> None:
-    """Append bytes to one regular single-link file without following a replacement."""
     if pathlib.PurePath(name).name != name or name in ("", ".", ".."):
         raise ValueError("an artefact file name must be one basename")
     flags = (os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW
@@ -164,7 +146,6 @@ def append_file(parent_fd: int, name: str, data: bytes, *, mode: int = 0o644) ->
 
 
 def read_file(parent_fd: int, relative, *, max_bytes: int | None = None) -> bytes:
-    """Read one stable regular file below ``parent_fd`` without reopening its path."""
     raw = os.fspath(relative)
     path = pathlib.PurePath(raw)
     if path.is_absolute() or not path.parts or any(part in ("", ".", "..") for part in path.parts):
@@ -177,8 +158,6 @@ def read_file(parent_fd: int, relative, *, max_bytes: int | None = None) -> byte
             child = os.open(part, _directory_flags(), dir_fd=directory)
             os.close(directory)
             directory = child
-        # O_NONBLOCK matters before ``fstat``: opening a hostile FIFO read-only otherwise waits forever
-        # for a writer, so the later regular-file check would never execute.
         flags = (os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW
                  | getattr(os, "O_CLOEXEC", 0))
         fd = os.open(path.parts[-1], flags, dir_fd=directory)
@@ -211,12 +190,6 @@ def read_file(parent_fd: int, relative, *, max_bytes: int | None = None) -> byte
 
 
 def read_file_prefix(parent_fd: int, relative, *, max_bytes: int) -> bytes:
-    """Read at most ``max_bytes`` from one stable regular single-link file.
-
-    This differs deliberately from ``read_file(..., max_bytes=...)``: callers whose established
-    contract is a prefix may inspect a larger file without allocating it whole.  The descriptor is
-    still identity-checked across the read, so a concurrent replacement or rewrite fails closed.
-    """
     if max_bytes < 0:
         raise ValueError("an artefact prefix ceiling must not be negative")
     raw = os.fspath(relative)
@@ -261,7 +234,6 @@ def read_file_prefix(parent_fd: int, relative, *, max_bytes: int) -> bytes:
 
 
 def remove_file(parent_fd: int, name: str, *, missing_ok: bool = False) -> None:
-    """Unlink one held-directory entry; the entry itself is never followed."""
     if pathlib.PurePath(name).name != name or name in ("", ".", ".."):
         raise ValueError("an artefact file name must be one basename")
     try:
@@ -280,7 +252,6 @@ def _same_inode(left, right) -> bool:
 
 
 def _remove_directory_contents(directory_fd: int) -> None:
-    """Clear a held directory without resolving an entry outside that descriptor."""
     with os.scandir(directory_fd) as entries:
         names = [entry.name for entry in entries]
     for name in names:
@@ -306,7 +277,6 @@ def _remove_directory_contents(directory_fd: int) -> None:
 
 
 def remove_tree(parent_fd: int, name: str, *, missing_ok: bool = False) -> None:
-    """Remove one child tree through held descriptors, never following a link in its place."""
     if pathlib.PurePath(name).name != name or name in ("", ".", ".."):
         raise ValueError("an artefact tree name must be one basename")
     try:
@@ -359,33 +329,28 @@ def _rooted_parent(root, target, *, create: bool = False):
 
 
 def rooted_read(root, target, *, max_bytes: int | None = None) -> bytes:
-    """Read one regular single-link file lexically below ``root``."""
     with _rooted_parent(root, target) as (parent_fd, name):
         return read_file(parent_fd, name, max_bytes=max_bytes)
 
 
 def rooted_read_prefix(root, target, *, max_bytes: int) -> bytes:
-    """Read a bounded prefix through the same descriptor-confined rooted path walk."""
     with _rooted_parent(root, target) as (parent_fd, name):
         return read_file_prefix(parent_fd, name, max_bytes=max_bytes)
 
 
 def rooted_write(root, target, data: bytes, *, create_parents: bool = False,
                  mode: int = 0o644) -> None:
-    """Atomically publish bytes below ``root`` without following hostile path components."""
     with _rooted_parent(root, target, create=create_parents) as (parent_fd, name):
         atomic_write(parent_fd, name, data, mode=mode)
 
 
 def rooted_append(root, target, data: bytes, *, create_parents: bool = False,
                   mode: int = 0o644) -> None:
-    """Append bytes below ``root`` without following hostile path components."""
     with _rooted_parent(root, target, create=create_parents) as (parent_fd, name):
         append_file(parent_fd, name, data, mode=mode)
 
 
 def rooted_remove(root, target, *, missing_ok: bool = False) -> None:
-    """Remove one entry below ``root`` without following its parent or the entry."""
     with _rooted_parent(root, target) as (parent_fd, name):
         remove_file(parent_fd, name, missing_ok=missing_ok)
 
@@ -394,7 +359,6 @@ def rooted_files(root, directory, *, max_files: int | None = None,
                  max_bytes: int | None = None,
                  max_total_bytes: int | None = None,
                  max_entries: int | None = None) -> list[tuple[str, bytes]]:
-    """Read every stable regular single-link file in one confined directory, sorted by name."""
     relative = _confined_relative(root, pathlib.Path(directory) / ".placeholder").parent
     with trusted_directory(root) as (_root, root_fd):
         with relative_directory(root_fd, relative) as directory_fd:
@@ -452,7 +416,6 @@ def _walk_regular_files(directory_fd: int, prefix: pathlib.PurePath,
 
 def rooted_file_names(root, directory=".", *, max_entries: int, max_depth: int = 64
                       ) -> list[pathlib.PurePath]:
-    """List regular single-link files recursively without following a directory entry."""
     if max_entries < 1 or max_depth < 0:
         raise ValueError("artefact walk ceilings must be positive")
     budget = [max_entries]
@@ -470,7 +433,6 @@ def rooted_file_names(root, directory=".", *, max_entries: int, max_depth: int =
 
 @contextlib.contextmanager
 def materialized_file(root, target, *, name: str = "input", max_bytes: int | None = None):
-    """Expose stable validated bytes at a private path for a pathname-only subprocess API."""
     data = rooted_read(root, target, max_bytes=max_bytes)
     with tempfile.TemporaryDirectory(prefix="shard-artefact-") as temporary:
         with trusted_directory(temporary) as (_path, directory_fd):

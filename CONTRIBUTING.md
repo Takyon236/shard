@@ -52,6 +52,23 @@ Changes to shared modules may ship in both free and commercial distributions. Th
 [`CLA`](CLA.md) grants that right without assigning your copyright; the bot asks for it once on your
 first pull request.
 
+### Why `shard/` has no comments or docstrings
+
+They are removed from the `shard/` package when this tree is generated. The development tree they come
+from requires a comment to record a constraint, a measurement or a rejected alternative, and that
+reasoning is what the commercial distribution is built on, so neither published tree carries it.
+**This is a build step, not the style we write in, and not something to fix.** A pull request that adds
+explanation to a module under `shard/` is work we cannot port: the next release regenerates the file
+without it.
+
+**Only `shard/` is stripped.** `tests/`, `examples/`, this file and every other document ship exactly
+as written, comments and all — the tests in `tests/` are meant to be read, and they are the best
+description of what the package promises. Prose you contribute there survives a release.
+
+So read the code as the code — names, types, the tests and the [`docs/`](docs/) directory are the
+intended explanation. When behaviour is unclear, open an issue rather than inferring intent from a
+stripped module; a question answered there reaches the tree that keeps the answer.
+
 ## Useful local checks
 
 ```bash

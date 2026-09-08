@@ -8,6 +8,32 @@ an exact version or commit when updates need review.
 
 ## [Unreleased]
 
+## [4.0.7] — 2026-09-08
+
+### Changed
+
+- **The published Python carries no comments or docstrings.** The free distribution is now built the
+  way the commercial image already was: every docstring and comment is removed from the emitted
+  `shard/` package. Measured on the artefact this replaces — 44 files, 25,998 lines, of which 11,648
+  were prose (44.8%); the package falls from 1,527,188 to 595,024 bytes. The code itself is unchanged.
+  The build proves, per file, that the emitted module's syntax tree equals the original's with its
+  docstrings removed, and refuses to publish if it does not. The CLI's help text, the report format,
+  `shard-result.json` and every documented interface are unaffected.
+- **`__doc__` is now `None` on shipped modules.** Anything that calls `help()` on an installed module,
+  or reads `Module.__doc__`, gets a different answer than it did in 4.0.6. Nothing in the product
+  reads a docstring at runtime and no documented interface exposes one, so no Action input, output or
+  report field changes — but it is observable from outside, and it is the one thing here to check if
+  you have tooling that introspects an installed Shard module.
+- **Line numbers in the published files move.** A traceback still matches the source at the tag it
+  came from, because the published repository is the stripped tree — but anything pinned to a line
+  number in an earlier release's file needs re-reading against the new one.
+- **Only the `shard/` package is stripped.** The test files, the examples, `README.md`,
+  `CHANGELOG.md`, `SECURITY.md`, `CONTRIBUTING.md` and the documentation ship exactly as written,
+  comments and all — the shipped tests are meant to be read, and they are the best description of
+  what the package promises. `CONTRIBUTING.md` now says which tree the missing comments are in, and
+  that their absence is a build step rather than the house style, so a contributor does not open a
+  pull request to restore them.
+
 ## [4.0.6] — 2026-09-08
 
 ### Changed
