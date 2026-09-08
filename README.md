@@ -8,7 +8,7 @@ endpoint you configure. Shard operates no inference or storage service. Containe
 execution runs without network or configured Shard credentials; [Security](SECURITY.md) defines the
 complete boundary.
 
-> **Version:** These pages document `v4.0.4`. Existing v3 users should use the
+> **Version:** These pages document `v4.0.5`. Existing v3 users should use the
 > [v3.0.2 documentation](https://github.com/Takyon236/shard/tree/v3.0.2).
 
 ## Start here
@@ -24,9 +24,9 @@ This profiles the Shard checkout without a model call or API key:
 
 ```bash
 set -euo pipefail
-demo_dir='shard-v4.0.4'
+demo_dir='shard-v4.0.5'
 test ! -e "$demo_dir"
-git clone --branch v4.0.4 --depth 1 https://github.com/Takyon236/shard "$demo_dir"
+git clone --branch v4.0.5 --depth 1 https://github.com/Takyon236/shard "$demo_dir"
 cd "$demo_dir"
 python3 -m venv .venv
 . .venv/bin/activate
@@ -62,7 +62,15 @@ The free Action supports `survey` and `diff`; `preflight` is a local CLI command
 - [Security](SECURITY.md) covers data flow, source snapshots, containment, and vulnerability reporting.
   No public disclosure channel is active before launch; do not post credentials or a vulnerability in
   a public issue.
-- [LICENSE](LICENSE) is authoritative. Public-repository use is free; private use has a limited
-  small-organisation grant, and commercial licensing is available at <licensing@reyse.ai>.
+- [LICENSE](LICENSE) is authoritative, and this is the shape of it rather than a second copy of
+  its terms. Shard is under the Business Source License 1.1: source-available, not open source.
+  **Two doors, and you only need one of them.** Public-repository use is free, always — no limit on
+  repositories, runs, findings, contributors, or the size of your organisation. Private repositories
+  are covered by a small-organisation grant, whose revenue and contributor thresholds the licence
+  states. Your own source, configuration, entry scripts and findings are never covered: reviewing
+  your code with Shard never obliges you to publish it. Offering Shard itself to others as a hosted,
+  managed or embedded service is not permitted; using it to do your own work, including for clients,
+  is. Each version converts to Apache 2.0 four years after it is first published, or on the licence's
+  change date, whichever comes first. Commercial terms: <licensing@reyse.ai>.
 - Read the [Changelog](CHANGELOG.md) for versioned behavior and [Contributing](CONTRIBUTING.md) before
   proposing a change.

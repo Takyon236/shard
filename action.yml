@@ -6,6 +6,15 @@ name: "Shard"
 description: "Security review with reproducing inputs, on your runner and model endpoint."
 author: "Reyse"
 
+# REQUIRED FOR A MARKETPLACE LISTING, and for nothing else. GitHub refuses to publish an Action
+# whose manifest has no `branding`, and the two keys are a closed vocabulary: the icon is one of the
+# Feather names GitHub allows and the colour is one of eight. `shield` and `blue` say "security
+# tool" in a browse list where the description is truncated; they are a presentation choice and
+# changing them alters no behaviour.
+branding:
+  icon: "shield"
+  color: "blue"
+
 inputs:
   mode:
     description: "Free image mode: survey or diff."
@@ -186,7 +195,7 @@ runs:
 # `Dockerfile` beside this file still ships and still builds the same image: it is what you
 # read to audit what executes in your pipeline, and what you build if you would rather run
 # your own. The build-context paragraph above applies to that path rather than to this one.
-        SHARD_ACTION_IMAGE: "docker://ghcr.io/takyon236/shard@sha256:48f8378364860f4b5918476d042538085e11a149a0733c075cfab6f1e8e51486"
+        SHARD_ACTION_IMAGE: "docker://ghcr.io/takyon236/shard@sha256:9161c2ff2e89495e733841a7ed5705fe50db92bd37b17cb5b638a096dc7e1238"
         INPUT_MODE: ${{ inputs.mode }}
         INPUT_MODEL_ENDPOINT: ${{ inputs.model_endpoint }}
         INPUT_MODEL: ${{ inputs.model }}

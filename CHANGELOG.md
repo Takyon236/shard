@@ -8,6 +8,25 @@ an exact version or commit when updates need review.
 
 ## [Unreleased]
 
+## [4.0.5] — 2026-09-08
+
+### Added
+
+- **The source-inspection block is documented.** Every diff run already reports which of the files in
+  scope it actually read — a `Source inspection` section in the report and an `inspection` object in
+  `shard-result.json`, with per-file line ranges — and no customer document had ever mentioned it. A
+  contributor reading the distribution concluded the capability was missing and began rebuilding it,
+  which is how the gap surfaced. [Reference](docs/reference.md) now describes the block, its fields,
+  and what it does and does not claim.
+- The licence summary in the README states the shape of the terms in plain words: source-available
+  under BUSL 1.1, free for public repositories without limit, a small-organisation grant for private
+  ones, your own code never covered, and what the Apache 2.0 conversion depends on. The thresholds
+  stay in the licence, which is the only place they can be read without drifting.
+- The measured per-run cost figures are shown as the table they were measured as, alongside the
+  existing floor caveat.
+- `action.yml` declares `branding`, which GitHub requires before an Action can be listed on the
+  Marketplace. It is presentation metadata and changes no behaviour.
+
 ## [4.0.4] — 2026-09-07
 
 **No behavioural change.** Apart from the version string, the package's code is identical to 4.0.3 —

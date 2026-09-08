@@ -98,6 +98,26 @@ for later job steps. The CLI also writes mutable copies under `out_dir`: diff wr
 SARIF, optional telemetry and log, and `bundles/`; survey writes the report and profile. Upload only the
 named Action paths, never the whole checkout output directory.
 
+### Source inspection
+
+Every diff run reports which of the files in scope it actually read. The Markdown report carries a
+**Source inspection** section and `shard-result.json` carries the same data under `inspection`.
+
+The heading line reads `N of M scoped file(s) returned source; K with no source recorded`, followed by
+a per-file table: the path, whether **full**, **partial** or **no** source was returned, the line
+ranges that reached the model, the diff context ranges, and any other activity against that file.
+
+In `shard-result.json`, `inspection` carries `scope_files`, `files_with_source`,
+`files_fully_returned`, `files_partially_returned`, `files_without_source`, `observed_lines`, a
+`files` array with `observed_ranges` per path, and counters including `read_calls`, `failed_reads`,
+`clamped_reads`, `partial_line_reads`, `search_calls` and `unscoped_reads`.
+
+Read it as an observation, not as coverage. The block carries its own `measurement` string saying so:
+returned source is what reached the conversation, not proof the model analysed it; clamped reads
+contribute no ranges, so the counts are lower bounds; and search results, shell output and directory
+listings establish no line coverage at all. A run that read 1 of 3 scoped files and reported nothing
+is a different result from one that read all three, and this block is how you tell them apart.
+
 A bundle can hold either a demonstrated input or a refused candidate; read `reproduced` in
 `metadata.json`. `done` is the only completed-review status. `budget`, `maxsteps` and `repeat` are
 incomplete; `error` means the review failed.
@@ -122,10 +142,28 @@ limits from your own completed reviews.
 
 ### What a run costs
 
-Five measured pull-request runs cost $0.022–$0.507, but they did not exercise command execution, so
-read that dollar range as a floor. Five later runs widened the measured token band to 21,184–1,544,464
-tokens, with median use 7.9x the earlier sample. Your endpoint, repository, and diff determine the
-actual result; use your own completed report-only runs to size limits.
+You supply the model, so your model bill is the price. Every pull-request run this project has
+metered:
+
+| changed files | changed lines | size of files touched | cost | tokens |
+|---|---|---|---|---|
+| 1 | 12 | 2,800 | $0.022 | 21,184 |
+| 1 | 1 | 2,900 | $0.026 | 50,547 |
+| 3 | 48 | 120,000 | $0.030 | 97,852 |
+| 3 | 48 | 120,000 | $0.045 | 131,410 |
+| 3 | 82 | 190,000 | **$0.507** | 786,563 |
+
+Five points is a small sample, quoted as a range rather than a formula. Cost tracks the size of the
+files touched more closely than the size of the change: 82 lines cost seventeen times what 48 lines
+did, against files 58% larger. Do not plan against the high end of that table — it is not the high
+end that has happened.
+
+**Read the dollar range as a FLOOR**, because those runs did not exercise command execution. Five
+later runs widened the measured band to 21,184–1,544,464 tokens, a median 7.9x the earlier sample.
+A first whole-repository survey is a different job again and measured far above this band. `shard preflight`
+estimates against your own repository's file sizes before you spend anything, and says which of the
+two jobs it is quoting. Your endpoint, repository and diff determine the actual result; size your
+limits from your own completed report-only runs.
 
 ## Runtime support
 

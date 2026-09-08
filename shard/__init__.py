@@ -77,7 +77,7 @@ __all__ = [
 # deletes a comment line that names either and keeps the rest, which truncates the sentence around
 # it: the first draft of this block lost its own last line that way. Bump this in the release commit
 # alongside both manifests; the release gate refuses a cut where the three disagree.
-__version__ = "4.0.4"
+__version__ = "4.0.5"
 
 
 def __getattr__(name: str):
