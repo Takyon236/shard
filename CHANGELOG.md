@@ -8,6 +8,17 @@ an exact version or commit when updates need review.
 
 ## [Unreleased]
 
+## [4.0.6] — 2026-09-08
+
+### Changed
+
+- The Action's manifest name is now **Shard Security Review**. GitHub refuses a Marketplace listing
+  whose name matches an existing user or organisation, and `Shard` is one. This is a display string:
+  it titles the listing and labels the step in a run log. The `uses:` reference resolves by
+  repository path and is unchanged, so no workflow needs editing, and the SARIF tool driver is still
+  `Shard` so code-scanning alert continuity is unaffected.
+
+
 ## [4.0.5] — 2026-09-08
 
 ### Added

@@ -2,7 +2,21 @@
 #
 # Customer workflow guidance lives in README.md and docs/. This manifest is the machine interface:
 # each field states its purpose, accepted values, default and the one caveat needed to use it safely.
-name: "Shard"
+# **THE MARKETPLACE NAME, AND IT IS NOT "Shard" BECAUSE IT CANNOT BE.** GitHub refuses a listing
+# whose name matches an existing user or organisation, and `github.com/Shard` is a user account held
+# by somebody else — measured 2026-09-08, when the listing was refused. The rule is independent of
+# whether any Action is listed under that name: `/marketplace/actions/shard` is a 404 and the name is
+# still unavailable, so probing the listing URL proves nothing and was the check that missed this.
+#
+# An account name cannot contain a space, so any multi-word name sidesteps the collision outright.
+# `github.com/reyse` is taken as well, which rules out a bare vendor name by the same rule.
+#
+# **THIS IS A DISPLAY STRING ONLY.** It titles the Marketplace listing and labels the step in a run
+# log. `uses: <owner>/<name>@<ref>` resolves by REPOSITORY PATH and is unaffected, so no customer
+# workflow changes. The SARIF tool driver is a different string — `report.TOOL_NAME` — and stays
+# `Shard`, because that one identifies the tool to a code-scanning consumer and renaming it would
+# break alert continuity for every repository already ingesting our output.
+name: "Shard Security Review"
 description: "Security review with reproducing inputs, on your runner and model endpoint."
 author: "Reyse"
 
@@ -195,7 +209,7 @@ runs:
 # `Dockerfile` beside this file still ships and still builds the same image: it is what you
 # read to audit what executes in your pipeline, and what you build if you would rather run
 # your own. The build-context paragraph above applies to that path rather than to this one.
-        SHARD_ACTION_IMAGE: "docker://ghcr.io/takyon236/shard@sha256:9161c2ff2e89495e733841a7ed5705fe50db92bd37b17cb5b638a096dc7e1238"
+        SHARD_ACTION_IMAGE: "docker://ghcr.io/takyon236/shard@sha256:c3fa4b1f478c2a601f61c2aa6545c88774bafbef83e821a76b6829d8f0ea8769"
         INPUT_MODE: ${{ inputs.mode }}
         INPUT_MODEL_ENDPOINT: ${{ inputs.model_endpoint }}
         INPUT_MODEL: ${{ inputs.model }}
