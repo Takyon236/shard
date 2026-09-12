@@ -37,7 +37,7 @@ __all__ = [
     'fence',
 ]
 
-__version__ = "4.0.7"
+__version__ = "5.0.0"
 
 
 def __getattr__(name: str):

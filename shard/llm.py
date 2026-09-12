@@ -14,6 +14,7 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Protocol
 
 from shard.diag import get_logger
+from shard.providermetrics import attempt as _provider_attempt, merge as _merge_provider_usage
 
 _log = get_logger(__name__)
 
@@ -29,6 +30,9 @@ class _ProviderUsage:
     unpriced: int
     reported: bool
     tokens_reported: bool
+    input_reported: bool = field(default=False, compare=False)
+    output_reported: bool = field(default=False, compare=False)
+    cached_reported: bool = field(default=False, compare=False)
 
 
 class _UsageIntegrityError(ValueError):
@@ -147,11 +151,14 @@ def _provider_usage(usage) -> _ProviderUsage:
         unpriced=int(raw_cost is None),
         reported=bool(usage),
         tokens_reported=total_reported,
+        input_reported=input_reported,
+        output_reported=output_reported,
+        cached_reported=details.get("cached_tokens") is not None,
     )
 
 
 def _provider_result_fields(usage: _ProviderUsage, served: str,
-                            identity_verdict: str) -> dict:
+                            identity_verdict: str, seconds: float = 0.0) -> dict:
     return {
         "cost_usd": usage.cost_usd,
         "tokens": usage.total_tokens,
@@ -160,7 +167,14 @@ def _provider_result_fields(usage: _ProviderUsage, served: str,
         "identity_verdict": identity_verdict,
         "tokens_reported": usage.tokens_reported,
         "cost_reported": not usage.unpriced,
+        "provider_usage": _provider_attempt(usage, seconds),
     }
+
+
+def _incomplete_error_message(data: dict) -> str:
+    stream_error = data.get("_stream_error")
+    detail = f": {str(stream_error)[:200]}" if stream_error is not None else ""
+    return f"incomplete response: finish_reason=error{detail}"
 
 
 def _combined_reported(flags: list[bool | None]) -> bool | None:
@@ -238,6 +252,7 @@ class LLMResult:
     identity_verdict: str = ""
     tokens_reported: bool | None = None
     cost_reported: bool | None = None
+    provider_usage: dict | None = None
 
 
 class LLMBackend(Protocol):
@@ -305,11 +320,28 @@ class ChatResult:
     forcing_retry_safe: bool = False
     empty_retry_safe: bool = False
     stall_retry_safe: bool = False
+    provider_usage: dict | None = None
 
 
 class ToolCallingBackend(Protocol):
     def chat(self, messages: list, tools: list, *, model: str = "sonnet",
              timeout: int = 600, tool_choice=None) -> ChatResult: ...
+
+
+def _chat_turn_verdict(data: dict, text: str, refusal, finish: str, native: str, model: str,
+                       fields: dict) -> tuple[ChatResult, int] | None:
+    if refusal or finish == "content_filter" or native == "refusal":
+        return ChatResult(ok=False, error=f"model refused the prompt (finish={finish or native})",
+                          model=model, finish_reason=finish, tool_calls=[], raw_message={},
+                          forcing_retry_safe=False, **fields), 403
+    if finish == "error":
+        return ChatResult(ok=False, error=_incomplete_error_message(data), model=model,
+                          finish_reason=finish, tool_calls=[], raw_message={},
+                          forcing_retry_safe=False, **fields), 200
+    if finish == "length":
+        return ChatResult(text=text, tool_calls=[], raw_message={}, ok=True, model=model,
+                          finish_reason=finish, **fields), 200
+    return None
 
 
 class ClaudeCliBackend:
@@ -736,11 +768,17 @@ class _SseAssembly:
     _models: list[str] = field(default_factory=list, repr=False)
     _model_error: str = field(default="", repr=False)
     _choice_index: int | None = field(default=None, repr=False)
+    _stream_error: object | None = field(default=None, repr=False)
 
     def add(self, chunk: dict) -> None:
         if not isinstance(chunk, dict):
             raise TypeError("SSE chunk is not an object")
         chunk_response_id = self._add_metadata(chunk)
+        if chunk.get("error") is not None:
+            self._record_stream_error(chunk["error"])
+            return
+        if self._stream_error is not None:
+            return
         choice = self._choice(chunk)
         if choice is None:
             return
@@ -755,6 +793,17 @@ class _SseAssembly:
             self.finish = finish
         if native:
             self.native = native
+
+    def _record_stream_error(self, error: object) -> None:
+        if self._stream_error is None:
+            self._stream_error = error
+        self.content.clear()
+        self.reasoning.clear()
+        self.refusal = None
+        self.frags.clear()
+        self.role = ""
+        self.native = ""
+        self.finish = "error"
 
     def _add_metadata(self, chunk: dict) -> str:
         if chunk.get("usage") is not None:
@@ -940,6 +989,8 @@ class _SseAssembly:
         if self.native:
             choice["native_finish_reason"] = self.native
         response = {"choices": [choice], "usage": self.usage, "model": self.model}
+        if self._stream_error is not None:
+            response["_stream_error"] = self._stream_error
         if self.response_id:
             response["id"] = self.response_id
         if self._model_error:
@@ -1309,6 +1360,8 @@ class OpenRouterBackend:
             return LLMResult("", 0.0, model, False, err, tokens=0,
                              abandoned_attempts=abandoned,
                              unpriced_attempts=unpriced,
+                             provider_usage=_provider_attempt(None, _gen_sec,
+                                                               sent=code not in _NO_ABANDON_CODES),
                              tokens_reported=False, cost_reported=False), code
         choice = (data.get("choices") or [{}])[0]
         msg = choice.get("message", {}) or {}
@@ -1322,10 +1375,11 @@ class OpenRouterBackend:
             self._record_abandoned(_gen_sec)
             return LLMResult("", 0.0, model, False, f"invalid provider usage: {e}",
                              abandoned_attempts=1, served_model=served,
+                             provider_usage=_provider_attempt(None, _gen_sec),
                              identity_verdict=identity, tokens_reported=False,
                              cost_reported=False), _USAGE_INTEGRITY_CODE
         self._accumulate_usage(usage, _gen_sec)
-        fields = _provider_result_fields(usage, served, identity)
+        fields = _provider_result_fields(usage, served, identity, _gen_sec)
         identity_error = identity_detail or _model_identity_error(model, served, identity)
         if identity_error:
             return LLMResult(text="", model=model, ok=False, error=identity_error,
@@ -1336,6 +1390,14 @@ class OpenRouterBackend:
             return LLMResult(text="", model=model, ok=False,
                              error=f"{err}: {refusal}" if refusal else err,
                              finish_reason=finish, **fields), 403
+        if finish == "error":
+            return LLMResult(text="", model=model, ok=False,
+                             error=_incomplete_error_message(data),
+                             finish_reason=finish, **fields), 200
+        if finish == "length":
+            return LLMResult(text="", model=model, ok=False,
+                             error="incomplete response: finish_reason=length",
+                             finish_reason=finish, **fields), 200
         if not text:
             return LLMResult(text="", model=model, ok=False,
                              error=f"empty response: {str(data)[:200]}",
@@ -1345,11 +1407,13 @@ class OpenRouterBackend:
     def complete(self, system: str, user: str, *, model: str = "sonnet", timeout: int = 600) -> "LLMResult":
         resolved = self._resolve(model)
         if not self.api_key:
-            return LLMResult("", 0.0, resolved, False, "no OPENROUTER_API_KEY")
+            return LLMResult("", 0.0, resolved, False, "no OPENROUTER_API_KEY",
+                             provider_usage=_merge_provider_usage(()))
         last = LLMResult("", 0.0, resolved, False, "no attempt")
         made, spent_usd, spent_tokens, abandoned, unpriced = 0, 0.0, 0, 0, 0
         token_flags: list[bool | None] = []
         cost_flags: list[bool | None] = []
+        measurements: list[dict | None] = []
         retry_window_closed = False
         with self._turn_ceiling() as deadline:
             for attempt in range(self.retries + 1):
@@ -1362,6 +1426,7 @@ class OpenRouterBackend:
                     retry_window_closed = True
                     break
                 last = candidate
+                measurements.append(last.provider_usage)
                 if code not in _PRE_WIRE_CODES:
                     made += 1
                     spent_usd += float(last.cost_usd or 0.0)
@@ -1371,11 +1436,11 @@ class OpenRouterBackend:
                     cost_flags.append(last.cost_reported)
                     abandoned += self._account_abandoned(last)
                 if last.ok or code not in self._RETRY_CODES:
-                    tokens_reported = _combined_reported(token_flags)
-                    cost_reported = _combined_reported(cost_flags)
                     return self._completion_bill(last, made, spent_usd, spent_tokens,
                                                  abandoned, unpriced,
-                                                 tokens_reported, cost_reported)
+                                                 _combined_reported(token_flags),
+                                                 _combined_reported(cost_flags),
+                                                 _merge_provider_usage(measurements))
                 if attempt >= self.retries:
                     break
                 if not self._wait_for_retry(deadline, attempt, resolved, code, last.error or ""):
@@ -1390,21 +1455,23 @@ class OpenRouterBackend:
                        resolved, self.retries, code, (last.error or "")[:200])
         return self._completion_bill(last, made, spent_usd, spent_tokens, abandoned, unpriced,
                                      _combined_reported(token_flags),
-                                     _combined_reported(cost_flags))
+                                     _combined_reported(cost_flags), _merge_provider_usage(measurements))
 
     @staticmethod
     def _completion_bill(result: LLMResult, made: int, spent_usd: float, spent_tokens: int,
                          abandoned: int, unpriced: int, tokens_reported: bool | None,
-                         cost_reported: bool | None) -> LLMResult:
+                         cost_reported: bool | None, provider_usage: dict | None = None) -> LLMResult:
         if (made <= 1 and result.abandoned_attempts == abandoned
+                and result.unpriced_attempts == unpriced
                 and result.tokens_reported is tokens_reported
                 and result.cost_reported is cost_reported):
-            return result
+            return (result if result.provider_usage == provider_usage
+                    else replace(result, provider_usage=provider_usage))
         return replace(result, cost_usd=spent_usd, tokens=spent_tokens,
                        abandoned_attempts=abandoned,
                        unpriced_attempts=unpriced,
                        tokens_reported=tokens_reported,
-                       cost_reported=cost_reported)
+                       cost_reported=cost_reported, provider_usage=provider_usage)
 
     def _provider_block(self, relax: bool = False) -> dict | None:
         block: dict = {}
@@ -1446,6 +1513,8 @@ class OpenRouterBackend:
             return ChatResult(ok=False, error=err, model=model,
                               abandoned_attempts=abandoned,
                               unpriced_attempts=unpriced,
+                              provider_usage=_provider_attempt(None, _gen_sec,
+                                                                sent=code not in _NO_ABANDON_CODES),
                               tokens_reported=False, cost_reported=False,
                               stall_retry_safe=code in (
                                   _PRE_WIRE_TIMEOUT_CODE, _POST_WIRE_TIMEOUT_CODE),
@@ -1460,10 +1529,11 @@ class OpenRouterBackend:
             self._record_abandoned(_gen_sec)
             return ChatResult(ok=False, error=f"invalid provider usage: {e}", model=model,
                               served_model=served, identity_verdict=identity,
+                              provider_usage=_provider_attempt(None, _gen_sec),
                               abandoned_attempts=1, tokens_reported=False,
                               cost_reported=False, forcing_retry_safe=False), _USAGE_INTEGRITY_CODE
         self._accumulate_usage(usage, _gen_sec)
-        fields = _provider_result_fields(usage, served, identity)
+        fields = _provider_result_fields(usage, served, identity, _gen_sec)
         identity_error = identity_detail or _model_identity_error(model, served, identity)
         if identity_error:
             return ChatResult(ok=False, error=identity_error, model=model,
@@ -1473,14 +1543,9 @@ class OpenRouterBackend:
         native = choice.get("native_finish_reason") or ""
         text = msg.get("content") or msg.get("reasoning") or ""
 
-        if refusal or finish == "content_filter" or native == "refusal":
-            return ChatResult(ok=False, error=f"model refused the prompt (finish={finish or native})",
-                              model=model, finish_reason=finish, tool_calls=[], raw_message={},
-                              forcing_retry_safe=False, **fields), 403
-
-        if finish == "length":
-            return ChatResult(text=text, tool_calls=[], raw_message={}, ok=True, model=model,
-                              finish_reason=finish, **fields), 200
+        verdict = _chat_turn_verdict(data, text, refusal, finish, native, model, fields)
+        if verdict is not None:
+            return verdict
 
         try:
             calls, call_error = _parsed_tool_calls(msg)
@@ -1501,11 +1566,13 @@ class OpenRouterBackend:
              tool_choice=None) -> ChatResult:
         resolved = self._resolve(model)
         if not self.api_key:
-            return ChatResult(ok=False, error="no OPENROUTER_API_KEY", model=resolved)
+            return ChatResult(ok=False, error="no OPENROUTER_API_KEY", model=resolved,
+                              provider_usage=_merge_provider_usage(()))
         last = ChatResult(ok=False, error="no attempt", model=resolved)
         made, spent_usd, spent_tokens, abandoned, unpriced = 0, 0.0, 0, 0, 0
         token_flags: list[bool | None] = []
         cost_flags: list[bool | None] = []
+        measurements: list[dict | None] = []
         with self._turn_ceiling() as deadline:
             for attempt in range(self.retries + 1):
                 candidate, code = self._chat_once(
@@ -1518,6 +1585,7 @@ class OpenRouterBackend:
                         last = candidate
                     break
                 last = candidate
+                measurements.append(last.provider_usage)
                 if code not in _PRE_WIRE_CODES:
                     made += 1
                     spent_usd += float(last.cost_usd or 0.0)
@@ -1533,19 +1601,23 @@ class OpenRouterBackend:
                                                f"leaves no retry window after {attempt + 1} attempt(s))")
                     break
         return self._billed(last, made, spent_usd, spent_tokens, abandoned, unpriced,
-                            _combined_reported(token_flags), _combined_reported(cost_flags))
+                            _combined_reported(token_flags), _combined_reported(cost_flags),
+                            _merge_provider_usage(measurements))
 
     @staticmethod
     def _billed(result: ChatResult, made: int, spent_usd: float, spent_tokens: int,
                 abandoned: int, unpriced: int, tokens_reported: bool | None,
-                cost_reported: bool | None) -> ChatResult:
+                cost_reported: bool | None, provider_usage: dict | None = None) -> ChatResult:
         if (made <= 1 and result.abandoned_attempts == abandoned
+                and result.unpriced_attempts == unpriced
                 and result.tokens_reported is tokens_reported
                 and result.cost_reported is cost_reported):
-            return result
+            return (result if result.provider_usage == provider_usage
+                    else replace(result, provider_usage=provider_usage))
         return replace(result, cost_usd=spent_usd, tokens=spent_tokens,
                        abandoned_attempts=abandoned, unpriced_attempts=unpriced,
-                       tokens_reported=tokens_reported, cost_reported=cost_reported)
+                       tokens_reported=tokens_reported, cost_reported=cost_reported,
+                       provider_usage=provider_usage)
 
 
 @dataclass

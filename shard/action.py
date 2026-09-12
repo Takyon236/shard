@@ -273,7 +273,7 @@ def _run(argv, env, *, invoke, echo, opener, handoff: _ActionHandoff | None = No
         payload = json.loads(captured)
     except (ValueError, TypeError):
         echo("shard: the run produced no machine-readable payload; no outputs were written")
-        return code
+        return EXIT_CONFIG if code in (EXIT_OK, EXIT_GATED) else code
 
     invalid = _payload_error(argv[0], payload)
     if invalid:

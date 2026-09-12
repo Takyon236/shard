@@ -8,6 +8,112 @@ an exact version or commit when updates need review.
 
 ## [Unreleased]
 
+## [5.0.0] — 2026-09-12
+
+### Breaking changes
+
+- A turn your endpoint reported as failed, including an error event part-way through a streaming response, is now discarded whole: no tool call it carried is executed, and the run exits 2.
+
+- A single-shot answer truncated at `max_tokens` now fails the call instead of being used as if complete, which affects deep target selection and `shard fix`; turns inside the review loop are unchanged.
+
+- The Action now fails the build with exit 2 when it cannot read a machine-readable result out of the run, instead of passing the run's own success or finding exit through.
+
+- Deep mode now refuses a target whose harness reports a setup or invocation failure on a benign input, naming the reserved exit status, before the solver starts.
+
+- A failure in the check that adjudicates a clean, no-finding result now ends the review with an error instead of letting the model's own declaration that it had finished stand.
+
+- `--library-pin` no longer selects an older library snapshot: a pin that is not the current signed snapshot's version now runs on the packs built into the image and records why.
+
+- Deep mode no longer leaves its raw transcript in `--workdir`, and a run whose system temporary directory sits inside the checkout, the workdir or the output directory now exits 2.
+
+- The Action now exits 2 when a run prints nothing it can parse, instead of passing through that run's own clean or gated exit code.
+
+- A reused `--out-dir` is cleared of the previous run's report, SARIF, result, telemetry, log and fix outputs before anything is written, so a failed write leaves no file there rather than the older one.
+
+- A directory occupying one of those names now ends the run with exit 2 instead of costing only that one artefact.
+
+- A diff-run finding whose demonstration printed a sanitizer report is now anchored on the innermost frame naming a file in your checkout, so it can arrive as a new alert and change a `fail_on: new` decision.
+
+- Deep-mode findings are now anchored on the line the sanitizer named rather than on the harness Shard wrote: an existing code-scanning alert closes, a new one opens, and `shard-result.json` reports the location as measured.
+
+- An Action run that printed no machine-readable result now exits 2 instead of passing or reporting a finding.
+
+- A second `shard mirror` pull into a destination another pull is publishing to now exits 2 with `mirror publication lock is busy; retry after its holder finishes`.
+
+- `shard mirror` also exits 2 on a symlink or filesystem-root `--dest`, a negative `--last-seen-version`, and a snapshot another pull superseded while this one was downloading.
+
+- A run whose output directory holds a directory named for one of Shard's own artefacts now stops with exit 2.
+
+
+### Added
+
+- Deep runs now write a redacted `shard-telemetry.json` and `shard-run.log` into `--out-dir`, which previously received neither. The raw model transcript is no longer left in the workdir: it is private temporary data, removed after reporting.
+
+- Deep mode now searches for a crashing input in your own repository, compiling the C/C++ target it already set up into a coverage-guided search binary and running it against your seed corpus for up to a few minutes at a time. An input it finds becomes a finding only when the same reproducer and benign control confirm it.
+
+- A reproduced deep finding whose target was built around one function your headers declare now names that function's call sites in your checkout, quoted in the report and carried in `shard-result.json`. It annotates and never gates, and no call site in your checkout does not mean the function is unreachable.
+
+- A deep run now writes `shard-telemetry.json` and `shard-run.log` into `--out-dir`, and the Action's `telemetry-path` and `log-path` outputs — empty on every deep run until now — name them. They carry counts, timings and gaps; arguments and tool output are described, never quoted.
+
+- A deep run records the library data it accepted: a `library` object in `shard-result.json` carrying state, requested policy, verified snapshot version and each accepted pack's name, version and digest, and the same summary in `shard-report.md`.
+
+- Deep-mode findings now name who calls the faulting function in your checkout, as a `Callers in this repository` line in `shard-report.md` with the call sites quoted and a `callers` object in `shard-result.json`. It is evidence only: nothing gates on it, and finding no caller is not a claim that the defect is unreachable.
+
+- `shard mirror` keeps an empty `.shard-mirror-<dest-name>.lock` file beside the destination to serialise publication; leave it in place between pulls and do not serve it as part of the corpus.
+
+
+### Fixed
+
+- Time spent waiting between retries is no longer counted as time spent at your endpoint; `shard-telemetry.json` and `shard-run.log` now report the requests actually made, the time inside them, and the provider's own token counts.
+
+- Any run fact `shard-telemetry.json` and `shard-run.log` cannot establish is now absent with the gap named, rather than stated as a zero or an all-clear. A missing execution measurement reads as unknown, and a malformed value no longer blocks the result.
+
+- The tool and argument names in `shard-telemetry.json` and `shard-run.log` now come from Shard's own tool definitions rather than from what the model wrote, so neither file can carry model-authored text. A record without that provenance counts under `<unnamed>`.
+
+- A no-finding result is no longer accepted when the replay did not complete — no observations, a kill at the time limit, a sanitizer that failed to initialise, or a harness setup failure. Such a run reports itself incomplete rather than `audited`.
+
+- A run that used every execution its ceiling allowed now records that in `shard-result.json` instead of coming back `complete: true` with no limit recorded. The report's trust line now adds **treat any finding here that is not gate-eligible as unconfirmed**.
+
+- A code-scanning rule now warns that an alert under it may point at your test harness rather than the defect whenever any of its alerts does, not only when the first one did.
+
+- A deep finding whose demonstration printed a sanitizer report was filed against the `test_poc.sh` Shard generates, at line 1. It now points at the innermost frame naming a file in your checkout, and still anchors on the harness when none does.
+
+- Deep mode asked the model to choose a header and listed none, so it declined and the run stopped with a configuration failure. The setup turn now lists the repository's own header paths.
+
+- The CPU and memory a deep run reports are now the tightest ceilings the container can see, including an ancestor cgroup quota, a CPU-affinity restriction and a cgroup memory limit above the run, all of which used to report the host's figure. That line's marker is now `(CPU quota set)` rather than `(container limit)`.
+
+- Output from a command the model runs is now capped at 16 MiB per stream, and output that exceeds the cap or cannot be fully captured is reported back as incomplete rather than buffered without limit on your runner. A command's surviving descendants are killed even when its own process has already been reaped.
+
+- Shard no longer follows a redirect while requesting your runner's identity token, and attaches that credential only to the entitlement request. Snapshot-download and entitlement refusals also stopped quoting the values they refused, so that log wording has changed.
+
+- Signed library data is now checked exactly: a duplicate key at any depth, a boolean standing in for an integer, a malformed digest, a truncated pack and a pack body whose schema disagrees with its signed row are refused, and the run continues without what was refused.
+
+- A pack the snapshot describes unusably is refused before its bytes are fetched, so it no longer spends the transfer allowance the packs after it need; `library: data-only` now skips a pack that declares code before downloading it.
+
+- The library step's 20-second budget is now enforced while a response is being read, not only before each request, so a slow origin can no longer stretch one response without bound.
+
+- `--library-pin` never selected an older snapshot: a version other than the current signed one is now refused by name, and the flag's help says historical selection is unsupported.
+
+- `shard mirror` now names a malformed `--origin-base` in its refusal instead of failing as an internal error, and refuses one carrying credentials before echoing the address. A `--library-mirror` refused the same way leaves a deep run on the image's baseline packs, with the reason stated.
+
+- A run writing into a directory that already holds results now deletes the previous run's report, SARIF, result, telemetry and log — and, for `shard fix`, its patch and JSON — before it writes, so a failed artefact is absent rather than stale.
+
+- A finding no longer inherits another finding's bundle number when a delivery fails, and neither the alert text nor the report claims an attached reproduction bundle before one has been written.
+
+- `shard-result.json` now names two limits it used to omit: findings dropped by the reporting cap, which it counted as none, and a run that used every execution its ceiling allowed. On such a run the report also warns that a finding which is not gate-eligible is unconfirmed.
+
+### Documentation
+
+- Same-repository GitHub pull requests are the supported v5 CI integration, and automatic fork review
+  remains unsupported until a tested design can prove both revisions and protect the restored model
+  credential.
+- The public docs remain one short, report-only GitHub Actions onboarding path. A finding bundle is an
+  audit record, not independently verified replay evidence: v5 has no trusted acquisition and replay
+  helper, so onboarding still does not enable gates.
+- Raw journals are still retained only when a direct CLI run explicitly sets `--journal-path` to a path
+  outside `--out-dir`. Deep runs now derive the two redacted files above from a private journal and
+  remove it; that is the only change to what a run leaves behind.
+
 ## [4.0.7] — 2026-09-08
 
 ### Changed
@@ -154,6 +260,18 @@ every release including a correct one. The fix is in this repository's own CI an
 
 ### Fixed
 
+- **The workdir check asked you to end `test_poc.sh` with the one line that stops a fault reaching
+  Shard, and graded that shape as supported.** It wanted `echo __EXIT__=$?` as the last command. On
+  your own repository a finding has to be a real fault — a fatal signal, or a sanitizer report —
+  because a number a script prints is something a correct program can also print. A harness whose last
+  line is an `echo` exits normally, so the target's death never reaches the supervisor watching for it;
+  and the marker is read before anything else, so a marker that is not the target's own status hides
+  the sanitizer report that was sitting in the output. A harness should END by `exec`ing the target, so
+  the target's own death is the script's death, with `export ASAN_OPTIONS="abort_on_error=1"` above it
+  to turn a sanitizer report into a signal. Shard now reports whether your harness ends that way and
+  whether a marker was printed, grades a marker-printing harness as degraded rather than supported, and
+  a run whose harness cannot demonstrate a fault says so instead of reporting a clean result. *Recorded
+  here after the fact: this shipped in 4.0.0 and was omitted from this entry when it was written.*
 - Retry decisions no longer read provider-supplied error text. Only an outcome measured by Shard's own
   transport can buy another attempt.
 - A bundle name that would be unsafe, or that repeats within one run, becomes a distinct visible path

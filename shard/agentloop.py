@@ -10,7 +10,9 @@ from shard.budget import BudgetExceeded, BudgetGovernor
 from shard.diag import get_logger
 from shard.journal import Journal
 from shard.memory import fence
+from shard.providermetrics import merge as _merge_provider_usage
 from shard.reasoning import ensure_compute_runway, render_self_review
+from shard.telemetry import _tool_metadata
 from shard.tools import OBS_WINDOW_CHARS, READ_MAX_FILE_BYTES, ToolRegistry, ToolResult
 from shard.toolvalidate import suggest_tool, validate_call_args
 
@@ -210,6 +212,7 @@ class _CarriedUsage:
     unpriced: int = 0
     tokens_reported: bool = True
     cost_reported: bool = True
+    provider_usage: dict | None = field(default_factory=lambda: _merge_provider_usage(()))
 
     @classmethod
     def from_result(cls, result) -> "_CarriedUsage":
@@ -220,6 +223,7 @@ class _CarriedUsage:
             unpriced=int(getattr(result, "unpriced_attempts", 0) or 0),
             tokens_reported=getattr(result, "tokens_reported", None) is not False,
             cost_reported=getattr(result, "cost_reported", None) is not False,
+            provider_usage=getattr(result, "provider_usage", None),
         )
 
 
@@ -366,6 +370,7 @@ class ToolCallingLoop:
         step_usd = usage["cost_usd"]
         self._rec("llm_request", step=step, seconds=round(time.monotonic() - sent_at, 3),
                   total_tokens=step_tokens, cost_usd=step_usd,
+                  provider_usage=usage["provider_usage"],
                   abandoned=usage["abandoned"], unpriced=usage["unpriced"],
                   tokens_reported=usage["tokens_reported"],
                   cost_reported=usage["cost_reported"], **identity,
@@ -429,6 +434,8 @@ class ToolCallingLoop:
             "unpriced": unpriced,
             "tokens_reported": tokens_reported,
             "cost_reported": cost_reported,
+            "provider_usage": _merge_provider_usage((carried.provider_usage,
+                                                     getattr(result, "provider_usage", None))),
         }
 
     def _identity_fields(self, result) -> dict:
@@ -658,6 +665,7 @@ class ToolCallingLoop:
                 st.repeat_sig, st.repeat_n, st.repeat_advised = sig, 1, False
 
             _tool = self.registry.get(tc.name)
+            tool_metadata = _tool_metadata(_tool)
             _enforce = self._allowed_union if self.tool_names_resolver is not None else self.tool_names
             if (self._enact_break_after > 0 and st.reads_since_progress >= self._enact_break_after
                     and (tc.name in self._enact_deny
@@ -722,7 +730,7 @@ class ToolCallingLoop:
                     f"returns the SAME result each time. Change approach — different arguments, a "
                     f"different tool, or finish — or the run will be STOPPED.")
 
-            self._rec("tool_result", key=sig, result=result.to_dict())
+            self._rec("tool_result", key=sig, result=result.to_dict(), tool_metadata=tool_metadata)
             idx = len(messages)
             messages.append({"role": "tool", "tool_call_id": tc.id, "name": tc.name, "content": obs})
             st.obs_args[idx] = json.dumps(tc.arguments, sort_keys=True)[:200]
@@ -846,7 +854,8 @@ class ToolCallingLoop:
                         reason = self.finish_gate(res.text)
                     except Exception as e:
                         self._rec("finish_gate_error", error=f"{type(e).__name__}: {e}")
-                        reason = None
+                        return self._result("error", step, st.n_calls, st.spent,
+                                            f"finish gate failed: {type(e).__name__}: {e}")
                     if reason:
                         self._rec("finish_rejected", reason=str(reason)[:500])
                         messages.append({"role": "user", "content": str(reason)})

@@ -860,6 +860,8 @@ _GO_FRAME = re.compile(r"^\t(\S+?\.go):(\d+)(?:\s|$)", re.M)
 
 _CLR_FRAME = re.compile(r"^\s+at\s+.*?\sin\s(\S+?):line\s+(\d+)\s*$", re.M)
 
+_SAN_FRAME = re.compile(r"^\s*#\d+\s+0x[0-9a-fA-F]+\s+in\s+.+?\s+(\S+?):(\d+)(?::\d+)?\s*$", re.M)
+
 _RUNTIME_FRAMES: tuple[tuple[str, re.Pattern[str], int], ...] = (
     ("cpython", _PY_FRAME, LAST),
     ("v8", _NODE_FRAME, FIRST),
@@ -867,6 +869,7 @@ _RUNTIME_FRAMES: tuple[tuple[str, re.Pattern[str], int], ...] = (
     ("ruby", _RUBY_FRAME, FIRST),
     ("go", _GO_FRAME, FIRST),
     ("clr", _CLR_FRAME, FIRST),
+    ("sanitizer", _SAN_FRAME, FIRST),
 )
 
 
@@ -902,6 +905,10 @@ def observed_location(evidence: str, repo, *, payload: bytes = b"") -> tuple[str
 
     def _claims(pattern):
         return [loc for loc in _locations(pattern, evidence) if loc not in forged]
+
+    for _name, _pattern, _end in _RUNTIME_FRAMES:
+        if _name == "sanitizer" and any(loc in forged for loc in _locations(_pattern, evidence)):
+            return None
 
     other = set(_claims(_PATH_LINE))
     runtimes = [(name, _claims(pattern), end) for name, pattern, end in _RUNTIME_FRAMES]

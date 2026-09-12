@@ -13,9 +13,9 @@ import urllib.parse
 from dataclasses import dataclass, fields
 
 from shard.inspectionview import markdown as inspection_markdown
+from shard.witness import observed_location
 
 from shard.artefactfs import (atomic_write as _atomic_write,
-                              rooted_write,
                               trusted_directory as _trusted_directory)
 from shard.target import HARNESS_NAME
 from shard.diffscope import prompt_safe, safe_directory_argv
@@ -59,8 +59,7 @@ _SAFE_TOKEN = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}")
 ANCHOR_DISCLAIMER = (
     "An alert here names the entry point that REPRODUCES the defect, not the line at fault: Shard "
     "resolves a reproduction, not a source location, and a guessed line would be a false positive in "
-    "the worst possible place. What the run observed is quoted with the finding and attached in full as "
-    "a reproduction bundle.")
+    "the worst possible place. What the run observed is quoted with the finding.")
 
 ANCHOR_CLAUSE = "filed against the entry point that reproduces it, not the line at fault"
 
@@ -122,6 +121,8 @@ class Finding:
     rule_title: str = ""
     location_is_harness: bool = False
     location_measured: bool = False
+    caller_note: str = ""
+    caller_rows: tuple[str, ...] = ()
     attribution: str = "unattributed"
     attribution_reason: str = ""
     witness_refused: str = ""
@@ -222,7 +223,7 @@ def build_sarif(findings, *, limit: int = DEFAULT_SARIF_CAP, status: str = "done
                 "level": "error" if _rule_all_reproduced(by_rule[f.rule_id]) else "note"},
         }
         rule["properties"] = _rule_properties(by_rule[f.rule_id])
-        if f.location_is_harness:
+        if any(x.location_is_harness for x in by_rule[f.rule_id]):
             rule["fullDescription"] = {"text": ANCHOR_DISCLAIMER}
         rules.append(rule)
     finished = status in COMPLETED_STATUSES
@@ -323,6 +324,7 @@ class RunFacts:
     levers_image_bound: bool | None = None
     stateful: bool | None = None
     inspection: dict | None = None
+    library: dict | None = None
 
 
 def _human_bytes(n: int | None) -> str:
@@ -348,7 +350,8 @@ def _language_summary(langs: tuple[str, ...]) -> str:
 def _trust_row(status: str, *, executions_spent: bool | None = None) -> str:
     if status in COMPLETED_STATUSES and executions_spent:
         return (f"**complete status (`{status}`), SPENT EXECUTION BUDGET** — every execution the "
-                f"ceiling allowed was used, so this run may have stopped early. Raise `--max-steps`")
+                f"ceiling allowed was used, so this run may have stopped early: **treat any finding "
+                f"here that is not gate-eligible as unconfirmed**. Raise `--max-steps`")
     if status in COMPLETED_STATUSES:
         return f"complete run (`{status}`)"
     return (f"**INCOMPLETE (`{status}`) — the counts below are a floor, not a result.** "
@@ -563,11 +566,31 @@ def build_survey_markdown(summary: str, *, target: str = "", truncated: bool = F
     return "\n".join(out) + "\n"
 
 
+def _library_markdown(library: dict | None) -> list[str]:
+    if library is None:
+        return []
+    state = _inline_code(prompt_safe(library["state"]))
+    policy = _inline_code(prompt_safe(library["policy"]))
+    snapshot = library["snapshot"]
+    out = ["### Library", "", f"State: {state}. Policy: {policy}.", "",
+           f"Verified snapshot: {_inline_code(str(snapshot)) if snapshot is not None else 'none'}.",
+           ""]
+    if not library["packs"]:
+        return out + ["No accepted packs; the image's built-in baseline was used.", ""]
+    out += ["Accepted packs:", ""]
+    for pack in library["packs"]:
+        label = f'{pack["name"]}@{pack["version"]}'
+        label = _inline_code(prompt_safe(label, limit=len(label)))
+        digest = str(pack["blob_digest"])
+        digest = _inline_code(prompt_safe(digest, limit=len(digest)))
+        out.append(f"- {label}: {digest}")
+    return out + [""]
+
+
 def build_markdown(findings, *, status: str, dropped: int = 0, target: str = "",
                    gate_reasons=(), scope_reasons=(), run: RunFacts | None = None,
                    bundle_names: dict[int, str] | None = None) -> str:
-    kept, _capped = cap(findings)
-    ordered = rank(kept)
+    ordered, _capped = cap(findings)
     derived = finding_names(ordered)
     named = [(f, (bundle_names or {}).get(id(f), name))
              for f, name in zip(ordered, derived)]
@@ -578,6 +601,7 @@ def build_markdown(findings, *, status: str, dropped: int = 0, target: str = "",
             else (f"## Shard — `{target}`" if target else "## Shard")), ""]
     out += _summary_table(findings, status=status, run=run,
                           gate_reasons=gate_reasons, scope_reasons=scope_reasons)
+    out += _library_markdown(getattr(run, "library", None))
 
     for reason in gate_reasons:
         out += [f"> **{reason}**", ""]
@@ -671,7 +695,7 @@ def _finding_block(f: Finding, *, reproduced: bool, bundle: str) -> list[str]:
         out.append("What the entry point printed:")
         out += ["", fence, body, fence]
         if clipped:
-            out.append(f"_Last {_EVIDENCE_IN_REPORT} characters; the bundle has the rest._")
+            out.append(f"_Last {_EVIDENCE_IN_REPORT} characters shown._")
         out.append("")
     if f.reproduce_command:
         out += ["Safe acquisition required", "",
@@ -684,6 +708,11 @@ def _finding_block(f: Finding, *, reproduced: bool, bundle: str) -> list[str]:
                 "do not use this bundle as a gate.", "",
                 f"`bundles/{bundle}/` sits beside this report and holds `reproduce.sh`, `input`, "
                 f"`output.txt` when captured, and `metadata.json`.", ""]
+    if f.caller_note:
+        out.append(f"Callers in this repository: {f.caller_note}")
+        out.append("")
+        if f.caller_rows:
+            out += ["```"] + list(f.caller_rows) + ["```", ""]
     if f.doubts:
         out.append("Oracle notes (advisory; these did not affect the verdict):")
         out += [f"- {d}" for d in f.doubts] + [""]
@@ -848,40 +877,31 @@ def _findings(result, workdir: pathlib.Path, setup, *, revision: str) -> list:
         sanitizer = getattr(one, "sanitizer", None)
         signature = getattr(one, "signature", "")
         poc_bytes = by_signature.get(signature)
-        poc_path = _sweep_poc(workdir, signature, by_signature) if poc_bytes is not None else None
         observed = _repo_relative(getattr(one, "evidence", "") or "", workdir)
+        sink = observed_location(observed, workdir / "repo", payload=poc_bytes or b"")
         findings.append(Finding(
             rule_id=_rule_id(sanitizer, observed),
             title=_finding_title(sanitizer, signature),
             rule_title=_crash_title(sanitizer),
-            location_is_harness=True,
+            location_is_harness=sink is None,
             message=(f"Shard produced an input that crashes this target on {one.crash_count} of "
-                     f"{one.replays} replays. The crashing input is attached as a reproduction bundle."),
+                     f"{one.replays} replays."),
             evidence=observed,
             gate_eligible=True,
-            location=harness,
+            location=sink[0] if sink else harness,
+            line=sink[1] if sink else 1,
+            location_measured=sink is not None,
             signature=signature,
             sanitizer=sanitizer,
             replays=one.replays,
             crash_count=one.crash_count,
             doubts=tuple(getattr(one, "doubts", ()) or ()),
-            poc_path=poc_path,
             poc_bytes=poc_bytes,
             revision=revision,
             reproduce_command=(f"entry={shlex.quote(harness)}\nrev={shlex.quote(revision)}\n"
                                f"{_REPRODUCE_SH}"),
         ))
     return findings
-
-def _sweep_poc(workdir: pathlib.Path, signature: str, by_signature: dict) -> str | None:
-    data = by_signature.get(signature)
-    if data is None:
-        live = workdir / "poc"
-        return str(live) if live.exists() else None
-    root = workdir.resolve()
-    path = root / "poc-findings" / (signature or "unsigned")
-    rooted_write(root, path, data, create_parents=True)
-    return str(path)
 
 def _crash_title(sanitizer: str | None) -> str:
     if not sanitizer:

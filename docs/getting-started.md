@@ -3,8 +3,8 @@
 This path adds Shard to a same-repository pull request in report-only mode. It verifies the repository,
 witness, endpoint, CI connection, and public outputs without turning findings into a merge gate.
 
-> **Version:** These pages document `v4.0.7`. Existing v3 users should use the
-> [v3.0.2 docs](https://github.com/Takyon236/shard/tree/v3.0.2).
+> **Version:** These pages document `v5.0.0`. Existing v4 users should use the
+> [v4.0.7 docs](https://github.com/Takyon236/shard/tree/v4.0.7).
 
 ## Before you start
 
@@ -21,7 +21,7 @@ set -euo pipefail
 onboarding_env="$(mktemp -d)/venv"
 python3 -m venv "$onboarding_env"
 . "$onboarding_env/bin/activate"
-python -m pip install 'git+https://github.com/Takyon236/shard.git@v4.0.7'
+python -m pip install 'git+https://github.com/Takyon236/shard.git@v5.0.0'
 
 repository_visibility='public' # change to private when appropriate
 shard survey --repo .
@@ -113,7 +113,7 @@ jobs:
 
       - name: Review the change with Shard
         id: shard
-        uses: Takyon236/shard@v4.0.7
+        uses: Takyon236/shard@v5.0.0
         env:
           SHARD_MODEL_API_KEY: ${{ secrets.SHARD_MODEL_API_KEY }}
         with:

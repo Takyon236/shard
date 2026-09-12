@@ -10,11 +10,12 @@ import sys
 import tempfile
 from dataclasses import replace
 
-from shard.telemetry import render_log as _render_log, summarise as _telemetry
+from shard.telemetry import _render_document as _render_log, summarise as _telemetry
 from shard.resultdoc import build as _build_result
 from shard.artefactfs import (atomic_write as _atomic_write,
                               child_directory as _child_directory,
                               private_directory as _private_directory,
+                              remove_file as _remove_file,
                               remove_tree as _remove_tree)
 from shard.artefactfs import trusted_directory as _trusted_directory
 
@@ -36,7 +37,7 @@ def _write_artefact(what: str, failed: list, write, *, details: list | None = No
         return True
     except Exception as e:
         effect = ("The finding cannot gate and this run reports a delivery failure."
-                  if required else "The run itself is unaffected and the other artefacts were written.")
+                  if required else "The run itself is unaffected; other artefacts are handled independently.")
         print(f"shard: could not write {what}: {type(e).__name__}: {e}. {effect}", file=sys.stderr)
         failed.append(what)
         if details is not None:
@@ -72,7 +73,6 @@ def _publish_bundle(finding, name: str, bundles_fd: int) -> dict[str, bytes]:
 
     stage_name = ""
     published = False
-    files = {}
     try:
         with _private_directory(bundles_fd, f".shard-{name}") as (stage_name, stage_fd):
             files = _write_bundle_fd(finding, stage_fd, require_input=finding.gate_eligible)
@@ -88,16 +88,14 @@ def _publish_bundle(finding, name: str, bundles_fd: int) -> dict[str, bytes]:
     return files
 
 
-def _bundle_delivery(kept: list, bundles_fd: int, public_out: pathlib.Path,
+def _bundle_delivery(kept: list, allocated_names: list[str], bundles_fd: int, public_out: pathlib.Path,
                      failed: list[str],
                      failed_details: list[dict], integrity: dict[str, str]
                      ) -> tuple[list, dict[int, str], list[str], list[dict]]:
-    from shard.report import finding_names
-
     names: dict[int, str] = {}
     bundles: list[str] = []
     required_failed: set[int] = set()
-    for finding, name in zip(kept, finding_names(kept)):
+    for finding, name in zip(kept, allocated_names):
         if not finding.gate_eligible and not finding.poc_path:
             continue
         public_dest = public_out / "bundles" / name
@@ -124,18 +122,17 @@ def _bundle_delivery(kept: list, bundles_fd: int, public_out: pathlib.Path,
     return deliverable, names, bundles, required_failures
 
 
-def _deliver_bundles(kept: list, out: pathlib.Path, out_fd: int, failed: list[str],
+def _deliver_bundles(kept: list, allocated_names: list[str], out: pathlib.Path, out_fd: int, failed: list[str],
                      failed_details: list[dict], integrity: dict[str, str]):
     if not any(finding.gate_eligible or finding.poc_path for finding in kept):
         return kept, {}, [], []
     try:
         with _child_directory(out_fd, "bundles", create=True) as bundles_fd:
-            return _bundle_delivery(kept, bundles_fd, out, failed, failed_details, integrity)
+            return _bundle_delivery(kept, allocated_names, bundles_fd, out,
+                                    failed, failed_details, integrity)
     except Exception as e:
-        from shard.report import finding_names
-
         required_ids: set[int] = set()
-        for finding, name in zip(kept, finding_names(kept)):
+        for finding, name in zip(kept, allocated_names):
             if not finding.gate_eligible and not finding.poc_path:
                 continue
             row = {"artefact": f"bundles/{name}", "required": finding.gate_eligible,
@@ -152,12 +149,45 @@ def _deliver_bundles(kept: list, out: pathlib.Path, out_fd: int, failed: list[st
         return deliverable, {}, [], required
 
 
+def _emit_telemetry(journal_path, out: pathlib.Path, out_fd: int, failed: list[str],
+                    failed_details: list[dict], integrity: dict[str, str]) -> dict[str, str]:
+    document = None
+    error = None
+    try:
+        document = _telemetry(journal_path)
+    except Exception as exc:
+        error = exc.with_traceback(None)
+
+    def publish(filename, role, render):
+        if error is not None:
+            raise error
+        _publish_bytes(out_fd, filename, render(document).encode(), integrity, role)
+
+    written = {}
+    for filename, role, render in (
+            ("shard-telemetry.json", "telemetry",
+             lambda doc: json.dumps(doc, indent=2, default=str)),
+            ("shard-run.log", "log", _render_log)):
+        if _write_artefact(filename, failed,
+                           lambda filename=filename, role=role, render=render:
+                               publish(filename, role, render),
+                           details=failed_details):
+            written[role] = str(out / filename)
+    return written
+
+
 def _emit(findings: list, out_dir: str | None, *, status: str, target: str, mode: str,
           gate_reasons=(), scope_reasons=(), run=None, journal_path=None) -> dict:
     if out_dir is None:
         return {}
     public_out = pathlib.Path(out_dir)
     with _trusted_directory(out_dir, create=True) as (_trusted_out, out_fd):
+        for name in ("shard.sarif", "shard-report.md", "shard-result.json",
+                     "shard-telemetry.json", "shard-run.log"):
+            try:
+                _remove_file(out_fd, name, missing_ok=True)
+            except OSError as exc:
+                raise OSError(f"previous output {name} could not be invalidated: {exc}") from exc
         return _emit_open(findings, public_out, out_fd, status=status, target=target, mode=mode,
                           gate_reasons=gate_reasons, scope_reasons=scope_reasons, run=run,
                           journal_path=journal_path)
@@ -165,9 +195,10 @@ def _emit(findings: list, out_dir: str | None, *, status: str, target: str, mode
 
 def _emit_open(findings: list, out: pathlib.Path, out_fd: int, *, status: str, target: str,
                mode: str, gate_reasons=(), scope_reasons=(), run=None, journal_path=None) -> dict:
-    from shard.report import build_markdown, cap, write_sarif
+    from shard.report import build_markdown, cap, finding_names, write_sarif
 
     kept, dropped = cap(findings)
+    allocated_names = finding_names(kept)
 
     written: dict = {}
     failed: list[str] = []
@@ -175,7 +206,8 @@ def _emit_open(findings: list, out: pathlib.Path, out_fd: int, *, status: str, t
     integrity: dict[str, str] = {}
 
     deliverable, bundle_names, bundles, required_failures = _deliver_bundles(
-        kept, out, out_fd, failed, failed_details, integrity)
+        kept, allocated_names, out, out_fd, failed, failed_details, integrity)
+    report_names = {id(finding): name for finding, name in zip(deliverable, allocated_names)}
     delivered = [bundle_names[id(f)] for f in kept if f.gate_eligible and id(f) in bundle_names]
     written["bundles"] = bundles
     written["bundle_map"] = {name: str(out / "bundles" / name)
@@ -205,27 +237,14 @@ def _emit_open(findings: list, out: pathlib.Path, out_fd: int, *, status: str, t
                            build_markdown(deliverable, status=effective_status, dropped=dropped,
                                           target=target, gate_reasons=gate_reasons,
                                           scope_reasons=scope_reasons, run=run,
-                                          bundle_names=bundle_names).encode(),
+                                          bundle_names=report_names).encode(),
                            integrity, "report"),
                        details=failed_details):
         written["report"] = str(report)
 
     if journal_path is not None and pathlib.Path(journal_path).is_file():
-        telemetry = out / "shard-telemetry.json"
-        if _write_artefact("shard-telemetry.json", failed,
-                           lambda: _publish_bytes(
-                               out_fd, telemetry.name,
-                               json.dumps(_telemetry(journal_path), indent=2,
-                                          default=str).encode(), integrity, "telemetry"),
-                           details=failed_details):
-            written["telemetry"] = str(telemetry)
-        runlog = out / "shard-run.log"
-        if _write_artefact("shard-run.log", failed,
-                           lambda: _publish_bytes(
-                               out_fd, runlog.name, _render_log(journal_path).encode(),
-                               integrity, "log"),
-                           details=failed_details):
-            written["log"] = str(runlog)
+        written.update(_emit_telemetry(journal_path, out, out_fd, failed,
+                                       failed_details, integrity))
 
     if failed_details:
         written["failed_artefacts"] = failed_details
@@ -239,7 +258,8 @@ def _emit_open(findings: list, out: pathlib.Path, out_fd: int, *, status: str, t
                            json.dumps(_build_result(
                                deliverable, status=effective_status, mode=mode, target=target,
                                run=run, gate_reasons=gate_reasons, scope_reasons=scope_reasons,
-                               artefacts=snapshot, bundle_names=bundle_names),
+                               artefacts=snapshot, bundle_names=report_names,
+                               previously_dropped=dropped),
                                indent=2, sort_keys=True).encode(), integrity, "result"),
                        details=failed_details):
         written["result"] = str(result)

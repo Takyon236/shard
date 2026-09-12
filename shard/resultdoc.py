@@ -7,7 +7,6 @@ from shard.report import (
     cap,
     finding_names,
     is_numbered,
-    rank,
     report_label,
 )
 
@@ -40,6 +39,11 @@ LIMIT_STATEMENTS: dict[str, str] = {
     "executions_refused":
         "the execution budget refused commands this run tried to make. It investigated less than it "
         "attempted to",
+    "executions_spent":
+        "this run used every execution its ceiling allowed and was never refused one. The agent is "
+        "told how many remain, so it stops asking rather than being denied — whether it finished "
+        "checking or ran out is not established here, and any finding in this document that is not "
+        "gate-eligible is unconfirmed",
     "no_execution":
         "this run executed nothing in the checkout, so no claim here was formed by running the code",
     "witness_refused":
@@ -61,10 +65,13 @@ LIMIT_STATEMENTS: dict[str, str] = {
 
 def build(findings, *, status: str, mode: str, target: str = "", run=None,
           gate_reasons=(), scope_reasons=(), artefacts=None,
-          bundle_names: dict[int, str] | None = None) -> dict:
-    kept, dropped = cap(findings)
-    ordered = rank(kept)
-    named = list(zip(ordered, finding_names(ordered)))
+          bundle_names: dict[int, str] | None = None, previously_dropped: int = 0) -> dict:
+    if type(previously_dropped) is not int or previously_dropped < 0:
+        raise ValueError("previously_dropped must be a nonnegative integer")
+    ordered, dropped = cap(findings)
+    dropped += previously_dropped
+    named = [(f, (bundle_names or {}).get(id(f), name))
+             for f, name in zip(ordered, finding_names(ordered))]
     reproduced = [f for f in ordered if f.gate_eligible]
     hypotheses = [f for f in ordered if not f.gate_eligible]
     ident = getattr(run, "report_id", "") or ""
@@ -86,11 +93,11 @@ def build(findings, *, status: str, mode: str, target: str = "", run=None,
         "gate": _gate(run, reproduced, gate_reasons, scope_reasons),
         "repository": _repository(run),
         "inspection": getattr(run, "inspection", None),
+        "library": getattr(run, "library", None),
         "run": _run(run),
         "limits": limits(ordered, status=status, run=run,
                          gate_reasons=gate_reasons, scope_reasons=scope_reasons, dropped=dropped),
-        "reproduced": [_finding(f, (bundle_names or {}).get(id(f), name))
-                       for f, name in named if f.gate_eligible],
+        "reproduced": [_finding(f, name) for f, name in named if f.gate_eligible],
         "hypotheses": [_finding(f, name) for f, name in named if not f.gate_eligible],
         "artefacts": dict(artefacts or {}),
     }
@@ -130,6 +137,7 @@ def _finding(f, name: str) -> dict:
             "measured": bool(f.location_measured),
         },
         "attribution": {"verdict": f.attribution, "reason": f.attribution_reason},
+        **({"callers": {"note": f.caller_note, "sites": list(f.caller_rows)}} if f.caller_note else {}),
         "weakness": _weakness(f),
         "reproduction": {
             "replays": f.replays,
@@ -172,6 +180,7 @@ def _run(run) -> dict:
         "witness_entry": getattr(run, "witness_entry", "") or "",
         "scan": getattr(run, "scan", "") or "",
         "exec_calls": getattr(run, "exec_calls", None),
+        "executions_spent": getattr(run, "executions_spent", None),
         "exec_refused": getattr(run, "exec_refused", None),
         "usd": getattr(run, "usd", None),
         "tokens": getattr(run, "tokens", None),
@@ -203,6 +212,8 @@ def limits(findings, *, status: str, run=None, gate_reasons=(), scope_reasons=()
     refused = getattr(run, "exec_refused", None)
     if refused:
         codes.append("executions_refused")
+    elif getattr(run, "executions_spent", None):
+        codes.append("executions_spent")
     if getattr(run, "exec_calls", None) == 0:
         codes.append("no_execution")
     if getattr(run, "unavailable_levers", ()) and getattr(run, "levers_image_bound", None):

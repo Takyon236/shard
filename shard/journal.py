@@ -20,18 +20,18 @@ class Journal:
         self._name = self.path.name
         self._directory = trusted_directory(self._root, create=True)
         _path, self._parent_fd = self._directory.__enter__()
-        self._now = now
-        self._step = 0
-        self._results: dict[str, Any] = {}
-        self._counts: Counter = Counter()
         try:
+            self._now = now
+            self._step = 0
+            self._results: dict[str, Any] = {}
+            self._counts: Counter = Counter()
             raw = self._bytes()
-        except Exception:
+            if raw is not None:
+                self._load(raw)
+            self._loaded_keys: set[str] = set(self._results)
+        except BaseException:
             self.close()
             raise
-        if raw is not None:
-            self._load(raw)
-        self._loaded_keys: set[str] = set(self._results)
 
     def _load(self, raw: bytes) -> None:
         for ev in self._events(raw):

@@ -13,9 +13,9 @@ Two things this template is NOT for:
     everyone immediately. See SECURITY.md.
   - A finding that is not real. Use the "False positive" template; it asks for different things.
 
-This template describes v4. `v4.0.7` is published and installs anonymously — no account, no granted
-access. Report the exact source and Action revisions you ran; existing v3 users should follow the
-documentation at their v3 tag.
+This template describes v5. `v5.0.0` is published and installs anonymously — no account, no granted
+access. Report the exact source and Action revisions you ran; existing v4 users should follow the
+documentation at their v4 tag.
 -->
 
 ## What happened
@@ -31,7 +31,7 @@ The supported v4 candidate path is GitHub Actions in report-only mode. Local con
 CI experiments are diagnostics, not supported integrations. Paste your exact workflow revision with
 secrets removed. The workflow snippet below names the published release ref:
 
-    - uses: Takyon236/shard@v4.0.7
+    - uses: Takyon236/shard@v5.0.0
       with:
         mode: diff
         fail_on: none
@@ -62,7 +62,7 @@ the scan was, and what limited it.
 
 ## Environment
 
-- Shard source commit and exact Action ref (`v4.0.7`, or the commit you pinned):
+- Shard source commit and exact Action ref (`v5.0.0`, or the commit you pinned):
 - Action mode (`survey` or `diff`), or CLI command (`preflight`):
 - Runner (GitHub-hosted `ubuntu-latest` or fresh self-hosted Linux GitHub Actions runner):
 - Model endpoint URL and exact model identifier:

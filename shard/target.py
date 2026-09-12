@@ -266,9 +266,9 @@ _BUILD_MARKERS: dict[str, str] = {
     "package.json": "npm", "Makefile": "make", "GNUmakefile": "make",
 }
 
-def _with_markers(markers: dict | None) -> tuple[dict, dict, dict]:
+def _with_markers(markers: dict | None) -> tuple[dict, dict]:
     if not markers:
-        return EXT_LANGUAGE, _BUILD_MARKERS, LANGUAGE_RUNTIME
+        return EXT_LANGUAGE, _BUILD_MARKERS
 
     def merged(baked: dict, key: str) -> dict:
         fresh = markers.get(key)
@@ -277,8 +277,7 @@ def _with_markers(markers: dict | None) -> tuple[dict, dict, dict]:
         return {**baked, **{k: v for k, v in fresh.items()
                             if isinstance(k, str) and isinstance(v, str)}}
 
-    return (merged(EXT_LANGUAGE, "ext_language"), merged(_BUILD_MARKERS, "build_markers"),
-            merged(LANGUAGE_RUNTIME, "language_runtime"))
+    return merged(EXT_LANGUAGE, "ext_language"), merged(_BUILD_MARKERS, "build_markers")
 
 
 _FUZZ_DIRS = frozenset({"fuzz", "fuzzing", "fuzzers", "oss-fuzz", "ossfuzz", "test_fuzz"})
@@ -319,7 +318,7 @@ class TargetProfile:
 
 def profile_repo(root, *, max_files: int = MAX_WALK_FILES, markers: dict | None = None) -> TargetProfile:
     root = pathlib.Path(root)
-    ext_language, build_markers, _ = _with_markers(markers)
+    ext_language, build_markers = _with_markers(markers)
     counts: dict[str, int] = {}
     headers: dict[str, int] = {}
     native: dict[str, list[str]] = {}

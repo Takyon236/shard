@@ -24,7 +24,7 @@ def _print_capability(payload: dict) -> None:
     mach = payload.get("machine")
     if mach:
         mem = f", {mach['memory_gb']} GiB" if mach.get("memory_gb") is not None else ""
-        limit = " (container limit)" if mach.get("cpus_are_a_container_limit") else ""
+        limit = " (CPU quota set)" if mach.get("cpus_are_a_container_limit") else ""
         print(f"this runner  {mach['cpus']} cpu{limit}{mem}, docker "
               f"{'yes' if mach['docker'] else 'NO'}")
         if mach.get("note"):

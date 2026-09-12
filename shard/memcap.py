@@ -6,6 +6,8 @@ import signal
 import subprocess
 import threading
 
+from .processcapture import MAX_CAPTURED_BYTES, Capture
+
 DEFAULT_CAP_MB = 4096
 
 CAP_ENV = "SHARD_MEM_CAP_MB"
@@ -26,7 +28,16 @@ class CappedProcess(subprocess.CompletedProcess):
         self.peak_bytes = peak_bytes
 
 
+class CaptureRefusedProcess(subprocess.CompletedProcess):
+
+    def __init__(self, args, returncode, stdout, stderr, *, reason: str):
+        super().__init__(args, returncode, stdout, stderr)
+        self.reason = reason
+
+
 def refusal(proc) -> str | None:
+    if isinstance(proc, CaptureRefusedProcess):
+        return proc.reason
     if not isinstance(proc, CappedProcess):
         return None
     return (f"KILLED BY THE MEMORY CEILING: this command and its children reached "
@@ -87,7 +98,7 @@ def _kill_tree(root: int) -> None:
         except OSError:
             continue
     try:
-        os.killpg(os.getpgid(root), signal.SIGKILL)
+        os.killpg(root, signal.SIGKILL)
     except OSError:
         pass
 
@@ -114,10 +125,11 @@ class _Watch:
 
     def stop(self) -> None:
         self._done.set()
-        self._thread.join(timeout=2)
+        if self._thread.ident is not None:
+            self._thread.join(timeout=2)
 
 
-def _popen_kwargs(capture_output: bool, text: bool, errors: str | None, cwd, env, has_input: bool):
+def _popen_kwargs(capture_output: bool, cwd, env, has_input: bool):
     kwargs = {
         "cwd": cwd,
         "env": env,
@@ -125,37 +137,54 @@ def _popen_kwargs(capture_output: bool, text: bool, errors: str | None, cwd, env
         "stdout": subprocess.PIPE if capture_output else None,
         "stderr": subprocess.PIPE if capture_output else None,
         "start_new_session": True,
+        "bufsize": 0,
     }
-    if text:
-        kwargs["text"] = True
-    if errors is not None:
-        kwargs["errors"] = errors
     return kwargs
 
 
-def run(argv, *, input=None, capture_output=False, text=False, errors=None,
-        cwd=None, env=None, timeout=None, limit=None):
-    ceiling = cap_bytes() if limit is None else int(limit)
-    proc = subprocess.Popen(argv, **_popen_kwargs(capture_output, text, errors, cwd, env,
-                                                  input is not None))
-    watch = _Watch(proc.pid, ceiling)
-    watch.start()
+def _cleanup(proc, capture):
     try:
-        stdout, stderr = proc.communicate(input=input, timeout=timeout)
-    except subprocess.TimeoutExpired:
         _kill_tree(proc.pid)
-        stdout, stderr = proc.communicate()
+    except AttributeError:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    finally:
+        capture.finish(proc)
+
+
+def run(argv, *, input=None, capture_output=False, text=False, errors=None,
+        cwd=None, env=None, timeout=None, limit=None, output_limit=None):
+    ceiling = cap_bytes() if limit is None else int(limit)
+    capture = Capture(input, text=text, errors=errors,
+                      limit=MAX_CAPTURED_BYTES if output_limit is None else output_limit)
+    proc = subprocess.Popen(argv, **_popen_kwargs(capture_output, cwd, env, input is not None))
+    watch = _Watch(proc.pid, ceiling)
+    try:
+        watch.start()
+        capture.start(proc)
+        capture.wait(proc, timeout)
+    except subprocess.TimeoutExpired:
+        _cleanup(proc, capture)
+        stdout, stderr = capture.output(partial=True)
         raise subprocess.TimeoutExpired(argv, timeout, output=stdout, stderr=stderr) from None
     except BaseException:
-        _kill_tree(proc.pid)
+        _cleanup(proc, capture)
         raise
     finally:
         watch.stop()
+    if capture.reason():
+        _cleanup(proc, capture)
+    note = capture.reason()
+    stdout, stderr = capture.output(partial=bool(note) or watch.peak_bytes > ceiling)
     if watch.peak_bytes > ceiling:
         return CappedProcess(argv, proc.returncode, stdout, stderr,
                              limit_bytes=ceiling, peak_bytes=watch.peak_bytes)
+    if note:
+        return CaptureRefusedProcess(argv, proc.returncode, stdout, stderr, reason=note)
     return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
 
 
-__all__ = ["CAP_ENV", "DEFAULT_CAP_MB", "POLL_SECONDS", "CappedProcess", "cap_bytes",
-           "descendants", "refusal", "run"]
+__all__ = ["CAP_ENV", "DEFAULT_CAP_MB", "MAX_CAPTURED_BYTES", "POLL_SECONDS", "CappedProcess",
+           "CaptureRefusedProcess", "cap_bytes", "descendants", "refusal", "run"]
